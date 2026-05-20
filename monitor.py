@@ -225,6 +225,17 @@ def main():
     print(f"  Position Monitor  —  {now_utc}")
     print(f"{'='*60}")
 
+    # ── Telegram connection test (manual / workflow_dispatch triggers only) ───
+    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        print("  [Telegram] Sending connection test...")
+        sent = send_telegram(
+            f"✅ <b>Breakout Bot — Monitor Connected</b>\n"
+            f"Telegram alerts are working!\n"
+            f"Time: {now_utc}\n"
+            f"Next: alerts fire automatically when stops/targets are hit."
+        )
+        print(f"  [Telegram] {'✓ message sent!' if sent else '✗ FAILED — check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID secrets'}")
+
     # ── Market window check ───────────────────────────────────────────────────
     session = ts.MarketClock.get_session()
     quality = session.get("quality", "CLOSED")

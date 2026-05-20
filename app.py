@@ -308,6 +308,11 @@ def _render_stock_card(r: dict):
     expl_html = (f'<div class="card-explosive">⚡ Explosive Score {score:.0f}/100'
                  f'{"  ·  Grade " + grade if grade else ""}</div>') if score >= 40 else ""
 
+    fee_adj_rr     = r.get("fee_adj_rr", 0) or 0
+    fee_adj_reward = r.get("fee_adj_reward_pct", 0) or 0
+    tf_pass        = r.get("trade_filter_pass", True)  # default True for legacy results
+    raw_rr_val     = r.get("raw_rr", rr) or rr
+
     stop_str   = f"${stop:.2f}"   if stop   else "—"
     tgt_str    = f"${target:.2f}" if target else "—"
     rr_str     = f"{rr:.1f}:1"   if rr     else "—"
@@ -318,6 +323,27 @@ def _render_stock_card(r: dict):
         move_html = f'<div class="card-move">↑ Estimated move: +{move_lo:.0f}% – {move_hi:.0f}%{dur}</div>'
 
     cat_html = f'<div class="card-catalyst">⚡ Catalyst: {catalyst}</div>' if catalyst else ""
+
+    # Fee-adjusted R/R block
+    if fee_adj_rr or fee_adj_reward:
+        tf_color  = "#3fb950" if tf_pass else "#f85149"
+        tf_label  = "✅ PASS" if tf_pass else "❌ FAIL"
+        fee_html  = (
+            f'<div style="margin-top:8px; padding:7px 10px; background:#0d1117; '
+            f'border-radius:6px; font-size:0.74rem;">'
+            f'<span style="color:#8b949e;">Fee-Adj R/R: </span>'
+            f'<span style="color:#58a6ff; font-weight:700;">{fee_adj_rr:.1f}:1</span>'
+            f'&nbsp;&nbsp;'
+            f'<span style="color:#8b949e;">Reward: </span>'
+            f'<span style="color:#58a6ff; font-weight:700;">+{fee_adj_reward:.1f}%</span>'
+            f'&nbsp;&nbsp;&nbsp;'
+            f'<span style="background:{"#1a4428" if tf_pass else "#4c1b1b"}; '
+            f'color:{tf_color}; padding:2px 8px; border-radius:10px; '
+            f'font-weight:700;">{tf_label}</span>'
+            f'</div>'
+        )
+    else:
+        fee_html = ""
 
     risks = []
     if earn and earn != "No":
@@ -358,6 +384,7 @@ def _render_stock_card(r: dict):
       </div>
       {move_html}
       {cat_html}
+      {fee_html}
       {risk_html}
     </div>
     """, unsafe_allow_html=True)
@@ -544,11 +571,13 @@ if run_btn:
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
-tab_dash, tab_results, tab_chart, tab_analytics = st.tabs([
+tab_dash, tab_results, tab_chart, tab_analytics, tab_paper, tab_fees = st.tabs([
     "📊  Dashboard",
     "🔍  Scan Results",
     "📈  Stock Chart",
     "📉  Analytics",
+    "💼  Paper Portfolio",
+    "💰  Fees Tracker",
 ])
 
 
@@ -1133,7 +1162,356 @@ with tab_analytics:
         # ── Improvement suggestions ────────────────────────────────────────────
         tips = analyzer.suggest_improvements()
         if tips:
-            st.markdown('<div class="section-hdr">💡 Self-Improvement Suggestions</div>',
+            st.markdown('<div class="section-hdr">Self-Improvement Suggestions</div>',
                         unsafe_allow_html=True)
             for tip in tips:
                 st.warning(tip, icon="💡")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TAB 5 — PAPER PORTFOLIO
+# ──────────────────────────────────────────────────────────────────────────────
+with tab_paper:
+    conn, _mode = get_db()
+    paper = ts.PaperTradingEngine(conn)
+    s     = paper.get_summary()
+    positions = paper.open_positions
+
+    # ── Header KPIs ──────────────────────────────────────────────────────────
+    st.markdown('<div class="section-hdr">Paper Portfolio — $1,000 Starting Capital</div>',
+                unsafe_allow_html=True)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    ret_col = "green" if s["total_return"] >= 0 else "red"
+    with c1: kpi("Total Capital",  f"${s['total_capital']:,.2f}", "blue")
+    with c2: kpi("Total Return",
+                 f"{'+'if s['total_return']>=0 else ''}${s['total_return']:,.2f}",
+                 ret_col)
+    with c3: kpi("Return %",
+                 f"{'+'if s['total_return_pct']>=0 else ''}{s['total_return_pct']:.1f}%",
+                 ret_col)
+    with c4: kpi("Fees Paid",  f"${s['total_fees_paid']:.2f}", "red")
+    with c5: kpi("Open Slots",
+                 f"{s['open_positions']}/{s['max_positions']}", "yellow")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: kpi("Available Cash",  f"${s['available_cash']:,.2f}", "blue")
+    with c2: kpi("Invested",        f"${s['invested_value']:,.2f}", "yellow")
+    with c3: kpi("Realized P&L",
+                 f"{'+'if s['realized_pnl']>=0 else ''}${s['realized_pnl']:,.2f}",
+                 "green" if s["realized_pnl"] >= 0 else "red")
+    with c4: kpi("Fee Drag",        f"-{s['fee_drag_pct']:.2f}%", "red")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Portfolio Pie Chart ───────────────────────────────────────────────────
+    if positions or s["total_fees_paid"] > 0:
+        labels, values, colors = [], [], []
+        for p in positions:
+            invested_val = (p.get("gross_invested") or 0) - (p.get("buy_fee") or 0)
+            labels.append(p["ticker"])
+            values.append(max(invested_val, 0))
+            colors.append("#3fb950")
+
+        labels.append("Available Cash")
+        values.append(max(s["available_cash"], 0))
+        colors.append("#30363d")
+
+        if s["total_fees_paid"] > 0:
+            labels.append("Fees Paid")
+            values.append(s["total_fees_paid"])
+            colors.append("#f85149")
+
+        col_pie, col_stats = st.columns([1, 1])
+        with col_pie:
+            st.markdown('<div class="section-hdr">Capital Allocation</div>',
+                        unsafe_allow_html=True)
+            fig_pie = go.Figure(go.Pie(
+                labels=labels, values=values,
+                marker=dict(colors=colors, line=dict(color="#0d1117", width=2)),
+                hole=0.45,
+                textinfo="label+percent",
+                textfont=dict(size=12, color="#e6edf3"),
+                hovertemplate="<b>%{label}</b><br>$%{value:.2f}<br>%{percent}<extra></extra>",
+            ))
+            fig_pie.update_layout(
+                paper_bgcolor="#161b22", plot_bgcolor="#161b22",
+                font=dict(color="#c9d1d9"), height=320,
+                showlegend=False, margin=dict(l=10, r=10, t=20, b=10),
+                annotations=[dict(text=f"${s['total_capital']:,.0f}",
+                                  font=dict(size=18, color="#e6edf3"), showarrow=False)]
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        with col_stats:
+            st.markdown('<div class="section-hdr">Position Breakdown</div>',
+                        unsafe_allow_html=True)
+            total_v = sum(values)
+            for label, val, col in zip(labels, values, colors):
+                pct = val / total_v * 100 if total_v > 0 else 0
+                dot = ("🟢" if label not in ("Available Cash","Fees Paid") else
+                       ("⬜" if label == "Available Cash" else "🔴"))
+                st.markdown(
+                    f'<div style="display:flex;justify-content:space-between;'
+                    f'padding:6px 0;border-bottom:1px solid #21262d;font-size:0.85rem;">'
+                    f'<span>{dot} {label}</span>'
+                    f'<span style="color:#e6edf3;font-weight:600;">'
+                    f'${val:,.2f} &nbsp;<span style="color:#8b949e;">'
+                    f'({pct:.1f}%)</span></span></div>',
+                    unsafe_allow_html=True)
+            st.markdown(
+                f'<div style="margin-top:12px;font-size:0.76rem;color:#8b949e;">'
+                f'Break-even move per trade: '
+                f'<strong style="color:#e3b341;">+{s["break_even_pct"]:.2f}%</strong>'
+                f' (1.5% buy + 1.5% sell fees)</div>',
+                unsafe_allow_html=True)
+    else:
+        st.info("No paper trades yet. Run a scan with auto-trade enabled to start.", icon="💼")
+
+    # ── Open Positions Detail ─────────────────────────────────────────────────
+    if positions:
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown('<div class="section-hdr">Open Positions</div>',
+                    unsafe_allow_html=True)
+        for p in positions:
+            ep     = p.get("entry_price") or 0
+            tgt    = p.get("target_price") or 0
+            stp    = p.get("stop_loss") or 0
+            shares = p.get("shares") or 0
+            gross  = p.get("gross_invested") or 0
+            bf     = p.get("buy_fee") or 0
+            far    = p.get("fee_adj_rr") or 0
+
+            # Estimated current P&L (entry price only — no live price fetch in dashboard)
+            est_sell_fee = shares * ep * 0.015
+            net_pnl_est  = -bf - est_sell_fee  # at entry price, net is negative (fees only)
+
+            with st.expander(f"**{p['ticker']}** — entered @ ${ep:.2f}  |  "
+                             f"Target ${tgt:.2f}  |  Stop ${stp:.2f}", expanded=True):
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Entry",     f"${ep:.2f}")
+                    st.metric("Shares",    f"{shares:.4f}")
+                with col2:
+                    st.metric("Stop Loss", f"${stp:.2f}" if stp else "—",
+                              delta=f"-{(ep-stp)/ep*100:.1f}%" if stp and ep else None,
+                              delta_color="inverse")
+                    st.metric("Invested",  f"${gross:.2f}")
+                with col3:
+                    st.metric("Target",    f"${tgt:.2f}" if tgt else "—",
+                              delta=f"+{(tgt-ep)/ep*100:.1f}%" if tgt and ep else None)
+                    st.metric("Buy Fee",   f"-${bf:.2f}")
+                with col4:
+                    st.metric("Fee-Adj R/R", f"{far:.1f}:1" if far else "—")
+                    est_sell = shares * (tgt or ep) * 0.015
+                    st.metric("Est Sell Fee", f"-${est_sell:.2f}")
+
+                st.caption(f"Pattern: {p.get('pattern','—')}  |  "
+                           f"Prob: {p.get('breakout_prob',0):.0f}%  |  "
+                           f"Explosive Score: {p.get('explosive_score',0):.0f}")
+
+        # Horizontal range chart
+        st.markdown('<div class="section-hdr">Position Range — Stop vs Entry vs Target</div>',
+                    unsafe_allow_html=True)
+        tickers_p = [p["ticker"] for p in positions]
+        entries   = [p.get("entry_price") or 0 for p in positions]
+        stops     = [p.get("stop_loss") or 0   for p in positions]
+        targets   = [p.get("target_price") or 0 for p in positions]
+
+        fig_range = go.Figure()
+        for i, (tk, ep, stp, tgt) in enumerate(zip(tickers_p, entries, stops, targets)):
+            if not ep:
+                continue
+            # Full range bar
+            fig_range.add_trace(go.Bar(
+                y=[tk], x=[tgt - stp], base=[stp], orientation="h",
+                marker=dict(color="rgba(88,166,255,0.15)",
+                            line=dict(color="#30363d", width=1)),
+                showlegend=False, hoverinfo="skip",
+            ))
+            for val, col, sym, lbl in [
+                (stp, "#f85149", "circle", "Stop"),
+                (ep,  "#58a6ff", "diamond", "Entry"),
+                (tgt, "#3fb950", "circle", "Target"),
+            ]:
+                if val:
+                    fig_range.add_trace(go.Scatter(
+                        y=[tk], x=[val], mode="markers",
+                        marker=dict(size=12, color=col, symbol=sym),
+                        name=lbl, showlegend=(i == 0),
+                        hovertemplate=f"{lbl}: ${val:.2f}<extra></extra>",
+                    ))
+        fig_range.update_layout(
+            paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+            font=dict(color="#c9d1d9"), height=120 + len(positions) * 50,
+            xaxis=dict(title="Price", gridcolor="#21262d"),
+            yaxis=dict(gridcolor="#21262d"),
+            barmode="overlay", margin=dict(l=10, r=10, t=10, b=10),
+        )
+        st.plotly_chart(fig_range, use_container_width=True)
+
+    # ── Closed Trades ─────────────────────────────────────────────────────────
+    closed_rows = conn.execute(
+        "SELECT * FROM paper_portfolio WHERE status='CLOSED' ORDER BY exit_date DESC"
+    ).fetchall()
+    if closed_rows:
+        st.markdown('<div class="section-hdr">Closed Paper Trades</div>',
+                    unsafe_allow_html=True)
+        rows = []
+        for r in closed_rows:
+            r = dict(r)
+            rows.append({
+                "Ticker":   r["ticker"],
+                "Entry":    f"${r.get('entry_price') or 0:.2f}",
+                "Exit":     f"${r.get('exit_price') or 0:.2f}",
+                "Shares":   f"{r.get('shares') or 0:.3f}",
+                "Fees":     f"${(r.get('buy_fee') or 0)+(r.get('sell_fee') or 0):.2f}",
+                "Gross P&L":f"{'+'if (r.get('gross_pnl') or 0)>=0 else ''}${r.get('gross_pnl') or 0:.2f}",
+                "Net P&L":  f"{'+'if (r.get('net_pnl') or 0)>=0 else ''}${r.get('net_pnl') or 0:.2f}",
+                "Net %":    f"{'+'if (r.get('net_pnl_pct') or 0)>=0 else ''}{r.get('net_pnl_pct') or 0:.1f}%",
+                "Reason":   r.get("exit_reason","—"),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TAB 6 — FEES TRACKER
+# ──────────────────────────────────────────────────────────────────────────────
+with tab_fees:
+    conn, _mode = get_db()
+
+    fee_rows = conn.execute(
+        "SELECT * FROM fees ORDER BY transaction_date ASC, id ASC"
+    ).fetchall()
+    fee_data = [dict(r) for r in fee_rows]
+
+    total_fees  = sum(r.get("fee_amount") or 0 for r in fee_data)
+    buy_fees    = sum(r.get("fee_amount") or 0 for r in fee_data
+                      if r.get("transaction_type") == "BUY")
+    sell_fees   = sum(r.get("fee_amount") or 0 for r in fee_data
+                      if r.get("transaction_type") == "SELL")
+    n_buy       = sum(1 for r in fee_data if r.get("transaction_type") == "BUY")
+    n_sell      = sum(1 for r in fee_data if r.get("transaction_type") == "SELL")
+
+    paper_s = ts.PaperTradingEngine(conn).get_summary()
+    gross_pnl_total = conn.execute(
+        "SELECT SUM(gross_pnl) FROM paper_portfolio WHERE status='CLOSED'"
+    ).fetchone()
+    gross_pnl_total = float(gross_pnl_total[0] or 0) if gross_pnl_total else 0.0
+
+    # ── Summary KPIs ─────────────────────────────────────────────────────────
+    st.markdown('<div class="section-hdr">Fee Summary</div>',
+                unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: kpi("Total Fees Paid",  f"${total_fees:.2f}", "red")
+    with c2: kpi("Buy Fees",  f"${buy_fees:.2f}  ({n_buy} trades)", "red")
+    with c3: kpi("Sell Fees", f"${sell_fees:.2f}  ({n_sell} trades)", "red")
+    with c4:
+        drag = total_fees / _PAPER_BUDGET * 100 if _PAPER_BUDGET else 0
+        kpi("Capital Drag", f"-{drag:.2f}%", "red")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        avg = total_fees / max(len(fee_data), 1)
+        kpi("Avg Fee / Transaction", f"${avg:.2f}", "yellow")
+    with c2:
+        eaten = total_fees / gross_pnl_total * 100 if gross_pnl_total > 0 else 0
+        kpi("% of Gross Profits Eaten",
+            f"{eaten:.1f}%" if gross_pnl_total > 0 else "N/A", "yellow")
+    with c3:
+        be = ts._FEE_ENGINE.break_even_move(1.0)["break_even_pct"]
+        kpi("Break-even Move / Trade", f"+{be:.2f}%", "yellow")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    if fee_data:
+        # ── Cumulative fee chart ──────────────────────────────────────────────
+        st.markdown('<div class="section-hdr">Cumulative Fees vs P&L Over Time</div>',
+                    unsafe_allow_html=True)
+
+        dates      = [r.get("transaction_date","") for r in fee_data]
+        cum_fees   = []
+        running    = 0.0
+        for r in fee_data:
+            running += r.get("fee_amount") or 0
+            cum_fees.append(running)
+
+        fig_fees = go.Figure()
+        fig_fees.add_trace(go.Scatter(
+            x=dates, y=cum_fees, name="Cumulative Fees",
+            line=dict(color="#f85149", width=2),
+            fill="tozeroy", fillcolor="rgba(248,81,73,0.08)",
+        ))
+
+        # Equity snapshots
+        snap_rows = conn.execute(
+            "SELECT snapshot_date, realized_pnl, portfolio_return_pct "
+            "FROM paper_trading ORDER BY snapshot_date ASC"
+        ).fetchall()
+        if snap_rows:
+            snap_dates = [r["snapshot_date"] for r in snap_rows]
+            snap_pnl   = [r["realized_pnl"]  for r in snap_rows]
+            fig_fees.add_trace(go.Scatter(
+                x=snap_dates, y=snap_pnl, name="Realized P&L",
+                line=dict(color="#3fb950", width=2),
+            ))
+
+        fig_fees.update_layout(
+            paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+            font=dict(color="#c9d1d9"), height=280,
+            xaxis=dict(gridcolor="#21262d"),
+            yaxis=dict(gridcolor="#21262d", title="$"),
+            legend=dict(bgcolor="#161b22"),
+            margin=dict(l=10, r=10, t=10, b=10),
+        )
+        st.plotly_chart(fig_fees, use_container_width=True)
+
+        # ── Full fee log ──────────────────────────────────────────────────────
+        st.markdown('<div class="section-hdr">Full Fee Transaction Log</div>',
+                    unsafe_allow_html=True)
+        log_rows = []
+        for i, r in enumerate(fee_data, 1):
+            t_type = r.get("transaction_type","—")
+            log_rows.append({
+                "#":        i,
+                "Date":     r.get("transaction_date","—"),
+                "Ticker":   r.get("ticker","—"),
+                "Type":     t_type,
+                "Gross":    f"${r.get('gross_amount') or 0:.2f}",
+                "Fee":      f"${r.get('fee_amount') or 0:.2f}",
+                "Net":      f"${r.get('net_amount') or 0:.2f}",
+                "Running Total": f"${r.get('running_total') or 0:.2f}",
+            })
+        st.dataframe(pd.DataFrame(log_rows), use_container_width=True, hide_index=True)
+
+        # Per-ticker fee summary
+        st.markdown('<div class="section-hdr">Fee Cost by Ticker</div>',
+                    unsafe_allow_html=True)
+        ticker_fees: dict = {}
+        for r in fee_data:
+            tk  = r.get("ticker","?")
+            amt = r.get("fee_amount") or 0
+            ticker_fees[tk] = ticker_fees.get(tk, 0) + amt
+        if ticker_fees:
+            df_tf = pd.DataFrame(
+                sorted(ticker_fees.items(), key=lambda x: x[1], reverse=True),
+                columns=["Ticker", "Total Fees ($)"]
+            )
+            fig_tf = px.bar(df_tf, x="Ticker", y="Total Fees ($)",
+                            color="Total Fees ($)",
+                            color_continuous_scale=["#3fb950","#e3b341","#f85149"])
+            fig_tf.update_layout(
+                paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                font=dict(color="#c9d1d9"), height=250,
+                coloraxis_showscale=False,
+                xaxis=dict(gridcolor="#21262d"),
+                yaxis=dict(gridcolor="#21262d"),
+                margin=dict(l=10, r=10, t=10, b=10),
+            )
+            st.plotly_chart(fig_tf, use_container_width=True)
+    else:
+        st.info("No fee transactions recorded yet. "
+                "Paper trades will appear here once the portfolio is active.", icon="💰")
+
+    _PAPER_BUDGET = ts._PAPER_BUDGET

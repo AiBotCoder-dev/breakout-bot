@@ -68,6 +68,110 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# FEE ENGINE — 1.5% per transaction (broker + spread + slippage)
+# ══════════════════════════════════════════════════════════════════════════════
+class FeeEngine:
+    FEE_RATE = 0.015  # 1.5% per transaction
+
+    def calculate_buy(self, gross_amount: float, price: float) -> dict:
+        fee    = gross_amount * self.FEE_RATE
+        net    = gross_amount - fee
+        shares = net / price if price > 0 else 0
+        return {"gross": gross_amount, "fee": fee, "net_investment": net,
+                "shares": shares,
+                "effective_price": gross_amount / shares if shares > 0 else price}
+
+    def calculate_sell(self, shares: float, sell_price: float) -> dict:
+        gross = shares * sell_price
+        fee   = gross * self.FEE_RATE
+        net   = gross - fee
+        return {"gross": gross, "fee": fee, "net": net,
+                "effective_price": net / shares if shares > 0 else sell_price}
+
+    def calculate_round_trip(self, entry: float, exit_: float, shares: float) -> dict:
+        buy_fee  = shares * entry  * self.FEE_RATE
+        sell_fee = shares * exit_  * self.FEE_RATE
+        total    = buy_fee + sell_fee
+        invested = shares * entry
+        drag_pct = total / invested * 100 if invested > 0 else 0
+        return {"buy_fee": buy_fee, "sell_fee": sell_fee,
+                "total_fees": total, "fee_drag_pct": drag_pct}
+
+    def break_even_move(self, entry: float) -> dict:
+        r        = self.FEE_RATE
+        be_price = entry * (1 + r) / (1 - r)
+        be_pct   = (be_price - entry) / entry * 100
+        return {"break_even_price": be_price, "break_even_pct": round(be_pct, 2)}
+
+    def fee_adjusted_rr(self, entry: float, target: float, stop: float) -> dict:
+        r = self.FEE_RATE
+        eff_entry  = entry  * (1 + r)
+        eff_target = target * (1 - r)
+        eff_stop   = stop   * (1 - r)
+
+        raw_reward = target - entry
+        raw_risk   = entry  - stop
+        raw_rr     = raw_reward / raw_risk if raw_risk > 0 else 0
+        raw_reward_pct = raw_reward / entry * 100 if entry > 0 else 0
+
+        adj_reward = eff_target - eff_entry
+        adj_risk   = eff_entry  - eff_stop
+        adj_rr     = adj_reward / adj_risk if adj_risk > 0 else 0
+        adj_reward_pct = adj_reward / eff_entry * 100 if eff_entry > 0 else 0
+
+        return {"raw_rr": round(raw_rr, 2), "raw_reward_pct": round(raw_reward_pct, 1),
+                "fee_adj_rr": round(adj_rr, 2),
+                "fee_adj_reward_pct": round(adj_reward_pct, 1)}
+
+
+_FEE_ENGINE = FeeEngine()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRADE FILTER — hard R/R ≥ 2.0 AND reward ≥ 20% (fee-adjusted)
+# ══════════════════════════════════════════════════════════════════════════════
+class TradeFilter:
+    MIN_RR      = 2.0
+    MIN_REWARD  = 20.0  # percent
+
+    def __init__(self, fee: FeeEngine = None):
+        self.fee = fee or _FEE_ENGINE
+
+    def check(self, result: dict) -> dict:
+        entry  = result.get("price")       or 0
+        target = result.get("tgt_price")   or 0
+        stop   = result.get("stop_price")  or 0
+
+        if not entry or not target or not stop or stop >= entry:
+            calc = {"raw_rr": 0, "raw_reward_pct": 0,
+                    "fee_adj_rr": 0, "fee_adj_reward_pct": 0}
+            return {"pass": False, "rr_pass": False, "reward_pass": False,
+                    "reason": "Rejected: insufficient price data", **calc}
+
+        calc       = self.fee.fee_adjusted_rr(entry, target, stop)
+        adj_rr     = calc["fee_adj_rr"]
+        adj_reward = calc["fee_adj_reward_pct"]
+
+        rr_pass     = adj_rr     >= self.MIN_RR
+        reward_pass = adj_reward >= self.MIN_REWARD
+
+        reasons = []
+        if not rr_pass:
+            reasons.append(f"R/R {adj_rr:.1f} (min 2.0)")
+        if not reward_pass:
+            reasons.append(f"Reward +{adj_reward:.1f}% (min +20%)")
+
+        return {"pass": rr_pass and reward_pass,
+                "rr_pass": rr_pass, "reward_pass": reward_pass,
+                "reason": ("✅ PASS" if not reasons
+                           else "Rejected: " + " AND ".join(reasons)),
+                **calc}
+
+
+_TRADE_FILTER = TradeFilter()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION  — all numeric thresholds here, no logic changes needed below
 # ══════════════════════════════════════════════════════════════════════════════
 CONFIG = {
@@ -1986,13 +2090,31 @@ class BreakoutScanner:
             if min_rs > 0:
                 self.results = [r for r in self.results if r["rs_rating"] >= min_rs]
 
+        # ── Apply TradeFilter (R/R ≥ 2.0 AND reward ≥ 20%, fee-adjusted) ────────
+        for r in self.results:
+            tf = _TRADE_FILTER.check(r)
+            r["trade_filter_pass"]    = tf["pass"]
+            r["rejection_reason"]     = tf["reason"]
+            r["fee_adj_rr"]           = tf["fee_adj_rr"]
+            r["fee_adj_reward_pct"]   = tf["fee_adj_reward_pct"]
+            r["raw_rr"]               = tf["raw_rr"]
+            r["raw_reward_pct"]       = tf["raw_reward_pct"]
+            r["rr_pass"]              = tf["rr_pass"]
+            r["reward_pass"]          = tf["reward_pass"]
+            r["break_even_pct"]       = _FEE_ENGINE.break_even_move(
+                                            r.get("price") or 1)["break_even_pct"]
+
+        self.rejected_results = [r for r in self.results if not r["trade_filter_pass"]]
+        self.results          = [r for r in self.results if  r["trade_filter_pass"]]
+
         # Sort by explosive score first, then breakout prob
         expl_results = sorted(self.results,
                               key=lambda x: (x["explosive_score"], x["probability"]),
                               reverse=True)
         self.results.sort(key=lambda x: (x["probability"], x["score"]), reverse=True)
 
-        print(f"\nScan complete: {elapsed:.0f}s  |  {len(self.results)} stocks qualified\n")
+        print(f"\nScan complete: {elapsed:.0f}s  |  {len(self.results)} qualified"
+              f"  |  {len(self.rejected_results)} rejected by R/R filter\n")
 
         n_pats = sum(1 for r in self.results if r["pattern"] != "No Pattern")
         self._print_market_box(len(self.results), n_pats)
@@ -2025,6 +2147,27 @@ class BreakoutScanner:
         if getattr(args, "export", True):
             print("\nExporting results...")
             self._export(top_n)
+
+        # REJECTION LOG
+        if self.rejected_results:
+            print("\n" + "═" * 70)
+            print("  ❌ REJECTED TRADES  (did not meet R/R ≥ 2.0 AND reward ≥ 20%)")
+            print("═" * 70)
+            rej_rows = []
+            for r in sorted(self.rejected_results,
+                            key=lambda x: x.get("probability", 0), reverse=True):
+                rej_rows.append([
+                    r["ticker"],
+                    f"{r.get('probability', 0)}%",
+                    f"{r.get('fee_adj_rr', 0):.1f}",
+                    f"+{r.get('fee_adj_reward_pct', 0):.1f}%",
+                    r.get("rejection_reason", "—"),
+                ])
+            print(tabulate(rej_rows,
+                           headers=["Ticker", "Score", "Fee-Adj R/R",
+                                    "Fee-Adj Reward", "Rejection Reason"],
+                           tablefmt="simple"))
+            print("═" * 70)
 
         print(f"\nTotal scan time: {elapsed:.0f}s")
 
@@ -3551,6 +3694,310 @@ _DB_FILE  = "trading_scanner_history.db"
 _POS_SIZE = 10_000.0   # virtual $ per tracked position
 
 
+_PAPER_BUDGET        = 1_000.0
+_PAPER_MAX_POSITIONS = 5
+_PAPER_MAX_PCT       = 0.20
+_PAPER_MIN_CASH      = 100.0
+
+
+class PaperTradingEngine:
+    """$1,000 paper portfolio that auto-trades top signals with fee simulation."""
+
+    def __init__(self, conn):
+        self.conn = conn
+        self.fee  = _FEE_ENGINE
+        self._init_schema()
+        self._load_state()
+
+    def _init_schema(self):
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS paper_portfolio (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker          TEXT,
+                entry_price     REAL,
+                entry_date      DATE,
+                shares          REAL,
+                gross_invested  REAL,
+                buy_fee         REAL,
+                stop_loss       REAL,
+                target_price    REAL,
+                fee_adj_rr      REAL,
+                pattern         TEXT,
+                explosive_score REAL,
+                breakout_prob   REAL,
+                status          TEXT DEFAULT 'OPEN',
+                exit_price      REAL,
+                exit_date       DATE,
+                exit_reason     TEXT,
+                sell_fee        REAL,
+                gross_pnl       REAL,
+                net_pnl         REAL,
+                net_pnl_pct     REAL
+            );
+            CREATE TABLE IF NOT EXISTS paper_state (
+                id               INTEGER PRIMARY KEY,
+                total_capital    REAL,
+                available_cash   REAL,
+                total_fees_paid  REAL,
+                realized_pnl     REAL,
+                trades_made      INTEGER,
+                starting_capital REAL
+            );
+            CREATE TABLE IF NOT EXISTS fees (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_id          INTEGER,
+                ticker           TEXT,
+                transaction_type TEXT,
+                transaction_date DATE,
+                gross_amount     REAL,
+                fee_amount       REAL,
+                net_amount       REAL,
+                running_total    REAL,
+                FOREIGN KEY (call_id) REFERENCES calls(id)
+            );
+            CREATE TABLE IF NOT EXISTS paper_trading (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_date        DATE,
+                total_capital        REAL,
+                available_cash       REAL,
+                invested_value       REAL,
+                unrealized_pnl       REAL,
+                realized_pnl         REAL,
+                total_fees_paid      REAL,
+                open_positions       INTEGER,
+                portfolio_return_pct REAL,
+                spy_return_pct       REAL,
+                alpha                REAL
+            );
+        """)
+
+    def _load_state(self):
+        row = self.conn.execute(
+            "SELECT * FROM paper_state WHERE id=1").fetchone()
+        if row:
+            self._cash          = row["available_cash"]
+            self._fees_paid     = row["total_fees_paid"]
+            self._realized_pnl  = row["realized_pnl"]
+            self._trades        = row["trades_made"]
+            self._starting      = row["starting_capital"]
+        else:
+            self._cash         = _PAPER_BUDGET
+            self._fees_paid    = 0.0
+            self._realized_pnl = 0.0
+            self._trades       = 0
+            self._starting     = _PAPER_BUDGET
+            self._save_state()
+
+    def _save_state(self):
+        self.conn.execute("""
+            INSERT OR REPLACE INTO paper_state
+            (id, total_capital, available_cash, total_fees_paid,
+             realized_pnl, trades_made, starting_capital)
+            VALUES (1,?,?,?,?,?,?)
+        """, (self.total_capital, self._cash, self._fees_paid,
+              self._realized_pnl, self._trades, self._starting))
+        self.conn.commit()
+
+    @property
+    def open_positions(self) -> list:
+        rows = self.conn.execute(
+            "SELECT * FROM paper_portfolio WHERE status='OPEN'").fetchall()
+        return [dict(r) for r in rows]
+
+    @property
+    def total_capital(self) -> float:
+        invested = sum((p.get("gross_invested") or 0) - (p.get("buy_fee") or 0)
+                       for p in self.open_positions)
+        return self._cash + invested
+
+    def open_position(self, ticker: str, signal: dict) -> dict:
+        positions = self.open_positions
+        if len(positions) >= _PAPER_MAX_POSITIONS:
+            return {"success": False,
+                    "reason": f"Max positions reached ({_PAPER_MAX_POSITIONS})"}
+        if any(p["ticker"] == ticker for p in positions):
+            return {"success": False, "reason": f"Already holding {ticker}"}
+        if self._cash < _PAPER_MIN_CASH:
+            return {"success": False,
+                    "reason": f"Insufficient cash (${self._cash:.2f})"}
+
+        slots = _PAPER_MAX_POSITIONS - len(positions)
+        gross = min(self._cash * _PAPER_MAX_PCT,
+                    self._cash / slots if slots > 0 else self._cash * _PAPER_MAX_PCT)
+        gross = max(gross, _PAPER_MIN_CASH)
+
+        price    = signal.get("price") or 0
+        if not price:
+            return {"success": False, "reason": "No price data"}
+        buy_calc = self.fee.calculate_buy(gross, price)
+
+        self._cash      -= gross
+        self._fees_paid += buy_calc["fee"]
+        self._trades    += 1
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        self.conn.execute("""
+            INSERT INTO paper_portfolio
+            (ticker, entry_price, entry_date, shares, gross_invested, buy_fee,
+             stop_loss, target_price, fee_adj_rr, pattern, explosive_score, breakout_prob)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (ticker, price, today, buy_calc["shares"], gross, buy_calc["fee"],
+              signal.get("stop_price", 0), signal.get("tgt_price", 0),
+              signal.get("fee_adj_rr", 0), signal.get("pattern", ""),
+              signal.get("explosive_score", 0), signal.get("probability", 0)))
+
+        self.conn.execute("""
+            INSERT INTO fees
+            (ticker, transaction_type, transaction_date, gross_amount,
+             fee_amount, net_amount, running_total)
+            VALUES (?,?,?,?,?,?,?)
+        """, (ticker, "BUY", today, gross,
+              buy_calc["fee"], buy_calc["net_investment"], self._fees_paid))
+        self._save_state()
+        return {"success": True, "shares": round(buy_calc["shares"], 4),
+                "gross": gross, "fee": round(buy_calc["fee"], 2),
+                "effective_price": round(buy_calc["effective_price"], 4)}
+
+    def close_position(self, ticker: str, exit_price: float,
+                       reason: str = "MANUAL") -> dict:
+        row = self.conn.execute(
+            "SELECT * FROM paper_portfolio WHERE ticker=? AND status='OPEN'",
+            (ticker,)).fetchone()
+        if not row:
+            return {"success": False, "reason": f"No open position for {ticker}"}
+        pos      = dict(row)
+        sell     = self.fee.calculate_sell(pos["shares"], exit_price)
+        gross_pnl = (exit_price - pos["entry_price"]) * pos["shares"]
+        net_pnl   = gross_pnl - (pos.get("buy_fee") or 0) - sell["fee"]
+        net_pct   = net_pnl / (pos.get("gross_invested") or 1) * 100
+        today     = datetime.now().strftime("%Y-%m-%d")
+
+        self._cash         += sell["net"]
+        self._fees_paid    += sell["fee"]
+        self._realized_pnl += net_pnl
+
+        self.conn.execute("""
+            UPDATE paper_portfolio
+            SET status='CLOSED', exit_price=?, exit_date=?, exit_reason=?,
+                sell_fee=?, gross_pnl=?, net_pnl=?, net_pnl_pct=?
+            WHERE ticker=? AND status='OPEN'
+        """, (exit_price, today, reason, sell["fee"],
+              gross_pnl, net_pnl, net_pct, ticker))
+
+        self.conn.execute("""
+            INSERT INTO fees
+            (ticker, transaction_type, transaction_date, gross_amount,
+             fee_amount, net_amount, running_total)
+            VALUES (?,?,?,?,?,?,?)
+        """, (ticker, "SELL", today, sell["gross"],
+              sell["fee"], sell["net"], self._fees_paid))
+        self._save_state()
+        return {"success": True, "exit_price": exit_price,
+                "sell_fee": round(sell["fee"], 2),
+                "gross_pnl": round(gross_pnl, 2),
+                "net_pnl": round(net_pnl, 2), "net_pnl_pct": round(net_pct, 1)}
+
+    def check_stops_and_targets(self) -> list:
+        closed = []
+        for pos in self.open_positions:
+            try:
+                raw = yf.download(pos["ticker"], period="2d", interval="1d",
+                                  progress=False, auto_adjust=True)
+                if raw.empty:
+                    continue
+                if isinstance(raw.columns, pd.MultiIndex):
+                    raw.columns = raw.columns.get_level_values(0)
+                price  = float(raw["Close"].iloc[-1])
+                stop   = pos.get("stop_loss")  or 0
+                target = pos.get("target_price") or 0
+                reason = None
+                if stop   and price <= stop:   reason = "STOP_HIT"
+                elif target and price >= target: reason = "TARGET_HIT"
+                if reason:
+                    res = self.close_position(pos["ticker"], price, reason)
+                    res["ticker"] = pos["ticker"]
+                    closed.append(res)
+            except Exception:
+                pass
+        return closed
+
+    def auto_trade(self, scan_results: list) -> list:
+        self.check_stops_and_targets()
+        candidates = [r for r in scan_results
+                      if r.get("trade_filter_pass")
+                      and (r.get("explosive_score", 0) >= 70
+                           or r.get("probability", 0) >= 65)]
+        candidates.sort(key=lambda x: x.get("explosive_score", 0), reverse=True)
+        opened = []
+        for sig in candidates:
+            res = self.open_position(sig["ticker"], sig)
+            if res.get("success"):
+                opened.append({"ticker": sig["ticker"], **res})
+        self._save_snapshot()
+        return opened
+
+    def _save_snapshot(self):
+        try:
+            positions = self.open_positions
+            invested  = sum((p.get("gross_invested") or 0) - (p.get("buy_fee") or 0)
+                            for p in positions)
+            today     = datetime.now().strftime("%Y-%m-%d")
+            ret_pct   = (self.total_capital - self._starting) / self._starting * 100
+            self.conn.execute("""
+                INSERT INTO paper_trading
+                (snapshot_date, total_capital, available_cash, invested_value,
+                 unrealized_pnl, realized_pnl, total_fees_paid, open_positions,
+                 portfolio_return_pct, spy_return_pct, alpha)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """, (today, self.total_capital, self._cash, invested,
+                  0.0, self._realized_pnl, self._fees_paid, len(positions),
+                  ret_pct, 0.0, 0.0))
+            self.conn.commit()
+        except Exception:
+            pass
+
+    def reset(self, budget: float = _PAPER_BUDGET):
+        self.conn.executescript("""
+            DELETE FROM paper_portfolio;
+            DELETE FROM paper_state;
+            DELETE FROM fees;
+            DELETE FROM paper_trading;
+        """)
+        self._cash = budget; self._fees_paid = 0.0
+        self._realized_pnl = 0.0; self._trades = 0; self._starting = budget
+        self._save_state()
+
+    def get_summary(self) -> dict:
+        positions  = self.open_positions
+        invested   = sum((p.get("gross_invested") or 0) - (p.get("buy_fee") or 0)
+                         for p in positions)
+        total      = self._cash + invested
+        total_ret  = total - self._starting
+        ret_pct    = total_ret / self._starting * 100 if self._starting else 0
+        row = self.conn.execute(
+            "SELECT COUNT(*), SUM(net_pnl) FROM paper_portfolio WHERE status='CLOSED'"
+        ).fetchone()
+        return {
+            "starting_capital": self._starting,
+            "total_capital":    total,
+            "available_cash":   self._cash,
+            "invested_value":   invested,
+            "total_return":     total_ret,
+            "total_return_pct": round(ret_pct, 2),
+            "total_fees_paid":  self._fees_paid,
+            "fee_drag_pct":     round(self._fees_paid / self._starting * 100, 2)
+                                if self._starting else 0,
+            "realized_pnl":     self._realized_pnl,
+            "unrealized_pnl":   invested - sum((p.get("gross_invested") or 0)
+                                               for p in positions),
+            "open_positions":   len(positions),
+            "max_positions":    _PAPER_MAX_POSITIONS,
+            "trades_made":      self._trades,
+            "n_closed":         row[0] if row and row[0] else 0,
+            "break_even_pct":   _FEE_ENGINE.break_even_move(1.0)["break_even_pct"],
+        }
+
+
 class CallLogger:
     """Records every scanner call and tracks outcomes persistently via SQLite."""
 
@@ -3611,22 +4058,31 @@ class CallLogger:
                 notes             TEXT
             );
             CREATE TABLE IF NOT EXISTS portfolio (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                call_id       INTEGER,
-                ticker        TEXT,
-                position_type TEXT DEFAULT 'VIRTUAL',
-                shares        REAL,
-                entry_price   REAL,
-                entry_date    DATE,
-                status        TEXT DEFAULT 'OPEN',
-                current_price REAL,
-                current_pct   REAL,
-                current_value REAL,
-                exit_price    REAL,
-                exit_date     DATE,
-                exit_reason   TEXT,
-                realized_pct  REAL,
-                realized_pnl  REAL,
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_id           INTEGER,
+                ticker            TEXT,
+                position_type     TEXT DEFAULT 'VIRTUAL',
+                shares            REAL,
+                entry_price       REAL,
+                entry_date        DATE,
+                status            TEXT DEFAULT 'OPEN',
+                current_price     REAL,
+                current_pct       REAL,
+                current_value     REAL,
+                exit_price        REAL,
+                exit_date         DATE,
+                exit_reason       TEXT,
+                realized_pct      REAL,
+                realized_pnl      REAL,
+                position_size_pct REAL,
+                buy_fee           REAL,
+                sell_fee          REAL,
+                total_fees        REAL,
+                fee_drag_pct      REAL,
+                gross_pnl         REAL,
+                net_pnl           REAL,
+                net_pnl_pct       REAL,
+                fee_adjusted_rr   REAL,
                 FOREIGN KEY (call_id) REFERENCES calls(id)
             );
             CREATE TABLE IF NOT EXISTS scan_runs (
@@ -4534,6 +4990,18 @@ def main():
                     help="Run scan but do NOT log results to history")
     ap.add_argument("--calibrate",      action="store_true",
                     help="Show probability calibration warnings and exit")
+    ap.add_argument("--paper",          action="store_true",
+                    help="Show paper trading portfolio summary and exit")
+    ap.add_argument("--paper-reset",    action="store_true",
+                    help="Reset paper portfolio back to $1,000 (asks confirmation)")
+    ap.add_argument("--paper-budget",   type=float, default=None, metavar="N",
+                    help="Set paper portfolio starting budget (default $1,000)")
+    ap.add_argument("--fees",           action="store_true",
+                    help="Show fees tracker summary and exit")
+    ap.add_argument("--no-auto-trade",  action="store_true",
+                    help="Scan without auto-opening paper trades")
+    ap.add_argument("--rejected",       action="store_true",
+                    help="Show full rejection log from last scan and exit")
     args = ap.parse_args()
 
     # ── Weight management shortcuts ───────────────────────────────────────────

@@ -4,6 +4,7 @@ Run with:  streamlit run app.py
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
@@ -286,6 +287,7 @@ def _render_stock_card(r: dict):
     grade    = r.get("explosive_grade", "") or ""
     stop     = r.get("stop_price") or 0
     target   = r.get("tgt_price") or 0
+    t1       = r.get("t1_price") or 0
     rr       = r.get("rr", 0) or 0
     move_lo  = r.get("move_low", 0) or 0
     move_hi  = r.get("move_high", 0) or 0
@@ -315,6 +317,7 @@ def _render_stock_card(r: dict):
 
     stop_str   = f"${stop:.2f}"   if stop   else "—"
     tgt_str    = f"${target:.2f}" if target else "—"
+    t1_str     = f"${t1:.2f}"    if t1     else "—"
     rr_str     = f"{rr:.1f}:1"   if rr     else "—"
 
     move_html = ""
@@ -372,11 +375,13 @@ def _render_stock_card(r: dict):
       {expl_html}
       <hr class="card-divider">
       <div class="tg-label" style="margin-bottom:6px;">Trade Plan</div>
-      <div class="trade-grid">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr 1fr;gap:6px;margin:6px 0 8px;">
         <div><div class="tg-label">Entry</div>
              <div class="tg-val">${price:.2f}</div></div>
-        <div><div class="tg-label">Stop Loss</div>
+        <div><div class="tg-label">Stop</div>
              <div class="tg-val tg-red">{stop_str}</div></div>
+        <div><div class="tg-label">T1 (50%)</div>
+             <div class="tg-val tg-blue">{t1_str}</div></div>
         <div><div class="tg-label">Target</div>
              <div class="tg-val tg-green">{tgt_str}</div></div>
         <div><div class="tg-label">R : R</div>
@@ -392,6 +397,113 @@ def _render_stock_card(r: dict):
     if st.button("📈 View Chart", key=f"card_{ticker}", use_container_width=True):
         st.session_state.selected = ticker
         st.rerun()
+
+def _render_market_clock():
+    """Live ET market clock with session quality and countdown — updates every second via JS."""
+    session = ts.MarketClock.get_session()
+    q       = session["quality"]
+    color   = session["color"]
+    name    = session["name"]
+    advice  = ts.MarketClock.get_advice()
+    rem     = session.get("remaining_seconds", 0)
+    nxt     = session.get("next_prime_seconds", 0)
+
+    # Choose what the countdown tracks
+    counting_down_to = ("Session ends" if q in ("PRIME", "SECONDARY", "CAUTION")
+                        else "Next prime")
+
+    _BADGE = {
+        "PRIME":     ("#1a4428", "#3fb950"),
+        "SECONDARY": ("#0d2d6b", "#58a6ff"),
+        "CAUTION":   ("#4a3b00", "#e3b341"),
+        "AVOID":     ("#4c1b1b", "#f85149"),
+        "PREMARKET": ("#2a1957", "#6e40c9"),
+        "CLOSED":    ("#21262d", "#8b949e"),
+    }
+    bg, fg = _BADGE.get(q, ("#21262d", "#8b949e"))
+    # Server-side end-time in ms so the JS countdown is accurate immediately
+    countdown_secs = rem if q in ("PRIME", "SECONDARY", "CAUTION", "AVOID", "PREMARKET") else nxt
+
+    html = f"""<!DOCTYPE html>
+<html><head><style>
+  * {{ box-sizing:border-box; }}
+  body {{ margin:0; padding:0; background:#0d1117;
+         font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }}
+  .card {{background:#161b22;border:1px solid {color};border-radius:10px;padding:13px 15px;}}
+  .lbl  {{font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.08em;margin-bottom:3px;}}
+  .time {{font-size:26px;font-weight:800;color:#e6edf3;font-family:monospace;letter-spacing:.03em;}}
+  .date {{font-size:10px;color:#8b949e;margin-top:1px;margin-bottom:8px;}}
+  .badge{{display:inline-block;background:{bg};color:{fg};padding:3px 11px;
+          border-radius:10px;font-size:10px;font-weight:700;margin-bottom:7px;}}
+  .adv  {{font-size:10px;color:#8b949e;line-height:1.45;margin-bottom:8px;}}
+  .cd-hdr{{font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;}}
+  .cd-row{{display:flex;gap:6px;}}
+  .cd-box{{flex:1;background:#0d1117;border-radius:6px;padding:5px 0;text-align:center;}}
+  .cd-val{{font-size:18px;font-weight:700;color:#e6edf3;font-family:monospace;}}
+  .cd-lbl{{font-size:8px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;}}
+</style></head><body>
+<div class="card">
+  <div class="lbl">Market Clock (Eastern Time)</div>
+  <div class="time" id="ct">--:--:-- --</div>
+  <div class="date" id="cd">Loading…</div>
+  <div class="badge">{q} &nbsp;·&nbsp; {name}</div>
+  <div class="adv">{advice}</div>
+  <div class="cd-hdr">{counting_down_to}</div>
+  <div class="cd-row">
+    <div class="cd-box"><div class="cd-val" id="ch">--</div><div class="cd-lbl">Hours</div></div>
+    <div class="cd-box"><div class="cd-val" id="cm">--</div><div class="cd-lbl">Mins</div></div>
+    <div class="cd-box"><div class="cd-val" id="cs">--</div><div class="cd-lbl">Secs</div></div>
+  </div>
+</div>
+<script>
+(function(){{
+  var target = Date.now() + {countdown_secs} * 1000;
+  function pad(n){{ return String(n).padStart(2,'0'); }}
+  function tick(){{
+    var now = new Date();
+    // Live ET clock
+    document.getElementById('ct').innerHTML =
+      now.toLocaleTimeString('en-US',{{timeZone:'America/New_York',hour:'numeric',
+        minute:'2-digit',second:'2-digit',hour12:true}});
+    document.getElementById('cd').innerHTML =
+      now.toLocaleDateString('en-US',{{timeZone:'America/New_York',
+        weekday:'short',month:'short',day:'numeric',year:'numeric'}});
+    // Countdown
+    var rem = Math.max(0, Math.floor((target - Date.now())/1000));
+    var h = Math.floor(rem/3600), r = rem%3600, m = Math.floor(r/60), s = r%60;
+    document.getElementById('ch').innerHTML = pad(h);
+    document.getElementById('cm').innerHTML = pad(m);
+    document.getElementById('cs').innerHTML = pad(s);
+  }}
+  setInterval(tick, 1000); tick();
+}})();
+</script></body></html>"""
+
+    components.html(html, height=218, scrolling=False)
+
+
+def _render_regime_banner(regime: dict):
+    """Horizontal banner showing current market regime."""
+    if not regime or regime.get("regime") == "UNKNOWN":
+        return
+    color = regime["color"]
+    r20   = regime.get("ret_20d", 0)
+    vol   = regime.get("hist_vol", 0)
+    a200  = "Above" if regime.get("above_200") else "Below"
+    st.markdown(f"""
+    <div style="background:#161b22;border:1px solid {color};border-radius:8px;
+                padding:9px 16px;margin-bottom:14px;display:flex;
+                justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+      <div>
+        <span style="color:{color};font-weight:700;font-size:0.88rem;">
+          📊 {regime['label']} Market Regime</span>
+        <span style="color:#8b949e;font-size:0.77rem;margin-left:10px;">
+          SPY {r20:+.1f}% (20d) &nbsp;·&nbsp; {a200} 200d SMA &nbsp;·&nbsp; Vol {vol:.0f}%</span>
+      </div>
+      <span style="color:#8b949e;font-size:0.76rem;">{regime['advice']}</span>
+    </div>
+    """, unsafe_allow_html=True)
+
 
 def _is_streamlit_cloud() -> bool:
     return (
@@ -448,6 +560,7 @@ for key, default in [
     ("market_ctx", {}),
     ("selected", None),
     ("scan_ran", False),
+    ("regime", {}),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -459,6 +572,9 @@ for key, default in [
 with st.sidebar:
     st.markdown("## 📈 Trading Scanner")
     st.caption("Configure and launch your scan below.")
+
+    # ── Live Market Clock ──────────────────────────────────────────────────────
+    _render_market_clock()
     st.divider()
 
     universe = st.selectbox(
@@ -496,6 +612,24 @@ with st.sidebar:
 # SCAN EXECUTION
 # ══════════════════════════════════════════════════════════════════════════════
 if run_btn:
+    # ── Trading-window advisory ────────────────────────────────────────────────
+    _session_now = ts.MarketClock.get_session()
+    _sq          = _session_now["quality"]
+    if _sq == "AVOID":
+        st.sidebar.warning(
+            f"⚠️ **{_session_now['name']}** — scanning now but paper bot will "
+            f"hold off on new entries. Clears in "
+            f"{_session_now['remaining_seconds'] // 60}m "
+            f"{_session_now['remaining_seconds'] % 60}s.",
+            icon="🕐",
+        )
+    elif _sq == "CAUTION":
+        st.sidebar.info(
+            "⚠️ Midday chop window — paper bot uses stricter thresholds "
+            "(prob ≥ 72%, explosive ≥ 75).",
+            icon="🌤️",
+        )
+
     conn, _mode = get_db()
 
     # Pre-scan: refresh pending outcomes silently
@@ -554,6 +688,7 @@ if run_btn:
         "filtered":  getattr(scanner, "_universe_filtered",  0),
         "advanced":  getattr(scanner, "_universe_advanced",  0),
     }
+    st.session_state.regime = getattr(scanner, "regime", {})
 
     # Post-scan: log to portfolio tracker
     if not paper_only and scanner.results:
@@ -569,33 +704,47 @@ if run_btn:
 
     # Post-scan: auto-trade paper portfolio
     all_results = scanner.results + getattr(scanner, "rejected_results", [])
-    paper = ts.PaperTradingEngine(conn)
-    opened = paper.auto_trade(all_results)
-    closed = getattr(paper, "_last_closed", [])
+    paper   = ts.PaperTradingEngine(conn)
+    opened  = paper.auto_trade(all_results)
+    last_s  = getattr(paper, "_last_session", {})
+    last_sq = last_s.get("quality", "UNKNOWN") if isinstance(last_s, dict) else "UNKNOWN"
+
     if opened:
+        session_tag = f" [{last_sq}]" if last_sq != "UNKNOWN" else ""
         st.sidebar.success(
-            f"💼 Paper portfolio: opened {len(opened)} new position(s) — "
+            f"💼 Paper bot opened {len(opened)} position(s){session_tag}: "
             + ", ".join(o["ticker"] for o in opened)
         )
     elif not paper_only:
-        # explain why no trades were opened
-        n_pass  = sum(1 for r in all_results if r.get("trade_filter_pass"))
-        n_qual  = sum(1 for r in all_results
-                      if r.get("trade_filter_pass")
-                      and (r.get("explosive_score", 0) >= 70
-                           or r.get("probability", 0) >= 65))
-        port    = paper.get_summary()
-        if port["open_positions"] >= ts._PAPER_MAX_POSITIONS:
-            st.sidebar.info("💼 Paper portfolio full (5/5 positions).")
-        elif port["available_cash"] < ts._PAPER_MIN_CASH:
-            st.sidebar.info(f"💼 Not enough cash (${port['available_cash']:.2f}).")
-        elif n_pass == 0:
-            st.sidebar.info("💼 No trades passed R/R ≥ 2.0 + reward ≥ 20% filter.")
-        elif n_qual == 0:
-            st.sidebar.info(
-                f"💼 {n_pass} trade(s) passed R/R filter but none had "
-                f"explosive score ≥ 70 or probability ≥ 65%."
+        if last_sq == "AVOID":
+            rem = last_s.get("remaining_seconds", 0) if isinstance(last_s, dict) else 0
+            st.sidebar.warning(
+                f"🕐 Paper bot paused — {last_s.get('name','Opening/Closing Volatility')}. "
+                f"Resumes in {rem // 60}m {rem % 60}s.",
             )
+        elif last_sq == "CAUTION":
+            st.sidebar.info(
+                "⚠️ Midday window — paper bot used stricter thresholds. "
+                "Check Scan Results to see if any signals qualify."
+            )
+        else:
+            n_pass = sum(1 for r in all_results if r.get("trade_filter_pass"))
+            n_qual = sum(1 for r in all_results
+                         if r.get("trade_filter_pass")
+                         and (r.get("explosive_score", 0) >= 70
+                              or r.get("probability", 0) >= 65))
+            port   = paper.get_summary()
+            if port["open_positions"] >= ts._PAPER_MAX_POSITIONS:
+                st.sidebar.info("💼 Paper portfolio full (5/5 positions).")
+            elif port["available_cash"] < ts._PAPER_MIN_CASH:
+                st.sidebar.info(f"💼 Not enough cash (${port['available_cash']:.2f}).")
+            elif n_pass == 0:
+                st.sidebar.info("💼 No trades passed fee-adj R/R ≥ 2.0 + reward ≥ 20% filter.")
+            elif n_qual == 0:
+                st.sidebar.info(
+                    f"💼 {n_pass} trade(s) passed R/R filter but none had "
+                    f"explosive ≥ 70 or prob ≥ 65%."
+                )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -783,6 +932,9 @@ with tab_results:
     else:
         results = st.session_state.results
         ctx     = st.session_state.market_ctx
+
+        # ── Market regime banner ──────────────────────────────────────────────
+        _render_regime_banner(st.session_state.regime)
 
         # ── Market context bar ────────────────────────────────────────────────
         raw      = ctx.get("spy_raw", 0)

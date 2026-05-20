@@ -68,6 +68,220 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MARKET CLOCK — real-time ET session tracker with optimal trading windows
+# ══════════════════════════════════════════════════════════════════════════════
+class MarketClock:
+    """
+    Tracks US market sessions and returns trading-window quality.
+
+    Windows (all times Eastern):
+      AVOID     09:30–09:45   Opening volatility — unpredictable, wide spreads
+      PRIME     09:45–11:30   Best breakout resolution; institutions active
+      CAUTION   11:30–13:00   Midday chop — low follow-through
+      SECONDARY 13:00–14:30   Afternoon directional drift; still tradeable
+      PRIME     14:30–15:45   Power hour — volume surge, clean momentum entries
+      AVOID     15:45–16:00   MOC orders distort price — avoid new entries
+      PREMARKET 04:00–09:30   Scan & plan only; no live paper-trade opens
+      CLOSED    all other     Review and prepare for next session
+    """
+
+    # Each row: (start_h, start_m, end_h, end_m, quality, name, hex_color)
+    _WINDOWS = [
+        ( 0,  0,  4,  0, "CLOSED",     "Overnight",            "#30363d"),
+        ( 4,  0,  9, 30, "PREMARKET",  "Pre-Market Setup",     "#6e40c9"),
+        ( 9, 30,  9, 45, "AVOID",      "Opening Volatility",   "#f85149"),
+        ( 9, 45, 11, 30, "PRIME",      "Prime Entry Window",   "#3fb950"),
+        (11, 30, 13,  0, "CAUTION",    "Midday Chop",          "#e3b341"),
+        (13,  0, 14, 30, "SECONDARY",  "Early Afternoon",      "#58a6ff"),
+        (14, 30, 15, 45, "PRIME",      "Power Hour",           "#3fb950"),
+        (15, 45, 16,  0, "AVOID",      "Closing Volatility",   "#f85149"),
+        (16,  0, 20,  0, "CLOSED",     "After Hours",          "#30363d"),
+        (20,  0, 24,  0, "CLOSED",     "Overnight",            "#30363d"),
+    ]
+
+    @classmethod
+    def now_et(cls) -> "datetime":
+        """Current time in US/Eastern, handling DST automatically."""
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.now(ZoneInfo("America/New_York"))
+        except ImportError:
+            try:
+                import pytz
+                return datetime.now(pytz.timezone("America/New_York"))
+            except ImportError:
+                # rough fallback — UTC−5 (will be off by 1h during EDT)
+                return datetime.utcnow() - timedelta(hours=5)
+
+    @classmethod
+    def get_session(cls) -> dict:
+        """Return current session metadata including countdown and quality."""
+        now = cls.now_et()
+
+        # Weekend — find next Monday 9:45 AM ET
+        if now.weekday() >= 5:
+            days = (7 - now.weekday()) % 7 or 7
+            nxt  = (now + timedelta(days=days)).replace(
+                hour=9, minute=45, second=0, microsecond=0)
+            secs = max(0, int((nxt - now).total_seconds()))
+            return {
+                "quality": "CLOSED", "name": "Weekend — Market Closed",
+                "color": "#30363d", "remaining_seconds": secs,
+                "next_prime_seconds": secs, "is_open": False, "time_et": now,
+            }
+
+        h, m  = now.hour, now.minute
+        total = h * 60 + m
+
+        for sh, sm, eh, em, quality, name, color in cls._WINDOWS:
+            if sh * 60 + sm <= total < eh * 60 + em:
+                end_dt    = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+                remaining = max(0, int((end_dt - now).total_seconds()))
+                return {
+                    "quality":            quality,
+                    "name":               name,
+                    "color":              color,
+                    "remaining_seconds":  remaining,
+                    "next_prime_seconds": cls._secs_to_next_prime(now),
+                    "is_open":            quality in ("PRIME", "SECONDARY"),
+                    "time_et":            now,
+                }
+
+        return {"quality": "CLOSED", "name": "Closed", "color": "#30363d",
+                "remaining_seconds": 0, "next_prime_seconds": 0,
+                "is_open": False, "time_et": now}
+
+    @classmethod
+    def _secs_to_next_prime(cls, now) -> int:
+        h, m  = now.hour, now.minute
+        total = h * 60 + m
+        for sh, sm, eh, em, quality, *_ in cls._WINDOWS:
+            if quality == "PRIME" and sh * 60 + sm > total:
+                t = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+                return max(0, int((t - now).total_seconds()))
+        # Roll to next trading day at 9:45
+        for i in range(1, 8):
+            nxt = now + timedelta(days=i)
+            if nxt.weekday() < 5:
+                t = nxt.replace(hour=9, minute=45, second=0, microsecond=0)
+                return max(0, int((t - now).total_seconds()))
+        return 0
+
+    @classmethod
+    def should_trade(cls) -> bool:
+        return cls.get_session()["quality"] in ("PRIME", "SECONDARY")
+
+    @classmethod
+    def get_advice(cls) -> str:
+        s   = cls.get_session()
+        q   = s["quality"]
+        rem = s.get("remaining_seconds", 0)
+        h_, r  = divmod(rem, 3600)
+        m_, sc = divmod(r,   60)
+        timer  = (f"{h_}h {m_}m" if h_ else f"{m_}m {sc}s") if rem else ""
+        if q == "PRIME":
+            return f"✅ PRIME WINDOW — Best time to scan & trade. {timer} remaining."
+        if q == "SECONDARY":
+            return f"🟡 SECONDARY — Good for momentum plays. {timer} remaining."
+        if q == "CAUTION":
+            return f"⚠️ MIDDAY CHOP — Low follow-through. Avoid new entries. {timer} left."
+        if q == "AVOID":
+            return f"🔴 {s['name']} — High noise. Skip new entries. Clears in {timer}."
+        if q == "PREMARKET":
+            return f"🔵 PRE-MARKET — Good time to scan setups. Trade after 9:45 ET. {timer} to open."
+        nxt = s.get("next_prime_seconds", 0)
+        h2, r2 = divmod(nxt, 3600); m2, _ = divmod(r2, 60)
+        nxt_str = f"{h2}h {m2}m" if h2 else f"{m2}m"
+        return f"⚫ CLOSED — Review setups. Next prime window in ~{nxt_str}."
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MARKET REGIME DETECTOR — classifies SPY trend for adaptive signal thresholds
+# ══════════════════════════════════════════════════════════════════════════════
+class MarketRegimeDetector:
+    """
+    Classifies broad market environment using SPY daily price action.
+
+    Regimes:
+      STRONG BULL  — above 20/50/200d SMA, positive 20d return, low vol
+      BULL         — above 50d + 200d SMA
+      NEUTRAL      — mixed (above one, below other)
+      RECOVERING   — above 50d but below 200d (bear-market rally)
+      BEAR         — below both 50d and 200d SMA
+    """
+
+    @staticmethod
+    def detect(spy_df: "pd.DataFrame") -> dict:
+        if spy_df is None or len(spy_df) < 50:
+            return {
+                "regime": "UNKNOWN", "label": "Unknown", "color": "#8b949e",
+                "score": 0, "advice": "Insufficient SPY data — using standard filters.",
+                "above_50": True, "above_200": True,
+                "dist_200_pct": 0.0, "ret_5d": 0.0, "ret_20d": 0.0, "hist_vol": 15.0,
+            }
+
+        C   = spy_df["Close"].values
+        cur = float(C[-1])
+
+        sma20  = float(C[-20:].mean()) if len(C) >= 20  else cur
+        sma50  = float(C[-50:].mean()) if len(C) >= 50  else cur
+        sma200 = float(C[-200:].mean()) if len(C) >= 200 else float(C.mean())
+
+        above_20  = cur > sma20
+        above_50  = cur > sma50
+        above_200 = cur > sma200
+
+        ret_5d  = float((cur - C[-6])  / C[-6])  if len(C) > 5  else 0.0
+        ret_20d = float((cur - C[-21]) / C[-21]) if len(C) > 20 else 0.0
+        dist200 = (cur - sma200) / sma200 * 100
+
+        # 20-day annualised historical volatility
+        if len(C) >= 21:
+            lrets    = np.diff(np.log(np.clip(C[-21:], 1e-9, None)))
+            hist_vol = float(np.std(lrets) * np.sqrt(252) * 100)
+        else:
+            hist_vol = 15.0
+
+        # Bull/bear score: each confirmed factor +1, each failed factor -1
+        score = sum([
+            1 if above_200 else -1,
+            1 if above_50  else -1,
+            1 if above_20  else -1,
+            1 if ret_20d > 0 else -1,
+            1 if ret_5d  > 0 else -1,
+        ])
+
+        if score >= 4 and ret_20d > 0.02:
+            regime, color, label = "STRONG BULL", "#3fb950", "Strong Bull"
+            advice = "Strong uptrend. Standard scan parameters. Full position sizing."
+        elif score >= 3:
+            regime, color, label = "BULL", "#58a6ff", "Bull"
+            advice = "Uptrend intact. Standard filters work well."
+        elif score >= 1:
+            regime, color, label = "NEUTRAL", "#e3b341", "Neutral"
+            advice = "Mixed signals. Recommend prob ≥ 65% filter."
+        elif score >= -1:
+            regime, color, label = "RECOVERING", "#e3b341", "Recovering"
+            advice = "Bear-market rally. High-quality setups only (prob ≥ 70%)."
+        else:
+            regime, color, label = "BEAR", "#f85149", "Bear"
+            advice = "Bear market. Only RS leaders pass. Reduce position size."
+
+        if hist_vol > 35:
+            advice = f"⚡ HIGH VOL ({hist_vol:.0f}% ann.) — " + advice
+
+        return {
+            "regime": regime, "label": label, "color": color,
+            "score": score, "advice": advice,
+            "above_50": above_50, "above_200": above_200,
+            "dist_200_pct": round(dist200, 1),
+            "ret_5d": round(ret_5d * 100, 2),
+            "ret_20d": round(ret_20d * 100, 2),
+            "hist_vol": round(hist_vol, 1),
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # FEE ENGINE — 1.5% per transaction (broker + spread + slippage)
 # ══════════════════════════════════════════════════════════════════════════════
 class FeeEngine:
@@ -1271,6 +1485,100 @@ class BreakoutProbabilityEngine:
         except Exception:
             pass
 
+        # ── MACD ─────────────────────────────────────────────────────────────
+        try:
+            if "MACD_line" in df.columns and "MACD_signal" in df.columns:
+                ml  = df["MACD_line"].dropna();    ms = df["MACD_signal"].dropna()
+                mh  = df["MACD_hist"].dropna() if "MACD_hist" in df.columns else pd.Series(dtype=float)
+                if len(ml) >= 2 and len(ms) >= 2:
+                    mv = float(ml.iloc[-1]); sv = float(ms.iloc[-1])
+                    hv = float(mh.iloc[-1]) if not mh.empty else mv - sv
+                    hp = float(mh.iloc[-2]) if len(mh) >= 2 else hv
+                    if mv > sv and mv > 0:
+                        add("MACD above signal & zero line (strong momentum)", +6)
+                    elif mv > sv and mv < 0:
+                        add("MACD bullish crossover (momentum turning up)", +4)
+                    elif mv < sv:
+                        add("MACD below signal line (bearish momentum)",      -5)
+                    if hv > 0 and hv > hp:
+                        add("MACD histogram expanding (acceleration)",         +4)
+                    elif hv < 0 and hv < hp:
+                        add("MACD histogram contracting negative (weakening)", -3)
+        except Exception:
+            pass
+
+        # ── OBV ──────────────────────────────────────────────────────────────
+        try:
+            if "OBV" in df.columns and "OBV_SMA20" in df.columns:
+                ov  = float(df["OBV"].iloc[-1])
+                osv = df["OBV_SMA20"].dropna()
+                if not osv.empty:
+                    if ov > float(osv.iloc[-1]):
+                        add("OBV above 20-SMA — institutional buying confirmed", +5)
+                    else:
+                        add("OBV below 20-SMA — distribution underway",          -4)
+        except Exception:
+            pass
+
+        # ── MFI ──────────────────────────────────────────────────────────────
+        try:
+            if "MFI_14" in df.columns:
+                mfi_s = df["MFI_14"].dropna()
+                if not mfi_s.empty:
+                    mv = float(mfi_s.iloc[-1])
+                    if 40 <= mv <= 60:
+                        add(f"MFI neutral-accumulation zone ({mv:.0f})", +3)
+                    elif 60 < mv <= 80:
+                        add(f"MFI bullish zone ({mv:.0f})",               +4)
+                    elif mv > 80:
+                        add(f"MFI overbought ({mv:.0f})",                 -4)
+                    elif mv < 20:
+                        add(f"MFI oversold ({mv:.0f}) — reversal setup",  +2)
+        except Exception:
+            pass
+
+        # ── Stochastic RSI ────────────────────────────────────────────────────
+        try:
+            if "SRSI_K" in df.columns and "SRSI_D" in df.columns:
+                k_s = df["SRSI_K"].dropna(); d_s = df["SRSI_D"].dropna()
+                if len(k_s) >= 2 and len(d_s) >= 2:
+                    kv = float(k_s.iloc[-1]); dv = float(d_s.iloc[-1])
+                    kp = float(k_s.iloc[-2]); dp = float(d_s.iloc[-2])
+                    if kv > dv and kp <= dp and kv < 80:
+                        add("StochRSI golden cross K > D (fresh bullish signal)", +5)
+                    elif kv > dv and 20 <= kv < 80:
+                        add("StochRSI bullish (K > D, room to run)",               +3)
+                    elif kv > 80:
+                        add(f"StochRSI overbought ({kv:.0f})",                    -4)
+                    elif kv < 20 and kv > dv:
+                        add("StochRSI oversold turning up",                        +2)
+        except Exception:
+            pass
+
+        # ── Weekly Chart Alignment ────────────────────────────────────────────
+        try:
+            if "W_SMA10" in df.columns:
+                w10 = df["W_SMA10"].dropna()
+                if not w10.empty:
+                    wv10 = float(w10.iloc[-1])
+                    if wv10 > 0 and cur > wv10:
+                        if "W_SMA20" in df.columns:
+                            w20 = df["W_SMA20"].dropna()
+                            if not w20.empty:
+                                wv20 = float(w20.iloc[-1])
+                                if wv20 > 0 and cur > wv20 and wv10 > wv20:
+                                    add("Weekly chart bullish — above W-SMA10 & W-SMA20 (stack)", +6)
+                                else:
+                                    add("Weekly chart bullish — above W-SMA10",                    +3)
+                            else:
+                                add("Weekly chart bullish — above W-SMA10",                        +3)
+                        else:
+                            add("Weekly chart bullish — above W-SMA10",                            +3)
+                    elif wv10 > 0:
+                        add("Weekly chart bearish — below W-SMA10 (weekly downtrend)",             -5)
+        except Exception:
+            pass
+
         total = sum(v for _, v in adj)
         final = max(5, min(95, base + total))
         self._mods = adj
@@ -1416,6 +1724,72 @@ class BreakoutScanner:
             df.loc[avwap.index, "AVWAP_63"] = avwap.values
         except Exception:
             pass
+
+        # ── MACD (12, 26, 9) ─────────────────────────────────────────────────
+        try:
+            ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+            ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+            df["MACD_line"]   = ema12 - ema26
+            df["MACD_signal"] = df["MACD_line"].ewm(span=9, adjust=False).mean()
+            df["MACD_hist"]   = df["MACD_line"] - df["MACD_signal"]
+        except Exception:
+            pass
+
+        # ── OBV (On-Balance Volume) ───────────────────────────────────────────
+        try:
+            closes = df["Close"].values
+            vols   = df["Volume"].values.astype(float)
+            obv    = np.zeros(len(closes))
+            for i in range(1, len(closes)):
+                if closes[i] > closes[i - 1]:
+                    obv[i] = obv[i - 1] + vols[i]
+                elif closes[i] < closes[i - 1]:
+                    obv[i] = obv[i - 1] - vols[i]
+                else:
+                    obv[i] = obv[i - 1]
+            df["OBV"]      = obv
+            df["OBV_SMA20"] = pd.Series(obv, index=df.index).rolling(20).mean()
+        except Exception:
+            pass
+
+        # ── MFI — Money Flow Index (14) ───────────────────────────────────────
+        try:
+            tp_mfi  = (df["High"] + df["Low"] + df["Close"]) / 3
+            mf_raw  = tp_mfi * df["Volume"]
+            pos_mf  = mf_raw.where(tp_mfi > tp_mfi.shift(1), 0.0)
+            neg_mf  = mf_raw.where(tp_mfi < tp_mfi.shift(1), 0.0)
+            pmf14   = pos_mf.rolling(14).sum()
+            nmf14   = neg_mf.rolling(14).sum()
+            mfr     = pmf14 / nmf14.replace(0, np.nan)
+            df["MFI_14"] = 100 - (100 / (1 + mfr))
+        except Exception:
+            pass
+
+        # ── Stochastic RSI (14, 3, 3) ─────────────────────────────────────────
+        try:
+            rsi_s = _fcol(df, "RSI_")
+            if not rsi_s.empty and len(rsi_s) >= 17:
+                rsi_a = rsi_s.reindex(df.index).ffill()
+                rmin  = rsi_a.rolling(14).min()
+                rmax  = rsi_a.rolling(14).max()
+                stoch = (rsi_a - rmin) / (rmax - rmin + 1e-8) * 100
+                df["SRSI_K"] = stoch.rolling(3).mean()
+                df["SRSI_D"] = df["SRSI_K"].rolling(3).mean()
+        except Exception:
+            pass
+
+        # ── Weekly SMA 10 + 20 (mapped back to daily) ────────────────────────
+        try:
+            wkly = df["Close"].resample("W").last().dropna()
+            if len(wkly) >= 10:
+                df["W_SMA10"] = wkly.rolling(10).mean().reindex(
+                    df.index, method="ffill")
+            if len(wkly) >= 20:
+                df["W_SMA20"] = wkly.rolling(20).mean().reindex(
+                    df.index, method="ffill")
+        except Exception:
+            pass
+
         return df
 
     # ── Composite Score ───────────────────────────────────────────────────────
@@ -1580,9 +1954,15 @@ class BreakoutScanner:
 
         atr = _fcol(df, "ATRr")
         av  = float(atr.iloc[-1]) if not atr.empty else cur * 0.02
-        sd  = av * 1.5
-        td  = h52 - cur
-        rr  = td / sd if sd > 0 else 0
+        # Dynamic ATR stop: 2x ATR below entry (standard swing-trade buffer)
+        sd  = av * 2.0
+        # Primary target: 52-week high; secondary (3:1) target for tight setups
+        td_52w = h52 - cur
+        td_3x  = sd * 3.0                          # guaranteed 3:1 R/R
+        td     = max(td_52w, td_3x)                # use whichever is larger
+        rr     = td / sd if sd > 0 else 0
+        # T1 partial target: 1.5× risk (book 50% at T1, let rest run to target)
+        t1_price = cur + sd * 1.5
 
         primary = prob["primary_pattern"]
         sig_sum = primary
@@ -1650,6 +2030,9 @@ class BreakoutScanner:
             "rs_rating":        50,   # placeholder — set post-scan in run()
             # Anchored VWAP vs price
             "above_avwap":      self._above_avwap(df),
+            # ATR-based sizing helpers
+            "atr_value":        av,
+            "t1_price":         t1_price,   # partial exit at 1.5× risk
         }
         result["thesis"] = self._thesis(result)
         return result
@@ -2038,7 +2421,9 @@ class BreakoutScanner:
         # ── Phase 4: Full pattern detection ───────────────────────────────
         print(f"[Phase 4/4] Pattern detection + scoring ({len(advanced)} stocks)...")
         print("Fetching SPY market data...")
-        self.spy = self._fetch_spy()
+        self.spy    = self._fetch_spy()
+        self.regime = MarketRegimeDetector.detect(self.spy)
+        print(f"  Market regime: {self.regime['regime']}  |  {self.regime['advice']}")
 
         with ThreadPoolExecutor(max_workers=self.cfg["max_workers"]) as ex:
             futs = {ex.submit(self._process_with_info, item,
@@ -3821,14 +4206,26 @@ class PaperTradingEngine:
             return {"success": False,
                     "reason": f"Insufficient cash (${self._cash:.2f})"}
 
-        slots = _PAPER_MAX_POSITIONS - len(positions)
-        gross = min(self._cash * _PAPER_MAX_PCT,
-                    self._cash / slots if slots > 0 else self._cash * _PAPER_MAX_PCT)
-        gross = max(gross, _PAPER_MIN_CASH)
-
-        price    = signal.get("price") or 0
+        price = signal.get("price") or 0
         if not price:
             return {"success": False, "reason": "No price data"}
+
+        # ── ATR-based position sizing ──────────────────────────────────────────
+        # Risk exactly 1.5% of current total capital per trade
+        stop_loss  = signal.get("stop_price") or (price * 0.95)
+        stop_dist  = max(abs(price - stop_loss), price * 0.02)  # floor at 2%
+        risk_amt   = self.total_capital * 0.015          # 1.5% risk per trade
+        shares_rsk = risk_amt / stop_dist                # shares implied by risk
+        gross_risk = shares_rsk * price                  # gross $ from risk rule
+
+        # Cap at 20% of portfolio AND even slot split
+        slots      = max(1, _PAPER_MAX_POSITIONS - len(positions))
+        gross_slot = self._cash / slots
+        gross      = min(gross_risk, self._cash * _PAPER_MAX_PCT, gross_slot)
+        gross      = max(gross, _PAPER_MIN_CASH)
+        if gross > self._cash:
+            gross = self._cash
+
         buy_calc = self.fee.calculate_buy(gross, price)
 
         self._cash      -= gross
@@ -3922,17 +4319,44 @@ class PaperTradingEngine:
         return closed
 
     def auto_trade(self, scan_results: list) -> list:
+        # Always check stops/targets on open positions first
         self.check_stops_and_targets()
+
+        # ── Trading-window gate ────────────────────────────────────────────────
+        session = MarketClock.get_session()
+        self._last_session = session  # expose for UI messaging
+        if session["quality"] == "AVOID":
+            # Opening / closing volatility — skip new entries, protect existing ones
+            self._save_snapshot()
+            return []
+
+        # In CAUTION or PREMARKET, require higher-conviction signals
+        min_prob  = 65
+        min_score = 70
+        if session["quality"] in ("CAUTION", "PREMARKET"):
+            min_prob  = 72
+            min_score = 75
+
         candidates = [r for r in scan_results
                       if r.get("trade_filter_pass")
-                      and (r.get("explosive_score", 0) >= 70
-                           or r.get("probability", 0) >= 65)]
-        candidates.sort(key=lambda x: x.get("explosive_score", 0), reverse=True)
+                      and (r.get("explosive_score", 0) >= min_score
+                           or r.get("probability", 0) >= min_prob)]
+
+        # Sort by combined conviction: explosive score + probability
+        candidates.sort(
+            key=lambda x: (x.get("explosive_score", 0) * 0.6 +
+                           x.get("probability",     0) * 0.4),
+            reverse=True,
+        )
         opened = []
         for sig in candidates:
             res = self.open_position(sig["ticker"], sig)
             if res.get("success"):
-                opened.append({"ticker": sig["ticker"], **res})
+                opened.append({
+                    "ticker":  sig["ticker"],
+                    "session": session["quality"],
+                    **res,
+                })
         self._save_snapshot()
         return opened
 

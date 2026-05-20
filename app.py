@@ -10,9 +10,154 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import yfinance as yf
 import sqlite3
-import sys, os, io, argparse, contextlib
+import sys, os, io, argparse, contextlib, re as _re
 from datetime import datetime, timedelta
 import numpy as np
+
+
+# ── PostgreSQL adapter (makes psycopg2 look like sqlite3) ─────────────────────
+class _PgRow:
+    """sqlite3.Row-compatible row backed by psycopg2 results."""
+    __slots__ = ("_cols", "_vals")
+
+    def __init__(self, cols, vals):
+        self._cols = list(cols)
+        self._vals = list(vals)
+
+    def __getitem__(self, k):
+        if isinstance(k, int):
+            return self._vals[k]
+        return self._vals[self._cols.index(k)]
+
+    def keys(self):
+        return self._cols
+
+    def get(self, k, default=None):
+        try:
+            return self._vals[self._cols.index(k)]
+        except (ValueError, IndexError):
+            return default
+
+    def __iter__(self):
+        return iter(self._vals)
+
+
+class _PgCursor:
+    """sqlite3 cursor wrapper for psycopg2."""
+
+    def __init__(self, cur):
+        self._cur = cur
+
+    def _cols(self):
+        return [d[0] for d in self._cur.description] if self._cur.description else []
+
+    def fetchone(self):
+        row = self._cur.fetchone()
+        if row is None:
+            return None
+        cols = self._cols()
+        return _PgRow(cols, row)
+
+    def fetchall(self):
+        cols = self._cols()
+        return [_PgRow(cols, r) for r in self._cur.fetchall()]
+
+    def __iter__(self):
+        cols = self._cols()
+        for row in self._cur:
+            yield _PgRow(cols, row)
+
+
+class _FakeCursor:
+    """Returns a fixed scalar — used to fake last_insert_rowid()."""
+
+    def __init__(self, value):
+        self._v = value
+
+    def fetchone(self):
+        return (self._v,)
+
+    def fetchall(self):
+        return [(self._v,)]
+
+
+class PgAdapter:
+    """
+    Wraps a psycopg2 connection to present a sqlite3-compatible API.
+    Handles: ?→%s, AUTOINCREMENT→BIGSERIAL, INSERT OR REPLACE→ON CONFLICT,
+             executescript(), last_insert_rowid(), DATETIME→TIMESTAMP.
+    """
+
+    _AUTOINCREMENT    = _re.compile(r"\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b", _re.I)
+    _INSERT_OR_REPLACE = _re.compile(r"\bINSERT\s+OR\s+REPLACE\b", _re.I)
+    _LAST_ROWID       = _re.compile(r"SELECT\s+last_insert_rowid\(\)", _re.I)
+    _INTO_TABLE       = _re.compile(r"\bINTO\s+(calls|portfolio)\b", _re.I)
+
+    def __init__(self, pg_conn):
+        self._conn    = pg_conn
+        self._last_id = None
+
+    def _adapt(self, sql: str) -> str:
+        sql = sql.replace("?", "%s")
+        sql = self._AUTOINCREMENT.sub("BIGSERIAL PRIMARY KEY", sql)
+        sql = sql.replace("DATETIME", "TIMESTAMP")
+        return sql
+
+    def execute(self, sql: str, params=()):
+        if self._LAST_ROWID.search(sql.strip()):
+            return _FakeCursor(self._last_id)
+
+        is_replace = bool(self._INSERT_OR_REPLACE.search(sql))
+        adapted    = self._adapt(sql)
+
+        if is_replace:
+            adapted = self._INSERT_OR_REPLACE.sub("INSERT", adapted)
+            adapted = adapted.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+
+        is_insert      = adapted.strip().upper().startswith("INSERT")
+        add_returning  = (
+            is_insert
+            and not is_replace
+            and "RETURNING" not in adapted.upper()
+            and bool(self._INTO_TABLE.search(adapted))
+        )
+        if add_returning:
+            adapted = adapted.rstrip().rstrip(";") + " RETURNING id"
+
+        cur = self._conn.cursor()
+        cur.execute(adapted, params or ())
+
+        if add_returning:
+            row           = cur.fetchone()
+            self._last_id = row[0] if row else None
+
+        self._conn.commit()
+        return _PgCursor(cur)
+
+    def executescript(self, sql: str):
+        adapted = self._adapt(sql)
+        cur     = self._conn.cursor()
+        for stmt in _re.split(r";[ \t]*\n?", adapted):
+            stmt = stmt.strip()
+            if not stmt or stmt.startswith("--"):
+                continue
+            try:
+                cur.execute(stmt)
+                self._conn.commit()
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+
+    def commit(self):
+        try:
+            self._conn.commit()
+        except Exception:
+            pass
+
+    def close(self):
+        self._conn.close()
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -90,26 +235,46 @@ def badge(text: str, colour: str = "blue"):
     return f'<span class="badge badge-{colour}">{text}</span>'
 
 def _is_streamlit_cloud() -> bool:
-    """Detect Streamlit Community Cloud environment."""
     return (
         os.environ.get("STREAMLIT_SHARING_MODE") == "1"
         or os.environ.get("HOME", "").startswith("/home/appuser")
-        or os.path.exists("/mount/src")  # Community Cloud mount point
+        or os.path.exists("/mount/src")
     )
+
+def _supabase_url() -> str:
+    try:
+        return st.secrets["database"]["url"]
+    except Exception:
+        return ""
 
 @st.cache_resource
 def get_db():
+    db_url   = _supabase_url()
     on_cloud = _is_streamlit_cloud()
-    if on_cloud:
-        path = ":memory:"
+
+    if db_url:
+        import psycopg2
+        pg  = psycopg2.connect(db_url, sslmode="require")
+        conn = PgAdapter(pg)
+        mode = "postgres"
+    elif on_cloud:
+        raw = sqlite3.connect(":memory:", check_same_thread=False)
+        raw.row_factory = sqlite3.Row
+        conn = raw
+        mode = "memory"
     else:
-        path = os.path.join(_DIR, "trading_scanner_history.db")
-    conn = sqlite3.connect(path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+        raw = sqlite3.connect(
+            os.path.join(_DIR, "trading_scanner_history.db"),
+            check_same_thread=False,
+        )
+        raw.row_factory = sqlite3.Row
+        conn = raw
+        mode = "local"
+
     logger = ts.CallLogger.__new__(ts.CallLogger)
     logger.conn = conn
     logger._init_schema()
-    return conn, on_cloud
+    return conn, mode
 
 def _df(query: str, conn, params=()):
     rows = conn.execute(query, params).fetchall()
@@ -172,7 +337,7 @@ with st.sidebar:
 # SCAN EXECUTION
 # ══════════════════════════════════════════════════════════════════════════════
 if run_btn:
-    conn, _cloud = get_db()
+    conn, _mode = get_db()
 
     # Pre-scan: refresh pending outcomes silently
     logger  = ts.CallLogger.__new__(ts.CallLogger)
@@ -259,12 +424,14 @@ tab_dash, tab_results, tab_chart, tab_analytics = st.tabs([
 # TAB 1 — PORTFOLIO DASHBOARD
 # ──────────────────────────────────────────────────────────────────────────────
 with tab_dash:
-    conn, on_cloud = get_db()
+    conn, _mode = get_db()
 
-    if on_cloud:
+    if _mode == "postgres":
+        st.success("Connected to Supabase — portfolio history persists across devices.", icon="🗄️")
+    elif _mode == "memory":
         st.warning(
-            "**Cloud mode:** Portfolio history is stored in memory only and resets "
-            "when the app restarts. To persist trade history, run the app locally.",
+            "**Cloud mode:** Portfolio history resets on app restart. "
+            "Add Supabase credentials to Streamlit secrets to persist data.",
             icon="☁️",
         )
 
@@ -713,7 +880,7 @@ with tab_chart:
 # TAB 4 — ANALYTICS
 # ──────────────────────────────────────────────────────────────────────────────
 with tab_analytics:
-    conn, _  = get_db()
+    conn, _mode = get_db()
     analyzer = ts.PerformanceAnalyzer(conn)
     s        = analyzer.summary()
 

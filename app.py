@@ -713,7 +713,7 @@ with tab_chart:
 # TAB 4 — ANALYTICS
 # ──────────────────────────────────────────────────────────────────────────────
 with tab_analytics:
-    conn     = get_db()
+    conn, _  = get_db()
     analyzer = ts.PerformanceAnalyzer(conn)
     s        = analyzer.summary()
 

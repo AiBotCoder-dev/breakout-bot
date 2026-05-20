@@ -1,0 +1,4708 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+trading_scanner.py — Professional Stock Breakout Scanner
+Identifies S&P 500 stocks with strong upside breakout potential using
+10-pattern detection engines and a Bayesian probability scoring system.
+"""
+
+# ── UTF-8 stdout so emoji and box chars work on Windows ──────────────────────
+import sys
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+import argparse
+import io
+import json
+import os
+import sqlite3
+import uuid as _uuid
+import warnings
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+
+# ── Auto-install any missing packages ─────────────────────────────────────────
+def _ensure(pkg, import_name=None):
+    import importlib, subprocess
+    try:
+        importlib.import_module(import_name or pkg)
+    except ImportError:
+        print(f"  Installing {pkg}...")
+        subprocess.run([sys.executable, "-m", "pip", "install", pkg, "--quiet"], check=True)
+
+
+import time
+
+for _pkg, _mod in [("yfinance", "yfinance"), ("pandas_ta", "pandas_ta"),
+                   ("tqdm", "tqdm"), ("tabulate", "tabulate"),
+                   ("scipy", "scipy"), ("numpy", "numpy"),
+                   ("requests", "requests"), ("beautifulsoup4", "bs4"),
+                   ("feedparser", "feedparser"), ("lxml", "lxml")]:
+    _ensure(_pkg, _mod)
+
+import yfinance as yf
+import pandas_ta as ta
+from scipy.signal import argrelextrema
+from tabulate import tabulate
+from tqdm import tqdm
+import requests
+from bs4 import BeautifulSoup
+try:
+    import feedparser
+    _HAS_FEEDPARSER = True
+except ImportError:
+    _HAS_FEEDPARSER = False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION  — all numeric thresholds here, no logic changes needed below
+# ══════════════════════════════════════════════════════════════════════════════
+CONFIG = {
+    "lookback_days":        252,
+    "max_workers":          10,
+    # VCP
+    "vcp_swing_order":      5,
+    "vcp_pivot_pct":        0.03,
+    "vcp_atr_63d":          63,
+    "vcp_atr_126d":         126,
+    # Cup & Handle
+    "cup_min_days":         30,
+    "cup_max_days":         130,
+    "cup_min_depth":        0.12,
+    "cup_max_depth":        0.50,
+    "cup_handle_min":       0.08,
+    "cup_handle_max":       0.15,
+    "cup_handle_days":      25,
+    # Wyckoff
+    "wk_range_days_max":    80,
+    "wk_range_pct_min":     0.10,
+    "wk_range_pct_max":     0.35,
+    "wk_spring_pct":        0.05,
+    "wk_spring_window":     15,
+    "wk_sos_window":        8,
+    # HTF
+    "htf_min_gain":         0.50,
+    "htf_max_pullback":     0.20,
+    "htf_flag_min":         5,
+    "htf_flag_max":         15,
+    # Bull Flag
+    "bf_min_gain":          0.15,
+    "bf_pole_max_days":     10,
+    "bf_retrace_min":       0.25,
+    "bf_retrace_max":       0.45,
+    "bf_flag_max_days":     20,
+    # Pennant
+    "pn_min_gain":          0.15,
+    "pn_pole_max_days":     10,
+    "pn_duration_max":      15,
+    # Ascending Triangle
+    "at_min_days":          20,
+    "at_max_days":          60,
+    "at_touches":           3,
+    "at_res_tol":           0.02,
+    # Flat Base
+    "fb_min_days":          25,
+    "fb_max_days":          50,
+    "fb_range_max":         0.15,
+    "fb_max_week_loss":     0.05,
+    # Double Bottom
+    "db_price_tol":         0.05,
+    "db_min_sep":           20,
+    # Symmetrical Triangle
+    "sym_min_days":         15,
+    "sym_max_days":         40,
+    "sym_apex_min":         0.60,
+    "sym_apex_max":         0.80,
+    # BB Squeeze
+    "bb_squeeze_6m":        126,
+    "bb_squeeze_3m":        63,
+    # Volume
+    "vol_strong":           1.5,
+    "vol_very_strong":      2.0,
+    # ADX
+    "adx_strong":           30,
+    "adx_medium":           25,
+    # Scoring
+    "tier1_pts":            40,
+    "tier2_pts":            30,
+    "tier3_pts":            20,
+}
+
+BASE_RATES = {
+    "VCP_3plus":             72,
+    "VCP_2":                 58,
+    "Cup and Handle":        68,
+    "Wyckoff Spring":        67,
+    "High and Tight Flag":   75,
+    "Bull Flag":             67,
+    "Pennant":               65,
+    "Ascending Triangle":    63,
+    "Flat Base":             61,
+    "Double Bottom":         58,
+    "Symmetrical Triangle":  54,
+    "No Pattern":            42,
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LEARNED WEIGHTS  — persisted in weights.json, updated by WeightOptimizer
+# ══════════════════════════════════════════════════════════════════════════════
+WEIGHTS_FILE = "weights.json"
+
+
+def _load_weights() -> dict:
+    if os.path.exists(WEIGHTS_FILE):
+        try:
+            with open(WEIGHTS_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"adjustments": {}, "base_rate_adjustments": {}, "samples": 0, "last_updated": None}
+
+
+def _save_weights(data: dict):
+    with open(WEIGHTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+LEARNED_WEIGHTS = _load_weights()
+
+
+# Trade thesis templates — one per pattern
+THESES = {
+    "VCP": (
+        "{ticker} has formed {n_cont} successive volatility contractions "
+        "({depths}), a textbook sign of institutional supply absorption. "
+        "The tight coil near ${pivot:.2f} on shrinking ATR signals an "
+        "imminent expansion. Enter on a volume-backed close above the pivot; "
+        "invalidate on a close below the last contraction low."
+    ),
+    "Cup and Handle": (
+        "{ticker} carved a {depth:.0%} cup base over {weeks:.0f} weeks "
+        "and formed a {handle:.0%} handle — a classic accumulation pattern. "
+        "Low-volume handle drift sets up a high-probability breakout above "
+        "${pivot:.2f}. Invalidate on a close below the handle low."
+    ),
+    "Wyckoff Spring": (
+        "{ticker} executed a Wyckoff Spring, flushing weak holders below "
+        "range support before snapping back — a sign of smart-money absorption. "
+        "The Sign of Strength confirms demand control. Enter near current "
+        "levels targeting a full re-rating; stop below the spring low."
+    ),
+    "High and Tight Flag": (
+        "{ticker} surged {gain:.0%} in the flagpole — a rare HTF setup. "
+        "The tight {pullback:.0%} consolidation on declining volume signals "
+        "minimal overhead supply. This pattern resolves higher the majority "
+        "of the time. Risk is well-defined below the flag low."
+    ),
+    "Bull Flag": (
+        "{ticker} built a {gain:.0%} flagpole and is consolidating in an "
+        "orderly {retrace:.0%} pullback — a healthy pause within the uptrend. "
+        "A breakout above the upper channel triggers the measured move. "
+        "Risk: a close below the channel or >50% retrace negates the setup."
+    ),
+    "Pennant": (
+        "{ticker} rallied {gain:.0%} then formed a symmetrical pennant "
+        "as volume dried to multi-week lows near the apex — balanced supply "
+        "and demand before a resolution. At {apex:.0%} to apex, breakout "
+        "timing is ideal. Risk: a breakdown below the lower trendline."
+    ),
+    "Ascending Triangle": (
+        "{ticker} has tested resistance at ${resist:.2f} {touches} times "
+        "while making higher lows — demand accumulation at a key level. "
+        "Price is coiled in the upper range; a volume surge above resistance "
+        "completes the breakout. Stop below the most recent higher low."
+    ),
+    "Flat Base": (
+        "{ticker} spent {weeks:.0f} weeks in a tight {range:.0%} range near "
+        "its 52-week high — institutional holders not selling concentrates "
+        "supply at the pivot. A volume-backed close above the base high "
+        "triggers the measured move. Base failure = close below midpoint."
+    ),
+    "Double Bottom": (
+        "{ticker} formed two troughs near ${low:.2f} with {div}bullish "
+        "divergence, signaling seller exhaustion. A breakout above the "
+        "neckline at ${neck:.2f} confirms the reversal. Invalidate on a "
+        "close below the second bottom."
+    ),
+    "Symmetrical Triangle": (
+        "{ticker} is compressing into a symmetrical triangle at {apex:.0%} "
+        "progress to apex — volume dried up and resolution is near. Given "
+        "the broader uptrend, the bullish resolution is higher probability. "
+        "Risk: a breakdown below the lower trendline flips the bias bearish."
+    ),
+    "No Pattern": (
+        "{ticker} shows momentum characteristics without a classic pattern. "
+        "Monitor for a volume-backed push to new highs as the entry trigger. "
+        "Risk/reward is less defined than a structured setup — size accordingly."
+    ),
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def _fcol(df: pd.DataFrame, prefix: str) -> pd.Series:
+    """Return first column whose name starts with prefix, else empty Series."""
+    for c in df.columns:
+        if c.startswith(prefix):
+            return df[c].dropna()
+    return pd.Series(dtype=float)
+
+
+def _slope(arr: np.ndarray) -> float:
+    if len(arr) < 2:
+        return 0.0
+    x = np.arange(len(arr), dtype=float)
+    return float(np.polyfit(x, arr, 1)[0])
+
+
+def _r2(arr: np.ndarray) -> float:
+    if len(arr) < 3:
+        return 0.0
+    x = np.arange(len(arr), dtype=float)
+    resid = arr - np.polyval(np.polyfit(x, arr, 1), x)
+    ss_tot = np.sum((arr - arr.mean()) ** 2)
+    return float(1 - np.sum(resid ** 2) / ss_tot) if ss_tot > 0 else 0.0
+
+
+def _swings(arr: np.ndarray, order: int = 5):
+    """Return (highs_idx, lows_idx) arrays using scipy argrelextrema."""
+    h = argrelextrema(arr, np.greater, order=order)[0]
+    l = argrelextrema(arr, np.less,    order=order)[0]
+    return h, l
+
+
+def _norm(raw) -> pd.DataFrame:
+    """Flatten yfinance MultiIndex to single-level OHLCV — handles both column orderings."""
+    _OHLCV = {"Open", "High", "Low", "Close", "Volume"}
+    if isinstance(raw.columns, pd.MultiIndex):
+        # Detect which level contains the price-type names
+        lvl = 0
+        if not _OHLCV.issubset(set(raw.columns.get_level_values(0))):
+            lvl = 1
+        raw = raw.copy()
+        raw.columns = raw.columns.get_level_values(lvl)
+        # Drop duplicate column names (yfinance sometimes emits duplicates)
+        raw = raw.loc[:, ~raw.columns.duplicated()]
+    return raw[["Open", "High", "Low", "Close", "Volume"]].copy()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PATTERN DETECTOR
+# ══════════════════════════════════════════════════════════════════════════════
+class PatternDetector:
+    """
+    One method per pattern.
+    Every method returns:
+      { "detected": bool, "confidence": float 0-1, "summary": str, "name": str, ...extras }
+    """
+
+    def __init__(self, df: pd.DataFrame, spy_df: pd.DataFrame = None, cfg: dict = None):
+        self.df  = df
+        self.spy = spy_df
+        self.cfg = cfg or CONFIG
+        self.C   = df["Close"].values
+        self.H   = df["High"].values
+        self.L   = df["Low"].values
+        self.V   = df["Volume"].values.astype(float)
+        self.n   = len(df)
+
+    def _r(self, det, conf, summ, name="", **kw):
+        return {"detected": det, "confidence": float(np.clip(conf, 0, 1)),
+                "summary": summ, "name": name, **kw}
+
+    # ── TIER 1 ───────────────────────────────────────────────────────────────
+
+    def detect_vcp(self):
+        C, H, L, V, n, cfg = self.C, self.H, self.L, self.V, self.n, self.cfg
+        if n < 60:
+            return self._r(False, 0, "Insufficient data", "VCP")
+
+        sma50  = _fcol(self.df, "SMA_50")
+        sma200 = _fcol(self.df, "SMA_200")
+        if sma50.empty or sma200.empty:
+            return self._r(False, 0, "Missing SMAs", "VCP")
+        cur = float(C[-1])
+        if cur < float(sma50.iloc[-1]) or cur < float(sma200.iloc[-1]):
+            return self._r(False, 0, "Not in Stage 2 uptrend", "VCP")
+
+        lb   = min(n, 120)
+        subH = H[-lb:]; subL = L[-lb:]; subV = V[-lb:]
+        h_idx, l_idx = _swings(subH, order=cfg["vcp_swing_order"])
+
+        if len(h_idx) < 2 or len(l_idx) < 2:
+            return self._r(False, 0, "Too few swing points", "VCP")
+
+        used = set()
+        contractions = []
+        for shi in h_idx:
+            nxt = [i for i in l_idx if i > shi and i not in used]
+            if not nxt:
+                continue
+            sli = nxt[0]; used.add(sli)
+            sh_v = subH[shi]; sl_v = subL[sli]
+            contractions.append({
+                "depth":    (sh_v - sl_v) / sh_v,
+                "duration": sli - shi,
+                "high":     sh_v, "low": sl_v,
+                "hi":       shi,  "lo":  sli,
+                "avg_vol":  float(subV[shi:sli + 1].mean()) if sli > shi else float(subV[shi]),
+            })
+
+        if len(contractions) < 2:
+            return self._r(False, 0, "< 2 contractions", "VCP")
+
+        valid = [contractions[0]]
+        for i in range(1, len(contractions)):
+            pr, cu = contractions[i - 1], contractions[i]
+            if cu["depth"] < pr["depth"] and cu["duration"] <= pr["duration"]:
+                valid.append(cu)
+            else:
+                break
+        n_cont = len(valid)
+        if n_cont < 2:
+            return self._r(False, 0, f"Only {n_cont} valid contraction", "VCP")
+
+        vol_final_lowest = valid[-1]["avg_vol"] == min(v["avg_vol"] for v in valid)
+        last   = valid[-1]
+        pivot  = last["high"]
+        fdepth = last["depth"]
+        prox   = (pivot - cur) / pivot
+        if prox > cfg["vcp_pivot_pct"] or prox < -0.01:
+            return self._r(False, 0.3, f"Price {prox:.1%} from pivot ${pivot:.2f}", "VCP")
+
+        atr = _fcol(self.df, "ATRr")
+        at63  = len(atr) >= 63  and float(atr.iloc[-1]) <= float(atr.iloc[-63:].min())  * 1.02
+        at126 = len(atr) >= 126 and float(atr.iloc[-1]) <= float(atr.iloc[-126:].min()) * 1.02
+
+        conf = 0.60
+        if n_cont >= 3:       conf += 0.10
+        if fdepth < 0.06:     conf += 0.10
+        if vol_final_lowest:  conf += 0.10
+        if at126:             conf += 0.10
+        elif at63:            conf += 0.05
+
+        depths_str = " → ".join(f"{c['depth']:.0%}" for c in valid)
+        pkey  = "VCP_3plus" if n_cont >= 3 else "VCP_2"
+        summ  = f"VCP {n_cont}x ({depths_str}), pivot ${pivot:.2f}, {prox:.1%} below"
+        return self._r(True, conf, summ, "VCP",
+                       n_contractions=n_cont, pivot=pivot, final_depth=fdepth,
+                       pattern_key=pkey, depths=depths_str)
+
+    def detect_cup_and_handle(self):
+        C, H, V, n, cfg = self.C, self.H, self.V, self.n, self.cfg
+        if n < 40:
+            return self._r(False, 0, "Insufficient data", "Cup and Handle")
+
+        best_conf, best_kw = 0.0, None
+        for cup_days in range(min(cfg["cup_max_days"], n - 10), cfg["cup_min_days"] - 1, -10):
+            sub = C[-cup_days:]; slen = len(sub); w = max(5, slen // 6)
+
+            left_high  = float(sub[:w].max())
+            cup_base   = float(sub[slen // 4: 3 * slen // 4].min())
+            right_high = float(sub[-w:].max())
+
+            depth = (left_high - cup_base) / left_high if left_high > 0 else 1
+            if not (cfg["cup_min_depth"] <= depth <= cfg["cup_max_depth"]):
+                continue
+            if (left_high - right_high) / left_high > 0.05:
+                continue
+
+            # V-shape check: recovery speed
+            lh = sub[:slen // 2]; rh = sub[slen // 2:]
+            v_shaped = (float(rh.max()) - float(rh.min())) < (float(lh.max()) - float(lh.min())) * 0.80
+
+            hd = min(cfg["cup_handle_days"], n - 1)
+            hC = C[-hd:]; hh = float(hC.max()); hl = float(hC.min())
+            hret = (hh - hl) / hh if hh > 0 else 1
+            if not (cfg["cup_handle_min"] <= hret <= cfg["cup_handle_max"]):
+                continue
+            if hl < cup_base + (left_high - cup_base) / 2:
+                continue
+
+            hV = V[-hd:]; pV = V[-hd * 2:-hd] if n > hd * 2 else V[:hd]
+            vol_ok = float(hV.mean()) < float(pV.mean())
+
+            # VCP sub-structure in handle
+            hH_sw, hL_sw = _swings(hC, order=2)
+            handle_vcp   = len(hH_sw) >= 2 and len(hL_sw) >= 2
+
+            conf = 0.60
+            if 0.25 <= depth <= 0.35:                             conf += 0.10
+            if handle_vcp:                                        conf += 0.10
+            if vol_ok:                                            conf += 0.05
+            if (left_high - right_high) / left_high <= 0.02:     conf += 0.10
+            if v_shaped:                                          conf -= 0.10
+
+            if conf > best_conf:
+                best_conf = conf
+                best_kw = {"cup_depth": depth, "handle_retrace": hret,
+                           "pivot": hh, "v_shaped": v_shaped,
+                           "weeks": cup_days / 5, "handle_vcp": handle_vcp}
+
+        if best_kw and best_conf >= 0.50:
+            s = (f"Cup & Handle: {best_kw['cup_depth']:.0%} cup ({best_kw['weeks']:.0f}w), "
+                 f"{best_kw['handle_retrace']:.0%} handle, pivot ${best_kw['pivot']:.2f}"
+                 f"{' [V-shaped]' if best_kw['v_shaped'] else ''}")
+            return self._r(True, best_conf, s, "Cup and Handle", **best_kw)
+        return self._r(False, 0, "No Cup and Handle", "Cup and Handle")
+
+    def detect_wyckoff_spring(self):
+        C, H, L, V, n, cfg = self.C, self.H, self.L, self.V, self.n, self.cfg
+        if n < 30:
+            return self._r(False, 0, "Insufficient data", "Wyckoff Spring")
+
+        lb   = min(cfg["wk_range_days_max"], n)
+        subC = C[-lb:]; subH = H[-lb:]; subL = L[-lb:]; subV = V[-lb:]
+        rh   = float(np.percentile(subH, 85)); rl = float(np.percentile(subL, 15))
+        rng  = (rh - rl) / rl if rl > 0 else 1
+
+        if not (cfg["wk_range_pct_min"] <= rng <= cfg["wk_range_pct_max"]):
+            return self._r(False, 0, f"Range {rng:.1%} outside 10–35%", "Wyckoff Spring")
+        if float(np.mean((subC >= rl * 0.98) & (subC <= rh * 1.02))) < 0.80:
+            return self._r(False, 0, "< 80% candles in range", "Wyckoff Spring")
+
+        avg_v = float(V[-20:].mean())
+        spring_idx = -1; spring_vr = 1.0; same_sess = False
+        win = min(cfg["wk_spring_window"], lb - 1)
+
+        for i in range(lb - win, lb):
+            if subL[i] < rl * (1 - cfg["wk_spring_pct"]) and subC[i] > rl * 0.99:
+                spring_idx = i
+                spring_vr  = subV[i] / avg_v if avg_v > 0 else 1
+                same_sess  = bool(subC[i] > rl)
+                break
+
+        if spring_idx < 0:
+            return self._r(False, 0, "No Spring below support", "Wyckoff Spring")
+        if spring_vr > 1.0:
+            return self._r(False, 0.2, "Spring on above-avg volume", "Wyckoff Spring")
+
+        sos_found = False; sos_vr = 0.0
+        for i in range(spring_idx, min(spring_idx + cfg["wk_sos_window"], lb)):
+            if subC[i] > rh and subV[i] > avg_v * 1.5:
+                sos_found = True; sos_vr = subV[i] / avg_v; break
+
+        if not sos_found:
+            return self._r(False, 0.4, "Spring found, SOS pending", "Wyckoff Spring")
+
+        lps      = bool(float(subV[-5:].mean()) < avg_v * 0.80)
+        long_rng = lb >= 40
+
+        conf = 0.60
+        if same_sess:   conf += 0.10
+        if sos_vr >= 2: conf += 0.10
+        if lps:         conf += 0.10
+        if long_rng:    conf += 0.10
+
+        s = (f"Wyckoff Spring ${subL[spring_idx]:.2f} ({spring_vr:.1f}x vol), "
+             f"SOS {sos_vr:.1f}x{', LPS' if lps else ''}")
+        return self._r(True, conf, s, "Wyckoff Spring",
+                       spring_vr=spring_vr, sos_vr=sos_vr, lps=lps, range_days=lb)
+
+    # ── TIER 2 ───────────────────────────────────────────────────────────────
+
+    def detect_high_tight_flag(self):
+        C, H, L, V, n, cfg = self.C, self.H, self.L, self.V, self.n, self.cfg
+        if n < 20:
+            return self._r(False, 0, "Insufficient data", "High and Tight Flag")
+
+        best_conf, best_kw = 0.0, None
+        for window in [10, 15, 20, 25]:
+            for off in range(5, 20, 5):
+                if window + off + 2 >= n:
+                    continue
+                seg = C[-(window + off):-off]
+                if len(seg) < 2:
+                    continue
+                lo   = float(seg.min()); hi = float(seg.max())
+                gain = (hi - lo) / lo if lo > 0 else 0
+                if gain < cfg["htf_min_gain"]:
+                    continue
+
+                flag_C = C[-off:]
+                if len(flag_C) < cfg["htf_flag_min"] or len(flag_C) > cfg["htf_flag_max"]:
+                    continue
+                pullback = (hi - float(flag_C.min())) / hi if hi > 0 else 1
+                if pullback > cfg["htf_max_pullback"]:
+                    continue
+
+                poleV = V[-(window + off):-off]
+                flagV = V[-off:]
+                vol_ok = float(flagV.mean()) <= float(poleV.mean()) * 0.70 if len(poleV) > 0 else False
+
+                conf = 0.65
+                if pullback < 0.10:       conf += 0.15
+                if gain >= 0.75:          conf += 0.10
+                if len(flag_C) <= 10:     conf += 0.10
+                if conf > best_conf:
+                    best_conf = conf
+                    best_kw   = {"pole_gain": gain, "pullback": pullback,
+                                 "flag_days": len(flag_C), "vol_ok": vol_ok}
+
+        if best_kw and best_conf >= 0.60:
+            s = (f"HTF: {best_kw['pole_gain']:.0%} pole, "
+                 f"{best_kw['pullback']:.0%} pullback, {best_kw['flag_days']}d flag")
+            return self._r(True, best_conf, s, "High and Tight Flag", **best_kw)
+        return self._r(False, 0, "No HTF", "High and Tight Flag")
+
+    def detect_bull_flag(self):
+        C, H, L, V, n, cfg = self.C, self.H, self.L, self.V, self.n, self.cfg
+        if n < 20:
+            return self._r(False, 0, "Insufficient data", "Bull Flag")
+        sma20 = _fcol(self.df, "SMA_20")
+        avg20 = float(V[-20:].mean())
+        best_conf, best_kw = 0.0, None
+
+        for fd in range(5, min(cfg["bf_flag_max_days"] + 1, n // 2)):
+            for pd_ in range(3, cfg["bf_pole_max_days"] + 1):
+                off = fd + pd_
+                if off + 3 >= n:
+                    continue
+                pole_C = C[-(off + 3):-fd]
+                if len(pole_C) < 2:
+                    continue
+                ps = float(pole_C[0]); ph = float(pole_C.max())
+                gain = (ph - ps) / ps if ps > 0 else 0
+                if gain < cfg["bf_min_gain"]:
+                    continue
+                pV = V[-(off + 3):-fd]
+                if float(pV.mean()) < avg20 * 1.5:
+                    continue  # pole needs high volume
+
+                flag_C = C[-fd:]; flagL = L[-fd:]; flagV = V[-fd:]
+                fh = float(C[-fd:].max()); fl = float(flagL.min())
+                denom   = ph - ps
+                retrace = (ph - fl) / denom if denom > 0 else 1
+                if not (cfg["bf_retrace_min"] <= retrace <= cfg["bf_retrace_max"]):
+                    continue
+                if _slope(flag_C) >= 0:
+                    continue
+                if float(flagV.mean()) >= float(pV.mean()) * 0.60:
+                    continue
+
+                above20 = not sma20.empty and float(flagL.min()) > float(sma20.iloc[-1])
+                conf = 0.60
+                if retrace < 0.35: conf += 0.10
+                if float(flagV.min()) <= avg20: conf += 0.10
+                if above20:        conf += 0.10
+                if gain >= 0.20:   conf += 0.10
+                if conf > best_conf:
+                    best_conf = conf
+                    best_kw   = {"pole_gain": gain, "retrace_pct": retrace,
+                                 "flag_days": fd, "above20": above20, "pivot": fh}
+
+        if best_kw and best_conf >= 0.55:
+            s = (f"Bull Flag: {best_kw['pole_gain']:.0%} pole, "
+                 f"{best_kw['retrace_pct']:.0%} retrace, {best_kw['flag_days']}d")
+            return self._r(True, best_conf, s, "Bull Flag", **best_kw)
+        return self._r(False, 0, "No Bull Flag", "Bull Flag")
+
+    def detect_pennant(self):
+        C, H, L, V, n, cfg = self.C, self.H, self.L, self.V, self.n, self.cfg
+        if n < 18:
+            return self._r(False, 0, "Insufficient data", "Pennant")
+        avg20 = float(V[-20:].mean()); avg30 = float(V[-30:].min())
+        best_conf, best_kw = 0.0, None
+
+        for nd in range(5, cfg["pn_duration_max"] + 1):
+            for pd_ in range(3, cfg["pn_pole_max_days"] + 1):
+                off = nd + pd_
+                if off + 3 >= n:
+                    continue
+                pole_C = C[-(off + 3):-nd]
+                if len(pole_C) < 2:
+                    continue
+                ps = float(pole_C[0]); ph = float(pole_C.max())
+                gain = (ph - ps) / ps if ps > 0 else 0
+                if gain < cfg["pn_min_gain"]:
+                    continue
+
+                pnH = H[-nd:]; pnL = L[-nd:]; pnV = V[-nd:]
+                if len(pnH) < 4:
+                    continue
+                if _slope(pnH) >= 0 or _slope(pnL) <= 0:
+                    continue
+
+                x     = np.arange(nd, dtype=float)
+                hline = np.polyval(np.polyfit(x, pnH, 1), x)
+                lline = np.polyval(np.polyfit(x, pnL, 1), x)
+                diff  = hline - lline
+                if diff[-1] <= 0 or diff[0] <= 0:
+                    continue
+                apex_pct = 1 - diff[-1] / diff[0]
+                if not (0.50 <= apex_pct <= 0.80):
+                    continue
+
+                vol30_low  = float(pnV.min()) < avg30 * 1.02
+                steep_pole = gain >= 0.15 and pd_ <= 5
+
+                conf = 0.58
+                if vol30_low:                conf += 0.10
+                if 0.60 <= apex_pct <= 0.75: conf += 0.10
+                if steep_pole:               conf += 0.10
+                if conf > best_conf:
+                    best_conf = conf
+                    best_kw   = {"pole_gain": gain, "pennant_days": nd, "apex_pct": apex_pct}
+
+        if best_kw and best_conf >= 0.55:
+            s = (f"Pennant: {best_kw['pole_gain']:.0%} pole, "
+                 f"{best_kw['pennant_days']}d, {best_kw['apex_pct']:.0%} to apex")
+            return self._r(True, best_conf, s, "Pennant", **best_kw)
+        return self._r(False, 0, "No Pennant", "Pennant")
+
+    # ── TIER 3 ───────────────────────────────────────────────────────────────
+
+    def detect_ascending_triangle(self):
+        H, L, C, V, n, cfg = self.H, self.L, self.C, self.V, self.n, self.cfg
+        lb = min(cfg["at_max_days"], n)
+        if lb < cfg["at_min_days"]:
+            return self._r(False, 0, "Insufficient data", "Ascending Triangle")
+
+        sH = H[-lb:]; sL = L[-lb:]; sC = C[-lb:]; sV = V[-lb:]
+        h_idx, _ = _swings(sH, order=4)
+        if len(h_idx) < 2:
+            return self._r(False, 0, "Too few swing highs", "Ascending Triangle")
+
+        resistance = float(np.median([sH[i] for i in h_idx]))
+        touches    = sum(1 for i in h_idx if abs(sH[i] - resistance) / resistance <= cfg["at_res_tol"])
+        if touches < cfg["at_touches"]:
+            return self._r(False, 0, f"{touches} resistance touches (need {cfg['at_touches']}+)", "Ascending Triangle")
+
+        _, l_idx = _swings(sL, order=4)
+        if len(l_idx) < 2:
+            return self._r(False, 0, "Too few swing lows", "Ascending Triangle")
+        sup_lows = np.array([sL[i] for i in l_idx])
+        if _slope(sup_lows) <= 0:
+            return self._r(False, 0, "Support not rising", "Ascending Triangle")
+
+        tri_l  = float(sL[l_idx].min())
+        coiled = float(sC[-1]) >= tri_l + (resistance - tri_l) * 0.75
+        age_ok = 15 <= lb <= 25
+        vol_ok = _slope(sV) < 0
+        r2     = _r2(sup_lows)
+
+        conf = 0.55
+        if touches >= 4: conf += 0.10
+        if age_ok:       conf += 0.10
+        if vol_ok:       conf += 0.10
+        if r2 > 0.85:    conf += 0.10
+
+        s = (f"Ascending Triangle: {touches} touches at ${resistance:.2f}, "
+             f"{'coiled near top' if coiled else 'building'}")
+        return self._r(True, conf, s, "Ascending Triangle",
+                       resistance=resistance, touches=touches, coiled=coiled)
+
+    def detect_flat_base(self):
+        C, H, L, V, n, cfg = self.C, self.H, self.L, self.V, self.n, self.cfg
+        if n < cfg["fb_min_days"]:
+            return self._r(False, 0, "Insufficient data", "Flat Base")
+
+        sma50  = _fcol(self.df, "SMA_50")
+        sma200 = _fcol(self.df, "SMA_200")
+        atr    = _fcol(self.df, "ATRr")
+        h252   = float(H[-252:].max()) if n >= 252 else float(H.max())
+        cur    = float(C[-1])
+        best_conf, best_kw = 0.0, None
+
+        for lb in range(cfg["fb_min_days"], cfg["fb_max_days"] + 1, 5):
+            if lb >= n:
+                continue
+            sH = H[-lb:]; sL = L[-lb:]; sC = C[-lb:]
+            rng = (float(sH.max()) - float(sL.min())) / float(sL.min()) if float(sL.min()) > 0 else 1
+            if rng > cfg["fb_range_max"]:
+                continue
+
+            wl_ok = True
+            for w in range(0, lb - 4, 5):
+                wo = float(sC[w]); wc = float(sC[min(w + 4, lb - 1)])
+                if wo > 0 and (wo - wc) / wo > cfg["fb_max_week_loss"]:
+                    wl_ok = False; break
+            if not wl_ok:
+                continue
+
+            above = True
+            if not sma50.empty  and cur < float(sma50.iloc[-1]):  above = False
+            if not sma200.empty and cur < float(sma200.iloc[-1]): above = False
+
+            atr_low = (len(atr) >= 126 and
+                       float(atr.iloc[-1]) <= float(atr.iloc[-126:].min()) * 1.02)
+            p52  = (h252 - cur) / h252
+            near = p52 <= 0.05
+
+            rs30 = None
+            if self.spy is not None and n >= 31:
+                sp = self.spy["Close"].values
+                if len(sp) >= 31:
+                    rs30 = ((C[-1] - C[-31]) / C[-31]) - ((sp[-1] - sp[-31]) / sp[-31])
+
+            ideal_wks = 30 <= lb <= 40
+            conf = 0.55
+            if rng <= 0.10:                    conf += 0.10
+            if rs30 is not None and rs30 > 0:  conf += 0.10
+            if atr_low:                        conf += 0.10
+            if ideal_wks:                      conf += 0.10
+            if conf > best_conf:
+                best_conf = conf
+                best_kw   = {"range_pct": rng, "near_high": near, "pct52": p52,
+                             "above_smas": above, "weeks": lb / 5}
+
+        if best_kw and best_conf >= 0.50:
+            s = (f"Flat Base: {best_kw['range_pct']:.0%} range "
+                 f"{best_kw['weeks']:.0f}w, {'near 52W hi' if best_kw['near_high'] else 'consolidating'}")
+            return self._r(True, best_conf, s, "Flat Base", **best_kw)
+        return self._r(False, 0, "No Flat Base", "Flat Base")
+
+    def detect_double_bottom(self):
+        C, H, L, V, n, cfg = self.C, self.H, self.L, self.V, self.n, self.cfg
+        if n < 50:
+            return self._r(False, 0, "Insufficient data", "Double Bottom")
+
+        lb  = min(120, n)
+        sL  = L[-lb:]; sH = H[-lb:]; sC = C[-lb:]; sV = V[-lb:]
+        rsi = _fcol(self.df, "RSI_")
+        cur = float(C[-1])
+        _, l_idx = _swings(sL, order=6)
+        if len(l_idx) < 2:
+            return self._r(False, 0, "Too few swing lows", "Double Bottom")
+
+        best_conf, best_kw = 0.0, None
+        for i in range(len(l_idx)):
+            for j in range(i + 1, len(l_idx)):
+                i1, i2 = l_idx[i], l_idx[j]
+                v1, v2 = float(sL[i1]), float(sL[i2])
+                if i2 - i1 < cfg["db_min_sep"]:
+                    continue
+                if abs(v1 - v2) / v1 > cfg["db_price_tol"]:
+                    continue
+
+                neckline = float(sH[i1:i2 + 1].max())
+                pct_neck = (neckline - cur) / neckline
+                if pct_neck > 0.05 or pct_neck < -0.02:
+                    continue
+
+                undercut    = bool(v2 < v1)
+                vol_exhaust = bool(sV[i2] < sV[i1])
+                rsi_div     = False
+                if len(rsi) >= lb:
+                    ri1 = float(rsi.iloc[-lb + i1]) if lb - i1 <= len(rsi) else None
+                    ri2 = float(rsi.iloc[-lb + i2]) if lb - i2 <= len(rsi) else None
+                    if ri1 and ri2 and v2 <= v1 and ri2 > ri1:
+                        rsi_div = True
+
+                conf = 0.52
+                if undercut:                      conf += 0.10
+                if rsi_div:                       conf += 0.10
+                if sV[i2] <= sV[i1] * 0.70:      conf += 0.10
+                if cur >= neckline * 0.99:        conf += 0.10
+                if conf > best_conf:
+                    best_conf = conf
+                    best_kw   = {"low1": v1, "low2": v2, "neckline": neckline,
+                                 "undercut": undercut, "rsi_div": rsi_div,
+                                 "vol_exhaust": vol_exhaust}
+
+        if best_kw and best_conf >= 0.50:
+            s = (f"Double Bottom: ${best_kw['low1']:.2f}/{best_kw['low2']:.2f} "
+                 f"neckline ${best_kw['neckline']:.2f}"
+                 f"{', shakeout' if best_kw['undercut'] else ''}"
+                 f"{', RSI div' if best_kw['rsi_div'] else ''}")
+            return self._r(True, best_conf, s, "Double Bottom", **best_kw)
+        return self._r(False, 0, "No Double Bottom", "Double Bottom")
+
+    def detect_symmetrical_triangle(self):
+        H, L, C, V, n, cfg = self.H, self.L, self.C, self.V, self.n, self.cfg
+        sma50  = _fcol(self.df, "SMA_50")
+        sma200 = _fcol(self.df, "SMA_200")
+        adx    = _fcol(self.df, "ADX_")
+        cur    = float(C[-1])
+
+        if not sma50.empty and cur < float(sma50.iloc[-1]):
+            return self._r(False, 0, "Below SMA50 — not bullish", "Symmetrical Triangle")
+
+        strong_trend = (not sma200.empty and cur > float(sma200.iloc[-1]) and
+                        not adx.empty and float(adx.iloc[-1]) > 25)
+        avg30 = float(V[-30:].min())
+        best_conf, best_kw = 0.0, None
+
+        for lb in range(cfg["sym_min_days"], min(cfg["sym_max_days"] + 1, n)):
+            sH = H[-lb:]; sL = L[-lb:]; sV = V[-lb:]
+            if _slope(sH) >= 0 or _slope(sL) <= 0:
+                continue
+
+            x     = np.arange(lb, dtype=float)
+            hline = np.polyval(np.polyfit(x, sH, 1), x)
+            lline = np.polyval(np.polyfit(x, sL, 1), x)
+            diff  = hline - lline
+            if diff[-1] <= 0 or diff[0] <= 0:
+                continue
+
+            apex_pct = 1 - diff[-1] / diff[0]
+            if not (cfg["sym_apex_min"] <= apex_pct <= cfg["sym_apex_max"]):
+                continue
+
+            vol30 = float(sV.min()) < avg30 * 1.02
+            conf  = 0.50
+            if 0.65 <= apex_pct <= 0.75: conf += 0.10
+            if vol30:                    conf += 0.10
+            if strong_trend:             conf += 0.10
+            if conf > best_conf:
+                best_conf = conf
+                best_kw   = {"apex_pct": apex_pct, "days": lb}
+
+        if best_kw and best_conf >= 0.50:
+            s = f"Sym Triangle: {best_kw['days']}d, {best_kw['apex_pct']:.0%} to apex"
+            return self._r(True, best_conf, s, "Symmetrical Triangle", **best_kw)
+        return self._r(False, 0, "No Sym Triangle", "Symmetrical Triangle")
+
+    # ── TIER 4 — Universal Signals ────────────────────────────────────────────
+
+    def detect_volume_surge(self):
+        V, n, cfg = self.V, self.n, self.cfg
+        if n < 21:
+            return {"ratio": 0.0, "strong": False, "very_strong": False}
+        avg20 = float(V[-21:-1].mean())
+        vr    = float(V[-1]) / avg20 if avg20 > 0 else 0
+        return {"ratio": vr, "strong": vr >= cfg["vol_strong"],
+                "very_strong": vr >= cfg["vol_very_strong"]}
+
+    def detect_bb_squeeze(self):
+        cfg = self.cfg
+        upper = _fcol(self.df, "BBU_")
+        lower = _fcol(self.df, "BBL_")
+        mid   = _fcol(self.df, "BBM_")
+        null  = {"squeeze_6m": False, "squeeze_3m": False, "bb_width": None}
+        if upper.empty or lower.empty or mid.empty:
+            return null
+        idx   = upper.index.intersection(lower.index).intersection(mid.index)
+        if len(idx) < 20:
+            return null
+        width = ((upper.loc[idx] - lower.loc[idx]) / mid.loc[idx]).dropna()
+        cur   = float(width.iloc[-1])
+        s6m   = (len(width) >= cfg["bb_squeeze_6m"] and
+                 cur <= float(width.iloc[-cfg["bb_squeeze_6m"]:].min()) * 1.02)
+        s3m   = (len(width) >= cfg["bb_squeeze_3m"] and
+                 cur <= float(width.iloc[-cfg["bb_squeeze_3m"]:].min()) * 1.02)
+        return {"squeeze_6m": bool(s6m), "squeeze_3m": bool(s3m), "bb_width": cur}
+
+    def detect_retest(self):
+        C, H, L, n = self.C, self.H, self.L, self.n
+        if n < 10:
+            return {"detected": False, "level": None}
+        for days_ago in range(3, 8):
+            if days_ago + 8 >= n:
+                continue
+            level = float(np.percentile(H[-(days_ago + 8):-days_ago], 90))
+            if float(C[-days_ago]) <= level:
+                continue
+            if (abs(float(L[-days_ago:].min()) - level) / level <= 0.02 and
+                    float(C[-1]) > level * 0.99):
+                return {"detected": True, "level": level}
+        return {"detected": False, "level": None}
+
+    def validate_four_layers(self, pattern_result: dict):
+        C, H, V, n = self.C, self.H, self.V, self.n
+        if n < 3:
+            return {"layers_passed": 0, "all_passed": False}
+        passed = 0
+        if pattern_result.get("confidence", 0) >= 0.60:
+            passed += 1
+        if float(C[-1]) > float(H[-2]):
+            passed += 1
+        avg20 = float(V[-21:-1].mean()) if n > 21 else float(V[:-1].mean())
+        if float(V[-1]) >= avg20 * self.cfg["vol_strong"]:
+            passed += 1
+        if n >= 3:
+            res = float(np.percentile(H[-10:-1], 90))
+            if float(C[-2]) > res and float(C[-1]) > res * 0.99:
+                passed += 1
+        return {"layers_passed": passed, "all_passed": passed == 4}
+
+    def run_all(self) -> dict:
+        results = {
+            "vcp":                  self.detect_vcp(),
+            "cup_and_handle":       self.detect_cup_and_handle(),
+            "wyckoff":              self.detect_wyckoff_spring(),
+            "htf":                  self.detect_high_tight_flag(),
+            "bull_flag":            self.detect_bull_flag(),
+            "pennant":              self.detect_pennant(),
+            "ascending_triangle":   self.detect_ascending_triangle(),
+            "flat_base":            self.detect_flat_base(),
+            "double_bottom":        self.detect_double_bottom(),
+            "symmetrical_triangle": self.detect_symmetrical_triangle(),
+            "volume_surge":         self.detect_volume_surge(),
+            "bb_squeeze":           self.detect_bb_squeeze(),
+            "retest":               self.detect_retest(),
+        }
+        best_conf, best_pat = 0.0, {}
+        for k in ["vcp", "cup_and_handle", "wyckoff", "htf", "bull_flag", "pennant",
+                  "ascending_triangle", "flat_base", "double_bottom", "symmetrical_triangle"]:
+            p = results[k]
+            if p.get("detected") and p.get("confidence", 0) > best_conf:
+                best_conf = p["confidence"]; best_pat = p
+        results["four_layer"] = self.validate_four_layers(best_pat)
+        return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BREAKOUT PROBABILITY ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+class BreakoutProbabilityEngine:
+    """
+    Three-layer Bayesian-style model:
+      Layer 1 — base win rate from pattern history
+      Layer 2 — additive modifiers (25+ factors)
+      Layer 3 — confidence band from signal count
+    Returns:
+      { probability, band, band_label, base_rate, positive_mods,
+        negative_mods, signals_count, display }
+    """
+
+    def __init__(self, pattern_results: dict, df: pd.DataFrame,
+                 spy_df: pd.DataFrame = None, cfg: dict = None):
+        self.pr  = pattern_results
+        self.df  = df
+        self.spy = spy_df
+        self.cfg = cfg or CONFIG
+        self._mods: list = []
+        self._n:    int  = 0
+
+    def _base_rate(self):
+        detected = []
+        mapping  = {
+            "vcp":                 ("VCP",                "VCP_2"),
+            "cup_and_handle":      ("Cup and Handle",     "Cup and Handle"),
+            "wyckoff":             ("Wyckoff Spring",     "Wyckoff Spring"),
+            "htf":                 ("High and Tight Flag","High and Tight Flag"),
+            "bull_flag":           ("Bull Flag",          "Bull Flag"),
+            "pennant":             ("Pennant",            "Pennant"),
+            "ascending_triangle":  ("Ascending Triangle", "Ascending Triangle"),
+            "flat_base":           ("Flat Base",          "Flat Base"),
+            "double_bottom":       ("Double Bottom",      "Double Bottom"),
+            "symmetrical_triangle":("Symmetrical Triangle","Symmetrical Triangle"),
+        }
+        br_adj = LEARNED_WEIGHTS.get("base_rate_adjustments", {})
+        for key, (label, _) in mapping.items():
+            p = self.pr.get(key, {})
+            if not p.get("detected"):
+                continue
+            wr  = BASE_RATES.get(p.get("pattern_key", label) if key == "vcp" else label, 42)
+            wr  = min(90, max(30, wr + br_adj.get(label, 0)))
+            lbl = "VCP" if key == "vcp" else label
+            detected.append((lbl, wr, p.get("confidence", 0.5)))
+
+        if not detected:
+            return 42, "No Pattern", []
+        detected.sort(key=lambda x: x[1], reverse=True)
+        bonus = min(len(detected) - 1, 3) * 5          # +5% per extra pattern, cap +15%
+        prob  = min(detected[0][1] + bonus, 90)
+        return prob, detected[0][0], detected
+
+    def _apply_mods(self, base: float):
+        df   = self.df
+        pr   = self.pr
+        C    = df["Close"].values
+        H    = df["High"].values
+        cur  = float(C[-1])
+        adj  = []
+        _wt_adj = LEARNED_WEIGHTS.get("adjustments", {})
+
+        def add(label, val):
+            adj.append((label, val + _wt_adj.get(label, 0)))
+
+        # ── Volume ────────────────────────────────────────────────────────────
+        vs = pr.get("volume_surge", {})
+        vr = vs.get("ratio", 0)
+        if vr >= 2.0:          add(f"Volume {vr:.1f}x average",        +8)
+        elif vr >= 1.5:        add(f"Volume {vr:.1f}x average",        +5)
+        elif vr >= 1.2:        add(f"Volume {vr:.1f}x average",        +2)
+        elif 0 < vr < 1.0:    add("Breakout on below-avg volume",     -10)
+        elif 1.0 <= vr < 1.2: add(f"Weak volume ({vr:.1f}x avg)",     -5)
+
+        # ── BB Squeeze ────────────────────────────────────────────────────────
+        bb = pr.get("bb_squeeze", {})
+        if bb.get("squeeze_6m"):   add("BB Squeeze (6-month low)",     +7)
+        elif bb.get("squeeze_3m"): add("BB Squeeze (3-month low)",     +4)
+
+        # ── SMA Stack ────────────────────────────────────────────────────────
+        sma20  = _fcol(df, "SMA_20");  sma50 = _fcol(df, "SMA_50")
+        sma200 = _fcol(df, "SMA_200")
+        a20  = not sma20.empty  and cur > float(sma20.iloc[-1])
+        a50  = not sma50.empty  and cur > float(sma50.iloc[-1])
+        a200 = not sma200.empty and cur > float(sma200.iloc[-1])
+        if a20 and a50 and a200: add("Full SMA stack aligned (20/50/200)", +6)
+        elif a50 and a200:       add("Above SMA50 and SMA200",             +3)
+        if not a200:  add("Price below SMA200",     -8)
+        elif not a50: add("Price below SMA50",      -5)
+
+        # ── RSI ───────────────────────────────────────────────────────────────
+        rsi = _fcol(df, "RSI_")
+        rv  = float(rsi.iloc[-1]) if not rsi.empty else None
+        if rv is not None:
+            if 55 <= rv <= 65:                        add(f"RSI ideal zone ({rv:.0f})",  +5)
+            elif (50 <= rv < 55) or (65 < rv <= 70): add(f"RSI good zone ({rv:.0f})",   +2)
+            if rv > 80:   add(f"Severely overbought RSI ({rv:.0f})", -8)
+            elif rv > 75: add(f"Overbought RSI ({rv:.0f})",          -4)
+
+        # ── ADX ───────────────────────────────────────────────────────────────
+        adx = _fcol(df, "ADX_")
+        av  = float(adx.iloc[-1]) if not adx.empty else None
+        if av is not None:
+            if av > 30:          add(f"ADX strong ({av:.0f})",    +5)
+            elif 25 <= av <= 30: add(f"ADX moderate ({av:.0f})",  +3)
+
+        # ── Retest ────────────────────────────────────────────────────────────
+        if pr.get("retest", {}).get("detected"):
+            add("Retest of breakout level confirmed", +8)
+
+        # ── Relative Strength ─────────────────────────────────────────────────
+        if self.spy is not None:
+            sp = self.spy["Close"].values
+            if len(sp) > 30 and len(C) > 30:
+                sr30  = (C[-1] - C[-31]) / C[-31]   if C[-31] != 0  else 0
+                spr30 = (sp[-1] - sp[-31]) / sp[-31] if sp[-31] != 0 else 0
+                if sr30 > spr30:
+                    add("Outperforming SPY (30d)", +5)
+                elif len(C) > 10 and len(sp) > 10:
+                    sr10  = (C[-1] - C[-11]) / C[-11]   if C[-11] != 0  else 0
+                    spr10 = (sp[-1] - sp[-11]) / sp[-11] if sp[-11] != 0 else 0
+                    if sr10 > spr10:
+                        add("Outperforming SPY (10d)", +3)
+
+        # ── Pattern Quality ───────────────────────────────────────────────────
+        vcp = pr.get("vcp", {})
+        if vcp.get("detected"):
+            fd = vcp.get("final_depth", 1)
+            if fd < 0.04: add("VCP final contraction < 4% (extremely tight)", +6)
+            if fd > 0.12: add("VCP final contraction widening (invalid)",     -5)
+
+        htf = pr.get("htf", {})
+        if htf.get("detected") and htf.get("pullback", 1) < 0.10:
+            add("HTF pullback < 10% (extremely tight)", +4)
+
+        cup = pr.get("cup_and_handle", {})
+        if cup.get("detected"):
+            if cup.get("handle_retrace", 1) < 0.10: add("Cup handle < 10% deep", +4)
+            if cup.get("v_shaped"):                 add("Cup is V-shaped",        -5)
+
+        db = pr.get("double_bottom", {})
+        if db.get("detected") and db.get("undercut"):
+            add("Double Bottom shakeout confirmed",  +3)
+
+        wy = pr.get("wyckoff", {})
+        if wy.get("detected") and wy.get("spring_vr", 1) < 0.5 and wy.get("lps"):
+            add("Wyckoff Spring very low vol + LPS", +5)
+
+        bf = pr.get("bull_flag", {})
+        if bf.get("detected") and bf.get("retrace_pct", 0) > 0.50:
+            add("Bull Flag retraced > 50% of flagpole", -7)
+
+        at = pr.get("ascending_triangle", {})
+        if at.get("detected") and at.get("touches", 3) < 3:
+            add("Ascending Triangle < 3 resistance touches", -4)
+
+        # ── 52-Week High Proximity ────────────────────────────────────────────
+        h252 = float(H[-252:].max()) if len(H) >= 252 else float(H.max())
+        p52  = (h252 - cur) / h252 if h252 > 0 else 1
+        if p52 <= 0.01:   add("Within 1% of 52-week high", +5)
+        elif p52 <= 0.03: add(f"Within {p52:.0%} of 52-week high", +3)
+        elif p52 <= 0.05: add(f"Within {p52:.0%} of 52-week high", +1)
+
+        # ── Four-Layer Validation ─────────────────────────────────────────────
+        if pr.get("four_layer", {}).get("all_passed"):
+            add("All four validation layers passed", +6)
+
+        # ── Weekly Chart (approximate) ────────────────────────────────────────
+        try:
+            weekly = df["Close"].resample("W").last().dropna()
+            if len(weekly) >= 10:
+                wsma10 = float(weekly.rolling(10).mean().iloc[-1])
+                if float(weekly.iloc[-1]) > wsma10:
+                    add("Weekly chart bullish (W close > 10-week SMA)", +4)
+        except Exception:
+            pass
+
+        # ── Broad Market ─────────────────────────────────────────────────────
+        if self.spy is not None:
+            sp = self.spy["Close"].values
+            if len(sp) >= 50:
+                sma50_val = float(sp[-50:].mean())
+                if sp[-1] < sma50_val:
+                    add("SPY below its 50-day SMA (headwind)", -8)
+                elif len(sp) >= 4 and all(sp[-i] < sp[-i - 1] for i in range(1, 4)):
+                    add("SPY down 3+ consecutive days",         -4)
+
+        # ── ATR Expansion ─────────────────────────────────────────────────────
+        atr = _fcol(df, "ATRr")
+        if len(atr) >= 14:
+            if float(atr.iloc[-1]) > float(atr.iloc[-14:-7].mean()) * 1.10:
+                add("ATR expanding (volatility rising, not coiling)", -5)
+
+        # ── Earnings Risk ─────────────────────────────────────────────────────
+        ed = pr.get("earnings_days", None)
+        if ed is not None and 0 <= ed <= 5:
+            add(f"Earnings in {ed} days (binary event)", -10)
+
+        # ── Late-Stage Base ───────────────────────────────────────────────────
+        try:
+            H252 = H[-252:] if len(H) >= 252 else H
+            h_top, _ = _swings(H252, order=10)
+            sma50_v  = _fcol(df, "SMA_50").values
+            n_bases  = sum(1 for hi in h_top[:-1]
+                           if hi < len(sma50_v) and H252[hi] > sma50_v[-(len(H252) - hi)])
+            if n_bases >= 3:
+                add(f"Late-stage base (approx #{n_bases + 1})", -6)
+        except Exception:
+            pass
+
+        total = sum(v for _, v in adj)
+        final = max(5, min(95, base + total))
+        self._mods = adj
+        self._n    = len(adj)
+        return final, adj
+
+    def _band(self):
+        n = self._n
+        if n >= 8: return 5,  "HIGH"
+        if n >= 5: return 10, "MEDIUM"
+        if n >= 3: return 15, "LOW"
+        return 20, "SPECULATIVE"
+
+    def calculate_probability(self, earnings_days=None) -> dict:
+        if earnings_days is not None:
+            self.pr["earnings_days"] = earnings_days
+        base, primary, all_pats = self._base_rate()
+        final, adj = self._apply_mods(base)
+        band, label = self._band()
+        pos = [(l, v) for l, v in adj if v > 0]
+        neg = [(l, v) for l, v in adj if v < 0]
+        return {
+            "probability":     final,
+            "base_rate":       base,
+            "primary_pattern": primary,
+            "all_patterns":    all_pats,
+            "positive_mods":   pos,
+            "negative_mods":   neg,
+            "band":            band,
+            "band_label":      label,
+            "signals_count":   self._n,
+            "display":         f"{final}% ± {band}% [{label}]",
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BREAKOUT SCANNER
+# ══════════════════════════════════════════════════════════════════════════════
+class BreakoutScanner:
+    """Orchestrates: fetch → indicators → detect → score → probability → output."""
+
+    def __init__(self, cfg: dict = None):
+        self.cfg     = cfg or CONFIG
+        self.spy     = None
+        self.results = []
+        self.args    = None
+
+    # ── Data ──────────────────────────────────────────────────────────────────
+
+    def _fetch_sp500(self) -> list:
+        try:
+            url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+            return pd.read_html(url)[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
+        except Exception as e:
+            print(f"  [warn] Could not fetch S&P 500: {e} — using 30-ticker fallback")
+            return ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","JPM","V","UNH",
+                    "XOM","PG","MA","HD","CVX","MRK","LLY","ABBV","KO","PEP",
+                    "COST","AVGO","CSCO","TMO","ACN","MCD","ABT","CRM","NKE","ADBE"]
+
+    def _fetch_ticker(self, ticker: str):
+        try:
+            end   = datetime.now()
+            start = end - timedelta(days=self.cfg["lookback_days"] + 60)
+            raw   = yf.download(ticker, start=start, end=end,
+                                progress=False, auto_adjust=True)
+            if raw.empty or len(raw) < 60:
+                return None, None
+            df = _norm(raw)
+
+            ed = None
+            try:
+                cal = yf.Ticker(ticker).calendar
+                if cal is not None:
+                    if hasattr(cal, "empty") and not cal.empty:
+                        d = pd.to_datetime(cal.iloc[0, 0])
+                        days = (d - pd.Timestamp.now()).days
+                        if 0 <= days <= 30:
+                            ed = int(days)
+                    elif isinstance(cal, dict):
+                        for k in ("Earnings Date", "earningsDate"):
+                            if k in cal:
+                                d = pd.to_datetime(cal[k])
+                                if hasattr(d, "__iter__"):
+                                    d = list(d)[0]
+                                days = (pd.Timestamp(d) - pd.Timestamp.now()).days
+                                if 0 <= days <= 30:
+                                    ed = int(days)
+                                break
+            except Exception:
+                pass
+            return df, ed
+        except Exception:
+            return None, None
+
+    def _fetch_spy(self):
+        try:
+            end   = datetime.now()
+            start = end - timedelta(days=self.cfg["lookback_days"] + 60)
+            raw   = yf.download("SPY", start=start, end=end,
+                                progress=False, auto_adjust=True)
+            return _norm(raw) if not raw.empty else None
+        except Exception:
+            return None
+
+    # ── Indicators ────────────────────────────────────────────────────────────
+
+    def _indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        for p in [20, 50, 200]:
+            df[f"SMA_{p}"] = df["Close"].rolling(p).mean()
+        for p in [10, 21]:
+            df[f"EMA_{p}"] = df["Close"].ewm(span=p, adjust=False).mean()
+        try:
+            df.ta.rsi(length=14, append=True)
+        except Exception:
+            pass
+        try:
+            df.ta.bbands(length=20, std=2, append=True)
+        except Exception:
+            r = df["Close"].rolling(20)
+            df["BBM_20_2.0"] = r.mean()
+            df["BBU_20_2.0"] = r.mean() + 2 * r.std()
+            df["BBL_20_2.0"] = r.mean() - 2 * r.std()
+        try:
+            df.ta.atr(length=14, append=True)
+        except Exception:
+            hl = df["High"] - df["Low"]
+            hc = (df["High"] - df["Close"].shift()).abs()
+            lc = (df["Low"]  - df["Close"].shift()).abs()
+            df["ATRr_14"] = pd.concat([hl, hc, lc], axis=1).max(axis=1).ewm(span=14).mean()
+        try:
+            df.ta.adx(length=14, append=True)
+        except Exception:
+            pass
+        # Anchored VWAP — anchored 63 bars back (≈ start of current base)
+        try:
+            n_anc = max(0, len(df) - 63)
+            tp    = (df["High"] + df["Low"] + df["Close"]) / 3
+            tp_s  = tp.iloc[n_anc:]
+            v_s   = df["Volume"].iloc[n_anc:]
+            avwap = (tp_s * v_s).cumsum() / v_s.cumsum().replace(0, np.nan)
+            df["AVWAP_63"] = np.nan
+            df.loc[avwap.index, "AVWAP_63"] = avwap.values
+        except Exception:
+            pass
+        return df
+
+    # ── Composite Score ───────────────────────────────────────────────────────
+
+    def _score(self, df: pd.DataFrame, pr: dict) -> float:
+        C   = df["Close"].values; H = df["High"].values; cur = float(C[-1])
+        sc  = 0.0
+        tier_map = [
+            ("vcp", 40), ("cup_and_handle", 40), ("wyckoff", 40),
+            ("htf", 30), ("bull_flag", 30), ("pennant", 30),
+            ("ascending_triangle", 20), ("flat_base", 20),
+            ("double_bottom", 20), ("symmetrical_triangle", 20),
+        ]
+        pts = [wt * p.get("confidence", 0.5)
+               for key, wt in tier_map if (p := pr.get(key, {})).get("detected")]
+        if pts:
+            pts.sort(reverse=True)
+            sc += min(40, pts[0] + (pts[1] * 0.5 if len(pts) > 1 else 0))
+
+        rsi = _fcol(df, "RSI_")
+        if not rsi.empty and 50 <= float(rsi.iloc[-1]) <= 70: sc += 10
+        sma20 = _fcol(df, "SMA_20"); sma50 = _fcol(df, "SMA_50")
+        if not sma20.empty and cur > float(sma20.iloc[-1]): sc += 5
+        if not sma50.empty and cur > float(sma50.iloc[-1]): sc += 5
+
+        vr = pr.get("volume_surge", {}).get("ratio", 0)
+        sc += min(20, (vr / 2.0) * 20)
+        if pr.get("bb_squeeze", {}).get("squeeze_6m") or pr.get("bb_squeeze", {}).get("squeeze_3m"):
+            sc += 5
+
+        atr = _fcol(df, "ATRr")
+        h52 = float(H[-252:].max()) if len(H) >= 252 else float(H.max())
+        if not atr.empty:
+            av = float(atr.iloc[-1])
+            td = h52 - cur
+            if av > 0 and td / (av * 1.5) >= 2: sc += 10
+        if pr.get("retest", {}).get("detected"): sc += 10
+
+        adx = _fcol(df, "ADX_")
+        if not adx.empty and float(adx.iloc[-1]) > 25: sc += 5
+        if self.spy is not None and len(self.spy) > 30 and len(C) > 30:
+            sp = self.spy["Close"].values
+            if len(sp) > 30:
+                sr  = (C[-1] - C[-31]) / C[-31]   if C[-31] != 0  else 0
+                spr = (sp[-1] - sp[-31]) / sp[-31] if sp[-31] != 0 else 0
+                if sr > spr: sc += 5
+        return min(100.0, sc)
+
+    # ── Trade Thesis ──────────────────────────────────────────────────────────
+
+    def _thesis(self, r: dict) -> str:
+        pat = r["pattern"]; pr = r.get("patterns", {}); cur = r["price"]
+        key = ("VCP"               if "VCP"          in pat else
+               "Cup and Handle"    if "Cup"           in pat else
+               "Wyckoff Spring"    if "Wyckoff"       in pat else
+               "High and Tight Flag" if "High"        in pat else
+               "Bull Flag"         if "Bull Flag"     in pat else
+               "Pennant"           if "Pennant"       in pat else
+               "Ascending Triangle" if "Ascending"    in pat else
+               "Flat Base"         if "Flat"          in pat else
+               "Double Bottom"     if "Double"        in pat else
+               "Symmetrical Triangle" if "Symmetrical" in pat else "No Pattern")
+        tmpl = THESES.get(key, THESES["No Pattern"])
+
+        vcp_p = pr.get("vcp", {}); cup_p = pr.get("cup_and_handle", {})
+        htf_p = pr.get("htf", {}); bf_p  = pr.get("bull_flag", {})
+        pn_p  = pr.get("pennant", {}); at_p = pr.get("ascending_triangle", {})
+        fb_p  = pr.get("flat_base", {}); db_p = pr.get("double_bottom", {})
+        sym_p = pr.get("symmetrical_triangle", {})
+
+        gain_val = htf_p.get("pole_gain", bf_p.get("pole_gain", pn_p.get("pole_gain", 0.20)))
+        fmt = {
+            "ticker":   r["ticker"],
+            "n_cont":   vcp_p.get("n_contractions", 2),
+            "depths":   vcp_p.get("depths", "N/A"),
+            "pivot":    vcp_p.get("pivot", cup_p.get("pivot", cur * 1.02)),
+            "depth":    cup_p.get("cup_depth", 0.30),
+            "weeks":    cup_p.get("weeks", fb_p.get("weeks", 10)),
+            "handle":   cup_p.get("handle_retrace", 0.10),
+            "gain":     gain_val,
+            "pullback": htf_p.get("pullback", 0.15),
+            "retrace":  bf_p.get("retrace_pct", 0.35),
+            "apex":     pn_p.get("apex_pct", sym_p.get("apex_pct", 0.70)),
+            "resist":   at_p.get("resistance", cur * 1.02),
+            "touches":  at_p.get("touches", 3),
+            "range":    fb_p.get("range_pct", 0.10),
+            "low":      db_p.get("low2", db_p.get("low1", cur * 0.95)),
+            "neck":     db_p.get("neckline", cur * 1.02),
+            "div":      "bullish RSI divergence and " if db_p.get("rsi_div") else "",
+        }
+        try:
+            return tmpl.format(**fmt)
+        except Exception:
+            return (f"{r['ticker']} shows a {pat} setup with {r['probability']}% "
+                    "breakout probability. Enter on volume confirmation above the "
+                    "pivot and stop below the nearest structure low.")
+
+    # ── Per-ticker pipeline ────────────────────────────────────────────────────
+
+    def _process_with_info(self, item: dict, catalyst: dict = None):
+        """Full pipeline when we already have .info from quick_filter."""
+        import traceback as _tb
+        ticker = item["ticker"]
+        info   = item.get("info", {})
+        raw, ed = self._fetch_ticker(ticker)
+        if raw is None:
+            if getattr(self, "_debug", False):
+                print(f"  [DEBUG] {ticker}: _fetch_ticker returned None")
+            return None
+        try:
+            df   = self._indicators(raw)
+            det  = PatternDetector(df, self.spy, self.cfg)
+            pats = det.run_all()
+            eng  = BreakoutProbabilityEngine(pats, df, self.spy, self.cfg)
+            prob = eng.calculate_probability(earnings_days=ed)
+            sc   = self._score(df, pats)
+            news_sc = (catalyst or {}).get("catalyst_score")
+            expl = ExplosiveMoveDetector(df, info, self.spy, pats, prob).calculate(news_sc)
+            # ── New signal layers ──────────────────────────────────────────
+            eq   = EarningsQualityEngine().score(ticker)
+            flow = OptionsFlowScorer().score(ticker)
+            # Pre-market gap from info dict (already fetched in quick_filter)
+            pre   = float(info.get("preMarketPrice", 0) or 0)
+            prev  = float(info.get("previousClose",  0) or 0)
+            pm_gap = (pre - prev) / prev if pre > 0 and prev > 0 else 0.0
+            # 12-month return for RS Rating (calculated post-scan)
+            C   = df["Close"].values
+            rs_12m = float(C[-1] / C[-252] - 1) if len(C) >= 252 else float(C[-1] / C[0] - 1)
+        except Exception as e:
+            if getattr(self, "_debug", False):
+                print(f"  [DEBUG] {ticker}: {e}")
+                _tb.print_exc()
+            return None
+        return self._build_result(ticker, df, pats, prob, sc, ed, expl,
+                                  catalyst, info, eq, flow, pm_gap, rs_12m)
+
+    def _process(self, ticker: str):
+        raw, ed = self._fetch_ticker(ticker)
+        if raw is None:
+            return None
+        try:
+            df   = self._indicators(raw)
+            det  = PatternDetector(df, self.spy, self.cfg)
+            pats = det.run_all()
+            eng  = BreakoutProbabilityEngine(pats, df, self.spy, self.cfg)
+            prob = eng.calculate_probability(earnings_days=ed)
+            sc   = self._score(df, pats)
+            expl = ExplosiveMoveDetector(df, {}, self.spy, pats, prob).calculate()
+        except Exception:
+            return None
+        return self._build_result(ticker, df, pats, prob, sc, ed, expl, None, {})
+
+    def _build_result(self, ticker, df, pats, prob, sc, ed, expl,
+                      catalyst, info, eq=None, flow=None, pm_gap=0.0, rs_12m=0.0):
+        C   = df["Close"].values; H = df["High"].values
+        cur = float(C[-1])
+        h52 = float(H[-252:].max()) if len(H) >= 252 else float(H.max())
+        p52 = (h52 - cur) / h52 if h52 > 0 else 0
+
+        rsi = _fcol(df, "RSI_")
+        rv  = float(rsi.iloc[-1]) if not rsi.empty else None
+
+        atr = _fcol(df, "ATRr")
+        av  = float(atr.iloc[-1]) if not atr.empty else cur * 0.02
+        sd  = av * 1.5
+        td  = h52 - cur
+        rr  = td / sd if sd > 0 else 0
+
+        primary = prob["primary_pattern"]
+        sig_sum = primary
+        for k in ["vcp","cup_and_handle","wyckoff","htf","bull_flag","pennant",
+                  "ascending_triangle","flat_base","double_bottom","symmetrical_triangle"]:
+            pp = pats.get(k, {})
+            if pp.get("detected") and pp.get("name","") == primary:
+                sig_sum = pp.get("summary", primary)[:65]; break
+
+        erisk = ("Yes"  if ed is not None and ed <= 5  else
+                 "Soon" if ed is not None and ed <= 10 else "No")
+
+        mkt_cap = float(info.get("marketCap", 0) or 0)
+
+        result = {
+            "ticker":         ticker,   "price":        cur,   "score":       sc,
+            "probability":    prob["probability"],
+            "prob_display":   prob["display"],
+            "conf_band":      prob["band"],
+            "conf_label":     prob["band_label"],
+            "pattern":        primary,  "rsi":          rv,
+            "vol_ratio":      pats.get("volume_surge",{}).get("ratio",0),
+            "bb_squeeze":     (pats.get("bb_squeeze",{}).get("squeeze_6m") or
+                               pats.get("bb_squeeze",{}).get("squeeze_3m")),
+            "pct_52w":        p52,      "rr":           rr,
+            "stop_price":     cur - sd, "tgt_price":    cur + td,
+            "stop_pct":       sd / cur if cur > 0 else 0,
+            "earnings_days":  ed,       "earnings_risk": erisk,
+            "signal_summary": sig_sum,
+            "prob_detail":    prob,     "patterns":     pats,
+            "market_cap":     mkt_cap,
+            # Explosive
+            "explosive_score":  expl["score"],
+            "explosive_grade":  expl["grade"],
+            "move_low":         expl["move_low"],
+            "move_high":        expl["move_high"],
+            "expl_short_pct":   expl["short_pct"],
+            "expl_float":       expl["float_sh"],
+            "expl_short_ratio": expl["short_ratio"],
+            "expl_comp_pts":    expl["compression_pts"],
+            "expl_squeeze_pts": expl["squeeze_pts"],
+            "expl_cat_pts":     expl["catalyst_pts"],
+            "expl_comp_det":    expl["compression_det"],
+            "expl_squeeze_det": expl["squeeze_det"],
+            "expl_cat_det":     expl["catalyst_det"],
+            # Catalyst
+            "catalyst_score":   (catalyst or {}).get("catalyst_score", 0),
+            "catalyst_flags":   (catalyst or {}).get("catalyst_flags", []),
+            "top_flag":         (catalyst or {}).get("top_flag", ""),
+            "top_headline":     (catalyst or {}).get("top_headline", ""),
+            # Earnings Quality
+            "eq_score":         (eq or {}).get("eq_score",       50),
+            "eq_grade":         (eq or {}).get("eq_grade",       "N/A"),
+            "eq_acceleration":  (eq or {}).get("eq_acceleration",False),
+            "eq_detail":        (eq or {}).get("eq_detail",      ""),
+            # Options Flow
+            "flow_score":       (flow or {}).get("flow_score",   0),
+            "flow_signal":      (flow or {}).get("flow_signal",  ""),
+            "cp_ratio":         (flow or {}).get("cp_ratio",     0.0),
+            "unusual_calls":    (flow or {}).get("unusual_calls",False),
+            "flow_detail":      (flow or {}).get("flow_detail",  ""),
+            # Pre-market gap & VWAP
+            "pm_gap":           pm_gap,
+            "rs_12m":           rs_12m,
+            "rs_rating":        50,   # placeholder — set post-scan in run()
+            # Anchored VWAP vs price
+            "above_avwap":      self._above_avwap(df),
+        }
+        result["thesis"] = self._thesis(result)
+        return result
+
+    def _above_avwap(self, df: pd.DataFrame) -> bool:
+        """True if current close is above the 63-bar anchored VWAP."""
+        try:
+            avwap = df["AVWAP_63"].dropna()
+            if avwap.empty:
+                return False
+            return float(df["Close"].iloc[-1]) > float(avwap.iloc[-1])
+        except Exception:
+            return False
+
+    # ── Market Context ────────────────────────────────────────────────────────
+
+    def _market_context(self):
+        if self.spy is None:
+            return 0, "N/A", "N/A"
+        sp = self.spy["Close"].values
+        if len(sp) < 50:
+            return 0, "Insufficient data", "N/A"
+        sma50 = float(sp[-50:].mean()); cur = float(sp[-1])
+        pct   = (cur - sma50) / sma50
+
+        if cur < sma50:
+            spy_str = f"BELOW -{abs(pct):.1%}"; mod = -8
+        else:
+            spy_str = f"ABOVE +{pct:.1%}"; mod = 0
+
+        if len(sp) >= 4 and all(sp[-i] < sp[-i - 1] for i in range(1, 4)):
+            three_d = "DOWN"
+            if mod == 0: mod = -4
+        elif len(sp) >= 2 and sp[-1] > sp[-2]:
+            three_d = "UP"
+        else:
+            three_d = "FLAT"
+
+        return mod, spy_str, three_d
+
+    # ── Output ────────────────────────────────────────────────────────────────
+
+    def _print_market_box(self, n_scanned, n_pats):
+        mod, spy_vs, three_d = self._market_context()
+        top_p = self.results[0]["probability"] if self.results else 0
+
+        spy_ok = "OK" if "ABOVE" in spy_vs else "!!"
+        td_ok  = "OK" if three_d == "UP" else ("!!" if three_d == "DOWN" else "--")
+
+        raw      = getattr(self, "_universe_raw",      n_scanned)
+        filtered = getattr(self, "_universe_filtered",  n_scanned)
+        advanced = getattr(self, "_universe_advanced",  n_scanned)
+
+        lines = [
+            f"  SPY vs SMA50      :  {spy_vs} [{spy_ok}]",
+            f"  SPY 3-day trend   :  {three_d} [{td_ok}]",
+            f"  Market modifier   :  {mod:+d}%",
+            f"  Universe (raw)    :  {raw} tickers fetched",
+            f"  Quick filter      :  {filtered} passed  →  {advanced} fully analyzed",
+            f"  Qualified results :  {n_scanned}   Patterns found: {n_pats}",
+            f"  Highest prob      :  {top_p}%",
+        ]
+        w = max(len(l) for l in lines) + 1
+        sep = "+" + "-" * (w + 2) + "+"
+        print(sep)
+        print("|" + "  MARKET CONTEXT".ljust(w + 2) + "|")
+        print(sep)
+        for ln in lines:
+            print("|  " + ln.ljust(w) + "|")
+        print(sep)
+        print()
+
+    def _print_table(self, top_n: int):
+        headers = ["#", "Ticker", "Price", "RS", "EQ", "Flow",
+                   "Breakout Prob", "Pattern", "AVWAP", "PM Gap",
+                   "%<52WH", "R:R", "Earn", "Signal Summary"]
+        rows = []
+        for i, r in enumerate(self.results[:top_n], 1):
+            pm = r.get("pm_gap", 0)
+            pm_str = f"+{pm:.1%}" if pm > 0.005 else ("" if pm == 0 else f"{pm:.1%}")
+            rows.append([
+                i, r["ticker"], f"${r['price']:.2f}",
+                r.get("rs_rating", "--"),
+                r.get("eq_grade", "N/A"),
+                f"{r.get('flow_score',0)}" if r.get("flow_score",0) > 0 else "--",
+                r["prob_display"], r["pattern"][:16],
+                "▲" if r.get("above_avwap") else "▼",
+                pm_str if pm_str else "--",
+                f"{r['pct_52w']:.1%}", f"{r['rr']:.1f}:1",
+                r["earnings_risk"],
+                r["signal_summary"][:36],
+            ])
+        try:
+            print(tabulate(rows, headers=headers, tablefmt="rounded_outline"))
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            print(tabulate(rows, headers=headers, tablefmt="grid"))
+        print()
+
+    def _print_breakdown(self, r: dict, rank: int):
+        d   = r["prob_detail"]; cur = r["price"]
+        pct = (r["tgt_price"] - cur) / cur if cur > 0 else 0
+        sep = "=" * 58
+
+        print(f"\n{sep}")
+        print(f"  #{rank}  {r['ticker']}   ({r['pattern']})")
+        print(sep)
+        print(f"  Base Win Rate    : {d['base_rate']}%")
+        if len(d["all_patterns"]) > 1:
+            others = ", ".join(f"{p[0]} ({p[1]}%)" for p in d["all_patterns"][1:])
+            print(f"  Co-Patterns      : {others}")
+        print()
+
+        print("  [+] Positive Modifiers:")
+        for lbl, val in d["positive_mods"]:
+            print(f"      {lbl:<48} -> +{val}%")
+        if not d["positive_mods"]:
+            print("      (none)")
+
+        print()
+        print("  [-] Negative Modifiers:")
+        for lbl, val in d["negative_mods"]:
+            print(f"      {lbl:<48} -> {val}%")
+        if not d["negative_mods"]:
+            print("      (none)")
+
+        print()
+        print(f"  {'─'*54}")
+        print(f"  BREAKOUT PROBABILITY : {d['display']}")
+        print(f"  {'─'*54}")
+        print()
+        print(f"  Entry Trigger  : ${cur:.2f}  (current / near pivot)")
+        print(f"  Stop Loss      : ${r['stop_price']:.2f}  (-{r['stop_pct']:.1%})")
+        print(f"  Target Price   : ${r['tgt_price']:.2f}  (+{pct:.1%})")
+        print(f"  Reward:Risk    : {r['rr']:.1f} : 1")
+        print()
+
+        # ── New signal layers ─────────────────────────────────────────────────
+        print(f"  RS Rating      : {r.get('rs_rating', '--')}/99"
+              + ("  [TOP DECILE]" if r.get("rs_rating", 0) >= 90 else
+                 "  [STRONG]"    if r.get("rs_rating", 0) >= 75 else ""))
+        eq_acc = "  ★ ACCELERATING" if r.get("eq_acceleration") else ""
+        print(f"  Earnings Qual  : {r.get('eq_grade','N/A')} (score {r.get('eq_score',50)}){eq_acc}")
+        if r.get("eq_detail"):
+            print(f"    {r['eq_detail']}")
+        flow_s = r.get("flow_score", 0)
+        if flow_s > 0:
+            print(f"  Options Flow   : {flow_s}/100  {r.get('flow_signal','')}")
+            if r.get("flow_detail"):
+                print(f"    {r['flow_detail']}")
+        else:
+            print(f"  Options Flow   : No unusual activity")
+        pm = r.get("pm_gap", 0)
+        if abs(pm) > 0.005:
+            print(f"  Pre-market Gap : {pm:+.1%}  {'⚡ CATALYST GAP' if pm > 0.05 else ''}")
+        avwap_str = "Above (bullish)" if r.get("above_avwap") else "Below (caution)"
+        print(f"  Anchored VWAP  : {avwap_str}  (63-bar base anchor)")
+        print()
+
+        thesis = r.get("thesis", "")
+        if thesis:
+            words  = thesis.split()
+            lines  = []
+            line   = "  Trade Thesis   : "
+            for w in words:
+                if len(line) + len(w) + 1 > 72:
+                    lines.append(line); line = "                   " + w + " "
+                else:
+                    line += w + " "
+            if line.strip():
+                lines.append(line)
+            for ln in lines:
+                print(ln.rstrip())
+        print()
+
+    def _export(self, top_n: int):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_p = f"breakout_scan_{ts}.csv"
+        txt_p = f"top15_{ts}.txt"
+
+        if self.results:
+            rows = [{
+                "Ticker":       r["ticker"],
+                "Price":        round(r["price"], 2),
+                "Score":        round(r["score"], 1),
+                "Breakout_Prob": r["probability"],
+                "Confidence":   r["conf_label"],
+                "Pattern":      r["pattern"],
+                "RSI":          round(r["rsi"], 1) if r["rsi"] else None,
+                "Vol_Ratio":    round(r["vol_ratio"], 2),
+                "BB_Squeeze":   r["bb_squeeze"],
+                "Pct_52W":      round(r["pct_52w"], 4),
+                "RR":           round(r["rr"], 2),
+                "Stop":         round(r["stop_price"], 2),
+                "Target":       round(r["tgt_price"], 2),
+                "Earnings":     r["earnings_risk"],
+                "Signal":       r["signal_summary"],
+            } for r in self.results]
+            pd.DataFrame(rows).to_csv(csv_p, index=False)
+
+        old, sys.stdout = sys.stdout, io.StringIO()
+        try:
+            n_pats = sum(1 for r in self.results if r["pattern"] != "No Pattern")
+            self._print_market_box(len(self.results), n_pats)
+            self._print_table(top_n)
+            for i, r in enumerate(self.results[:5], 1):
+                self._print_breakdown(r, i)
+            txt_content = sys.stdout.getvalue()
+        finally:
+            sys.stdout = old
+
+        with open(txt_p, "w", encoding="utf-8") as f:
+            f.write(txt_content)
+
+        print(f"  Exported: {csv_p}")
+        print(f"  Exported: {txt_p}")
+        return csv_p, txt_p
+
+    # ── Explosive output ──────────────────────────────────────────────────────
+
+    def _print_explosive_table(self, top_n: int = 15):
+        rows = [r for r in self.results if r["explosive_score"] >= 40]
+        rows.sort(key=lambda x: x["explosive_score"], reverse=True)
+        if not rows:
+            print("  No explosive candidates found (score ≥ 40).\n"); return
+        hdrs = ["#","Ticker","Price","MktCap","Float","Short%",
+                "Exp Score","Grade","Catalyst","Est Move%","Pattern","Prob","Headline"]
+        tbl = []
+        for i, r in enumerate(rows[:top_n], 1):
+            mc  = r["market_cap"]; fs = r["expl_float"]
+            mc_s = f"${mc/1e9:.1f}B" if mc >= 1e9 else (f"${mc/1e6:.0f}M" if mc >= 1e6 else "—")
+            fs_s = f"{fs/1e6:.1f}M" if fs >= 1e6 else (f"{fs/1e3:.0f}K" if fs > 0 else "—")
+            tbl.append([i, r["ticker"], f"${r['price']:.2f}", mc_s, fs_s,
+                        f"{r['expl_short_pct']:.0%}" if r["expl_short_pct"] else "—",
+                        f"{r['explosive_score']}/100",
+                        r["explosive_grade"],
+                        r["top_flag"][:18] if r["top_flag"] else "—",
+                        f"+{r['move_low']:.0f}%–{r['move_high']:.0f}%",
+                        r["pattern"][:14],
+                        r["prob_display"][:12],
+                        r["top_headline"][:30] if r["top_headline"] else "—"])
+        try:
+            print(tabulate(tbl, headers=hdrs, tablefmt="rounded_outline"))
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            print(tabulate(tbl, headers=hdrs, tablefmt="grid"))
+        print()
+
+    def _print_explosive_breakdown(self, r: dict, rank: int):
+        sep  = "═" * 58
+        sep2 = "─" * 56
+        cur  = r["price"]
+        pct  = (r["tgt_price"] - cur) / cur if cur > 0 else 0
+        sq_t = cur * (1 + r["move_high"] / 100)
+
+        print(f"\n⚡ #{rank}  {r['ticker']} (${cur:.2f})  —  {r['explosive_grade']}")
+        print(sep)
+        print(f"  Explosive Score  : {r['explosive_score']}/100  {r['explosive_grade']}")
+        print(f"  Estimated Move   : +{r['move_low']:.0f}% to +{r['move_high']:.0f}%")
+        print(f"  Breakout Prob    : {r['prob_display']}")
+        if r["market_cap"]:
+            mc = r["market_cap"]
+            print(f"  Market Cap       : ${mc/1e9:.2f}B" if mc >= 1e9 else f"  Market Cap       : ${mc/1e6:.0f}M")
+        print()
+
+        # Catalyst flags
+        if r["catalyst_flags"]:
+            print(f"  🚀 CATALYST (score {r['catalyst_score']}/100):")
+            for fl in r["catalyst_flags"][:4]:
+                sign = "+" if fl["score"] > 0 else ""
+                hl   = f'  "{fl["headline"]}"' if fl["headline"] else ""
+                print(f"     {fl['flag']}  [{sign}{fl['score']}]{hl}")
+            print()
+
+        # Compression
+        print(f"  🗜️  COMPRESSION ({r['expl_comp_pts']}/35):")
+        for desc, pts in (r["expl_comp_det"] or [("—", 0)]):
+            print(f"     {desc:<52} → {pts} pts")
+
+        # Squeeze
+        print(f"\n  🔥 SQUEEZE FUEL ({r['expl_squeeze_pts']}/30):")
+        for desc, pts in (r["expl_squeeze_det"] or [("—", 0)]):
+            print(f"     {desc:<52} → {pts} pts")
+
+        # Technical catalyst
+        print(f"\n  📡 TECH CATALYST ({r['expl_cat_pts']}/25):")
+        for desc, pts in (r["expl_cat_det"] or [("—", 0)]):
+            print(f"     {desc:<52} → {pts} pts")
+
+        print(f"\n  {sep2}")
+        print(f"  Entry Trigger    : ${cur:.2f}")
+        print(f"  Stop Loss        : ${r['stop_price']:.2f}  (-{r['stop_pct']:.1%})")
+        print(f"  Base Target      : ${r['tgt_price']:.2f}  (+{pct:.1%})")
+        print(f"  Squeeze Target   : ${sq_t:.2f}  (+{r['move_high']:.0f}%)")
+        print(f"  Reward:Risk      : {r['rr']:.1f} : 1")
+
+        thesis = r.get("thesis", "")
+        if thesis:
+            words, lines, line = thesis.split(), [], "  Thesis: "
+            for w in words:
+                if len(line) + len(w) + 1 > 72:
+                    lines.append(line); line = "          " + w + " "
+                else:
+                    line += w + " "
+            if line.strip(): lines.append(line)
+            print()
+            for ln in lines: print(ln.rstrip())
+
+        sp = r["expl_short_pct"]; fs = r["expl_float"]
+        risks = []
+        if sp > 0.20: risks.append(f"High short interest {sp:.0%} — binary squeeze risk")
+        if fs > 0 and fs < 5e6: risks.append("Micro float — low liquidity, wide spreads")
+        if r["earnings_risk"] in ("Yes","Soon"): risks.append("Earnings event upcoming — binary risk")
+        if any(f["score"] < 0 for f in r["catalyst_flags"]):
+            neg = [f["flag"] for f in r["catalyst_flags"] if f["score"] < 0]
+            risks.append(", ".join(neg))
+        if risks:
+            print(f"\n  ⚠️  Key Risks: {'; '.join(risks)}")
+        print(sep)
+
+    # ── Main entry ────────────────────────────────────────────────────────────
+
+    def run(self):
+        args = self.args or argparse.Namespace(
+            pattern=None, watchlist=None, min_prob=0, no_earnings=False,
+            top=15, export=True, universe="all", min_explosive=0,
+            catalyst_only=False, biotech=False, squeeze=False,
+            max_float=None, max_cap=None, no_otc=False)
+
+        t0 = datetime.now()
+        self.results = []
+        self._universe_raw      = 0
+        self._universe_filtered = 0
+        self._universe_advanced = 0
+
+        # ── Phase 1: Universe ──────────────────────────────────────────────
+        if getattr(args, "watchlist", None):
+            tickers_info = [{"ticker": t.strip().upper(), "info": {},
+                             "market_cap": 0, "price": 0, "avg_vol": 0,
+                             "float_shares": 0, "short_pct": 0,
+                             "short_ratio": 0, "sector": ""}
+                            for t in args.watchlist.split(",")]
+            n = len(tickers_info)
+            self._universe_raw = self._universe_filtered = n
+            print(f"\n[Phase 1/4] Custom watchlist: {n} tickers")
+        else:
+            print("\n[Phase 1/4] Building universe...")
+            ub      = UniverseBuilder()
+            raw_t   = ub.build(
+                universe_type = getattr(args, "universe", "all"),
+                file_path     = getattr(args, "file",     None),
+            )
+            self._universe_raw = len(raw_t)
+            print(f"  Raw universe: {len(raw_t)} tickers")
+
+            # ── Phase 2: Quick filter ──────────────────────────────────────
+            print(f"[Phase 2/4] Quick filtering {len(raw_t)} tickers...")
+            tickers_info = ub.quick_filter(raw_t, args)
+            self._universe_filtered = len(tickers_info)
+            print(f"  {len(tickers_info)} stocks passed quick filter\n")
+
+        # ── Phase 3: News catalyst ─────────────────────────────────────────
+        cat_threshold = 20 if getattr(args, "catalyst_only", False) else 0
+        print(f"[Phase 3/4] News catalyst scan ({len(tickers_info)} stocks)...")
+        nce      = NewsCatalystEngine()
+        catalyst_map: dict = {}
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            futs = {ex.submit(nce.scan, item["ticker"]): item["ticker"]
+                    for item in tickers_info}
+            with tqdm(total=len(tickers_info), desc="  Catalyst scan",
+                      unit="stock", ncols=80) as bar:
+                for fut in as_completed(futs):
+                    r = fut.result()
+                    catalyst_map[r["ticker"]] = r
+                    bar.update(1)
+
+        if getattr(args, "biotech", False):
+            BIOTECH_KWS = ["biotech","pharma","therapeutics","biosciences","oncology","health"]
+            tickers_info = [x for x in tickers_info
+                            if any(k in x.get("sector","").lower() for k in BIOTECH_KWS)
+                            or catalyst_map.get(x["ticker"],{}).get("top_flag","").startswith("🧬")]
+
+        advanced = [x for x in tickers_info
+                    if catalyst_map.get(x["ticker"],{}).get("catalyst_score",0) >= cat_threshold]
+        self._universe_advanced = len(advanced)
+        print(f"  {len(advanced)} stocks advancing to full scan\n")
+
+        # ── Phase 4: Full pattern detection ───────────────────────────────
+        print(f"[Phase 4/4] Pattern detection + scoring ({len(advanced)} stocks)...")
+        print("Fetching SPY market data...")
+        self.spy = self._fetch_spy()
+
+        with ThreadPoolExecutor(max_workers=self.cfg["max_workers"]) as ex:
+            futs = {ex.submit(self._process_with_info, item,
+                              catalyst_map.get(item["ticker"])): item["ticker"]
+                    for item in advanced}
+            with tqdm(total=len(advanced), desc="  Analyzing",
+                      unit="stock", ncols=80) as bar:
+                for fut in as_completed(futs):
+                    try:
+                        r = fut.result()
+                        if r is None:
+                            continue
+                        min_prob  = getattr(args, "min_prob", 0)
+                        min_expl  = getattr(args, "min_explosive", 0)
+                        min_rs    = getattr(args, "min_rs", 0)
+                        no_earn   = getattr(args, "no_earnings", False)
+                        eq_only   = getattr(args, "earnings_quality", False)
+                        pm_only   = getattr(args, "premarket", False)
+                        pat_filt  = getattr(args, "pattern", None)
+                        sq_only   = getattr(args, "squeeze", False)
+                        if r["probability"] < min_prob: continue
+                        if r["explosive_score"] < min_expl: continue
+                        if no_earn and r["earnings_risk"] == "Yes": continue
+                        if pat_filt and pat_filt.lower() not in r["pattern"].lower(): continue
+                        if sq_only and r["expl_short_pct"] < 0.10: continue
+                        if eq_only and r["eq_score"] < 65: continue
+                        if pm_only and r["pm_gap"] < 0.03: continue
+                        self.results.append(r)
+                    except Exception as _e:
+                        if getattr(self, "_debug", False):
+                            import traceback as _tb2
+                            print(f"  [DEBUG phase4] {_e}")
+                            _tb2.print_exc()
+                    finally:
+                        bar.update(1)
+
+        elapsed = (datetime.now() - t0).total_seconds()
+
+        # ── RS Rating: rank 1-99 by 12-month return vs all results ───────────
+        if self.results:
+            all_rs = [r["rs_12m"] for r in self.results]
+            all_rs_sorted = sorted(all_rs)
+            n = len(all_rs_sorted)
+            for r in self.results:
+                pct = all_rs_sorted.index(r["rs_12m"]) / max(n - 1, 1)
+                r["rs_rating"] = max(1, min(99, round(pct * 98 + 1)))
+            # Apply min-rs filter now that ratings are assigned
+            min_rs = getattr(args, "min_rs", 0)
+            if min_rs > 0:
+                self.results = [r for r in self.results if r["rs_rating"] >= min_rs]
+
+        # Sort by explosive score first, then breakout prob
+        expl_results = sorted(self.results,
+                              key=lambda x: (x["explosive_score"], x["probability"]),
+                              reverse=True)
+        self.results.sort(key=lambda x: (x["probability"], x["score"]), reverse=True)
+
+        print(f"\nScan complete: {elapsed:.0f}s  |  {len(self.results)} stocks qualified\n")
+
+        n_pats = sum(1 for r in self.results if r["pattern"] != "No Pattern")
+        self._print_market_box(len(self.results), n_pats)
+
+        # TABLE 1 — Explosive movers
+        top_n = getattr(args, "top", 15)
+        print("=" * 62)
+        print("  ⚡ EXPLOSIVE MOVE CANDIDATES  (sorted by Explosive Score)")
+        print("=" * 62)
+        self.results_by_explosive = expl_results
+        self._print_explosive_table(top_n)
+
+        # Top 3 explosive breakdowns
+        for i, r in enumerate(expl_results[:3], 1):
+            if r["explosive_score"] >= 40:
+                self._print_explosive_breakdown(r, i)
+
+        # TABLE 2 — Breakout probability (original)
+        print("\n" + "=" * 62)
+        print("  📊 BREAKOUT PROBABILITY RANKINGS  (sorted by Prob %)")
+        print("=" * 62)
+        self._print_table(top_n)
+
+        print("=" * 58)
+        print("  PROBABILITY BREAKDOWNS — TOP 5")
+        print("=" * 58)
+        for i, r in enumerate(self.results[:5], 1):
+            self._print_breakdown(r, i)
+
+        if getattr(args, "export", True):
+            print("\nExporting results...")
+            self._export(top_n)
+
+        print(f"\nTotal scan time: {elapsed:.0f}s")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXPLOSIVE MOVE DETECTOR
+# ══════════════════════════════════════════════════════════════════════════════
+class ExplosiveMoveDetector:
+    """
+    Scores a stock 0-100 for large-fast-move potential.
+    Three pillars:
+      Compression  (0-35 pts) — how coiled the spring is
+      Squeeze      (0-30 pts) — what forces the move
+      Catalyst     (0-25 pts) — technical trigger proximity
+    News catalyst score (0-100) from NewsCatalystEngine can replace
+    the Catalyst pillar with 50% weight in the final formula.
+    """
+
+    def __init__(self, df: pd.DataFrame, info: dict = None,
+                 spy_df: pd.DataFrame = None, pattern_results: dict = None,
+                 prob_result: dict = None):
+        self.df   = df
+        self.info = info or {}
+        self.spy  = spy_df
+        self.pr   = pattern_results or {}
+        self.prob = prob_result or {}
+        self.C = df["Close"].values
+        self.H = df["High"].values
+        self.L = df["Low"].values
+        self.V = df["Volume"].values.astype(float)
+        self.n = len(df)
+
+    # ── Compression ───────────────────────────────────────────────────────────
+    def compression_score(self):
+        C, H, L, n = self.C, self.H, self.L, self.n
+        pts, det = 0, []
+
+        # ATR compression ratio
+        atr = _fcol(self.df, "ATRr")
+        if len(atr) >= 63:
+            atr_now = float(atr.iloc[-1])
+            atr_63  = float(atr.iloc[-63])
+            if atr_63 > 0:
+                ratio = atr_now / atr_63
+                p = (10 if ratio < 0.40 else 8 if ratio < 0.50 else
+                     6  if ratio < 0.60 else 4 if ratio < 0.70 else
+                     2  if ratio < 0.80 else 0)
+                if p:
+                    pts += p
+                    det.append((f"ATR compressed to {ratio:.0%} of 63-day level", p))
+
+        # BB width percentile
+        upper = _fcol(self.df, "BBU_")
+        lower = _fcol(self.df, "BBL_")
+        mid   = _fcol(self.df, "BBM_")
+        if not upper.empty and not lower.empty and not mid.empty:
+            idx = upper.index.intersection(lower.index).intersection(mid.index)
+            if len(idx) >= 60:
+                w = ((upper.loc[idx] - lower.loc[idx]) / mid.loc[idx]).dropna()
+                if len(w) >= 60:
+                    cur_w  = float(w.iloc[-1])
+                    hist   = w.iloc[-min(252, len(w)):]
+                    pctile = float((hist < cur_w).mean() * 100)
+                    p = (10 if pctile <= 5  else 8 if pctile <= 10 else
+                         6  if pctile <= 15 else 4 if pctile <= 20 else
+                         2  if pctile <= 30 else 0)
+                    if p:
+                        pts += p
+                        det.append((f"BB squeeze — bottom {pctile:.0f}th percentile", p))
+
+        # Historical volatility collapse
+        if n >= 90:
+            lr = np.log(C[1:] / np.where(C[:-1] > 0, C[:-1], 1))
+            hv10 = float(np.std(lr[-10:]) * np.sqrt(252)) if len(lr) >= 10 else 1
+            hv90 = float(np.std(lr[-90:]) * np.sqrt(252)) if len(lr) >= 90 else 1
+            if hv90 > 0:
+                rv = hv10 / hv90
+                p = (8 if rv < 0.30 else 6 if rv < 0.40 else
+                     4 if rv < 0.50 else 2 if rv < 0.60 else 0)
+                if p:
+                    pts += p
+                    det.append((f"10-day HV at {rv:.0%} of 90-day norm", p))
+
+        # Inside bar accumulation
+        if n >= 3:
+            count = 0
+            for i in range(n - 1, max(n - 16, 0), -1):
+                if H[i] <= H[i-1] and L[i] >= L[i-1]:
+                    count += 1
+                else:
+                    break
+            p = (7 if count >= 5 else 5 if count >= 4 else
+                 3 if count >= 3 else 1 if count >= 2 else 0)
+            if p:
+                h52 = float(H[-252:].max()) if n >= 252 else float(H.max())
+                near = (h52 - float(C[-1])) / h52 <= 0.03 if h52 > 0 else False
+                bonus = 2 if near else 0
+                pts += p + bonus
+                det.append((f"{count} consecutive inside bars — max compression"
+                             + (" at resistance" if near else ""), p + bonus))
+
+        return min(35, pts), det
+
+    # ── Squeeze ───────────────────────────────────────────────────────────────
+    def squeeze_score(self):
+        V, n = self.V, self.n
+        pts, det = 0, []
+        info = self.info
+
+        # Short interest
+        sp  = float(info.get("shortPercentOfFloat", 0) or 0)
+        sr  = float(info.get("shortRatio", 0) or 0)
+        p = (15 if sp > 0.20 and sr > 5 else 12 if sp > 0.15 and sr > 4 else
+             8  if sp > 0.10 and sr > 3 else  4 if sp > 0.07 and sr > 2 else 0)
+        if p:
+            flag = " — SQUEEZE CANDIDATE" if sp > 0.15 else ""
+            pts += p
+            det.append((f"Short float {sp:.0%}, {sr:.1f}d to cover{flag}", p))
+
+        # Float size
+        fs = int(info.get("floatShares", 0) or 0)
+        if fs > 0:
+            fm = fs / 1e6
+            if   fs < 10e6:  p, lbl = 10, "micro"
+            elif fs < 25e6:  p, lbl =  8, "small"
+            elif fs < 50e6:  p, lbl =  6, "small"
+            elif fs < 100e6: p, lbl =  4, "medium"
+            elif fs < 200e6: p, lbl =  2, "medium"
+            else:            p, lbl =  0, "large"
+            if p:
+                pts += p
+                det.append((f"Float {fm:.1f}M shares ({lbl})", p))
+
+        # Volume dry-up
+        if n >= 20:
+            avg20 = float(V[-21:-1].mean())
+            avg5  = float(V[-5:].mean())
+            ratio = avg5 / avg20 if avg20 > 0 else 1.0
+            p = (5 if ratio < 0.40 else 4 if ratio < 0.50 else
+                 3 if ratio < 0.60 else 2 if ratio < 0.70 else
+                 1 if ratio < 0.80 else 0)
+            if p:
+                pts += p
+                det.append((f"Volume dry-up: {ratio:.0%} of 20-day avg — calm before storm", p))
+
+        return min(30, pts), det
+
+    # ── Technical catalyst ────────────────────────────────────────────────────
+    def catalyst_score(self):
+        C, H, V, n = self.C, self.H, self.V, self.n
+        pts, det = 0, []
+        cur = float(C[-1])
+
+        # 52W high proximity
+        h52 = float(H[-252:].max()) if n >= 252 else float(H.max())
+        if h52 > 0:
+            pct = (cur - h52) / h52
+            if   cur >= h52:    p, d = 10, "Fresh 52-week high breakout"
+            elif pct >= -0.005: p, d =  9, f"Within 0.5% of 52-week high"
+            elif pct >= -0.01:  p, d =  7, f"Within 1% of 52-week high"
+            elif pct >= -0.02:  p, d =  5, f"Within 2% of 52-week high"
+            elif pct >= -0.03:  p, d =  3, f"Within 3% of 52-week high"
+            elif pct >= -0.05:  p, d =  1, f"Within 5% of 52-week high"
+            else:               p, d =  0, ""
+            if p:
+                pts += p
+                det.append((d, p))
+
+        # Relative strength vs SPY
+        if self.spy is not None:
+            sp = self.spy["Close"].values
+            rs_pts, rs_parts = 0, []
+            for days, thresh, award in [(5, 0.03, 3), (10, 0.05, 3), (20, 0.10, 2)]:
+                if len(sp) > days and len(C) > days and C[-days] > 0 and sp[-days] > 0:
+                    rs = (C[-1]/C[-days] - 1) - (sp[-1]/sp[-days] - 1)
+                    if rs > thresh:
+                        rs_pts += award
+                        rs_parts.append(f"+{rs:.1%} {days}d")
+            if rs_pts:
+                pts += rs_pts
+                det.append((f"Outperforming SPY: {', '.join(rs_parts)}", rs_pts))
+
+        # Momentum ignition candle (last 3 days)
+        O = self.df["Open"].values if "Open" in self.df.columns else C
+        if n >= 22:
+            avg_body = float(np.mean(np.abs(C[-21:-1] - O[-21:-1])))
+            avg_vol  = float(V[-21:-1].mean())
+            for days_ago in range(1, 4):
+                i = -days_ago
+                body  = abs(float(C[i]) - float(O[i]))
+                vol   = float(V[i])
+                rng   = float(H[i]) - float(self.L[i])
+                top25 = rng > 0 and (float(C[i]) - float(self.L[i])) / rng >= 0.75
+                big_b = avg_body > 0 and body >= avg_body * 2
+                big_v = avg_vol  > 0 and vol  >= avg_vol  * 2
+                if big_b and top25 and big_v:
+                    pts += 7; det.append((f"Momentum ignition candle {days_ago}d ago", 7)); break
+                elif big_b and big_v:
+                    pts += 4; det.append((f"High-conviction candle {days_ago}d ago", 4)); break
+                elif avg_vol > 0 and vol >= avg_vol * 3:
+                    pts += 2; det.append((f"3x+ volume spike {days_ago}d ago", 2)); break
+
+        return min(25, pts), det
+
+    # ── Move estimate ─────────────────────────────────────────────────────────
+    def estimate_move(self):
+        C, H, n = self.C, self.H, self.n
+        cur = float(C[-1])
+        atr_s   = _fcol(self.df, "ATRr")
+        atr_val = float(atr_s.iloc[-1]) if not atr_s.empty else cur * 0.02
+
+        pat = self.prob.get("primary_pattern", "No Pattern")
+        vcp = self.pr.get("vcp", {}); cup = self.pr.get("cup_and_handle", {})
+        htf = self.pr.get("htf", {}); bf  = self.pr.get("bull_flag", {})
+        at  = self.pr.get("ascending_triangle", {}); db = self.pr.get("double_bottom", {})
+        wy  = self.pr.get("wyckoff", {})
+        h52 = float(H[-252:].max()) if n >= 252 else float(H.max())
+
+        if   "VCP"        in pat: base = vcp.get("final_depth", 0.10) * 1.5
+        elif "Cup"        in pat: base = cup.get("cup_depth",   0.30)
+        elif "High"       in pat: base = htf.get("pole_gain",   0.50)
+        elif "Wyckoff"    in pat:
+            lo = float(self.L[-252:].min()) if n >= 252 else float(self.L.min())
+            base = ((h52 - lo) / cur) * 1.5 if cur > 0 else 0.30
+        elif "Bull Flag"  in pat: base = bf.get("pole_gain",    0.20)
+        elif "Ascending"  in pat:
+            resist = at.get("resistance", cur * 1.02)
+            lo     = float(self.L[-60:].min()) if n >= 60 else float(self.L.min())
+            base   = (resist - lo) / cur if cur > 0 else 0.15
+        elif "Double"     in pat:
+            neck = db.get("neckline", cur * 1.02); lo = db.get("low1", cur * 0.90)
+            base = (neck - lo) / cur * 2 if cur > 0 else 0.20
+        elif "Flat"       in pat: base = 0.20
+        else:                     base = atr_val / cur * 5 if cur > 0 else 0.10
+
+        base = max(0.05, min(1.50, base))
+
+        sp  = float(self.info.get("shortPercentOfFloat", 0) or 0)
+        fs  = int(self.info.get("floatShares", 0) or 0)
+        sqm = 2.0 if sp > 0.20 else 1.5 if sp > 0.10 else 1.2 if sp > 0.05 else 1.0
+        fm  = 1.5 if fs < 10e6 else 1.3 if fs < 25e6 else 1.1 if fs < 50e6 else 1.0
+
+        lo_est  = base * sqm * fm
+        hi_est  = min(3.0, lo_est + (atr_val / cur * 3 if cur > 0 else 0.10) + (sqm - 1) * 0.30)
+        return round(lo_est * 100, 1), round(hi_est * 100, 1)
+
+    # ── Main calculate ────────────────────────────────────────────────────────
+    def calculate(self, news_score: float = None) -> dict:
+        c_pts, c_det = self.compression_score()
+        s_pts, s_det = self.squeeze_score()
+        t_pts, t_det = self.catalyst_score()
+
+        if news_score is not None:
+            raw = (c_pts / 35) * 25 + (s_pts / 30) * 25 + (news_score / 100) * 50
+        else:
+            raw = (c_pts + s_pts + t_pts) / 90 * 100
+
+        score = min(100, max(0, round(raw)))
+        grade = ("⚡ EXPLOSIVE" if score >= 85 else "🔥 HIGH"     if score >= 70 else
+                 "📈 MODERATE"  if score >= 55 else "👀 WATCH"    if score >= 40 else "❌ PASS")
+
+        move_lo, move_hi = self.estimate_move()
+        return {
+            "score":           score,  "grade":         grade,
+            "compression_pts": c_pts,  "squeeze_pts":   s_pts,
+            "catalyst_pts":    t_pts,  "compression_det": c_det,
+            "squeeze_det":     s_det,  "catalyst_det":  t_det,
+            "move_low":        move_lo, "move_high":    move_hi,
+            "short_pct":  float(self.info.get("shortPercentOfFloat", 0) or 0),
+            "float_sh":   int(self.info.get("floatShares",          0) or 0),
+            "short_ratio":float(self.info.get("shortRatio",         0) or 0),
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEWS CATALYST ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# EARNINGS QUALITY ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+class EarningsQualityEngine:
+    """
+    Scores EPS quality 0-100 based on:
+      - Profitability (positive EPS)
+      - Growth rate (YoY or QoQ)
+      - Acceleration (each quarter better than last)
+      - Revenue growth alignment
+    """
+    def score(self, ticker: str) -> dict:
+        empty = {"eq_score": 50, "eq_grade": "N/A", "eq_acceleration": False,
+                 "eq_eps_vals": [], "eq_detail": "No data"}
+        try:
+            t  = yf.Ticker(ticker)
+            qe = None
+            for attr in ("quarterly_earnings", "quarterly_income_stmt"):
+                try:
+                    qe = getattr(t, attr)
+                    if qe is not None and not qe.empty:
+                        break
+                except Exception:
+                    pass
+            if qe is None or qe.empty:
+                return empty
+
+            # quarterly_earnings → index=date, cols=[Earnings, Revenue]
+            # quarterly_income_stmt → cols=dates, rows=line items
+            if hasattr(qe, "columns") and "Earnings" in qe.columns:
+                eps = qe["Earnings"].dropna().values[:4]
+            else:
+                # income_stmt format: rows are items, cols are dates
+                for row_key in ("Net Income", "Net Income Common Stockholders",
+                                "Diluted EPS", "Basic EPS"):
+                    if row_key in qe.index:
+                        eps = qe.loc[row_key].dropna().values[:4]
+                        break
+                else:
+                    return empty
+
+            if len(eps) < 2:
+                return empty
+
+            score = 50
+            accel = False
+            detail_parts = []
+
+            # Profitability
+            if eps[0] > 0:
+                score += 15
+            elif eps[0] > eps[1]:
+                score += 5   # improving loss
+
+            # Growth rate (most recent vs same quarter LY if 4 quarters available)
+            if len(eps) >= 4 and eps[3] != 0:
+                yoy = (eps[0] - eps[3]) / abs(eps[3])
+                if yoy > 0.50: score += 20
+                elif yoy > 0.25: score += 15
+                elif yoy > 0.10: score += 10
+                elif yoy > 0:    score += 5
+                elif yoy < -0.20: score -= 10
+                detail_parts.append(f"YoY {yoy:+.0%}")
+
+            # Acceleration: recent quarter better than previous 2
+            if len(eps) >= 3 and eps[1] != 0 and eps[2] != 0:
+                g1 = (eps[0] - eps[1]) / abs(eps[1])
+                g2 = (eps[1] - eps[2]) / abs(eps[2])
+                if g1 > g2 > 0 or (eps[0] > eps[1] > eps[2] and all(e > 0 for e in eps[:3])):
+                    accel = True
+                    score += 15
+
+            score = max(0, min(100, score))
+            if score >= 85:   grade = "A+"
+            elif score >= 75: grade = "A"
+            elif score >= 65: grade = "B+"
+            elif score >= 55: grade = "B"
+            elif score >= 45: grade = "C"
+            else:             grade = "D"
+
+            detail_parts.append(f"EPS:{'/'.join(f'{e:.2f}' for e in eps[:3])}")
+            return {"eq_score": score, "eq_grade": grade, "eq_acceleration": accel,
+                    "eq_eps_vals": list(eps[:4]), "eq_detail": " | ".join(detail_parts)}
+        except Exception:
+            return empty
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OPTIONS FLOW SCORER
+# ══════════════════════════════════════════════════════════════════════════════
+class OptionsFlowScorer:
+    """
+    Scores unusual options activity 0-100 using yfinance options chain.
+    Signals: call/put volume ratio, vol > OI (new positioning), large OI buildup.
+    """
+    def score(self, ticker: str) -> dict:
+        empty = {"flow_score": 0, "flow_signal": "", "cp_ratio": 0.0,
+                 "unusual_calls": False, "flow_detail": ""}
+        try:
+            t = yf.Ticker(ticker)
+            dates = t.options
+            if not dates:
+                return empty
+
+            total_call_vol = 0; total_put_vol = 0; total_call_oi = 0
+            unusual = False
+
+            for d in dates[:3]:   # sample nearest 3 expiries
+                try:
+                    chain = t.option_chain(d)
+                    cv = float(chain.calls["volume"].fillna(0).sum())
+                    pv = float(chain.puts ["volume"].fillna(0).sum())
+                    co = float(chain.calls["openInterest"].fillna(0).sum())
+                    total_call_vol += cv; total_put_vol += pv; total_call_oi += co
+                    # Vol > OI means fresh positioning (not just delta hedge)
+                    mask = (chain.calls["volume"].fillna(0) >
+                            chain.calls["openInterest"].fillna(1) * 0.8)
+                    if mask.any():
+                        unusual = True
+                except Exception:
+                    pass
+
+            if total_put_vol == 0 and total_call_vol == 0:
+                return empty
+
+            cp = total_call_vol / max(total_put_vol, 1)
+            sc = 0
+            if   cp > 4.0: sc += 40
+            elif cp > 3.0: sc += 30
+            elif cp > 2.0: sc += 20
+            elif cp > 1.5: sc += 12
+            elif cp > 1.2: sc +=  6
+            if unusual: sc += 30
+            if total_call_oi > 0 and total_call_vol / total_call_oi > 0.40:
+                sc += 15   # high vol/OI turnover
+
+            sc = min(100, sc)
+            if sc >= 60:   sig = f"UNUSUAL CALLS  C/P {cp:.1f}x"
+            elif sc >= 35: sig = f"Elevated calls C/P {cp:.1f}x"
+            elif sc >= 15: sig = f"Call bias C/P {cp:.1f}x"
+            else:          sig = ""
+
+            return {"flow_score": sc, "flow_signal": sig, "cp_ratio": round(cp, 2),
+                    "unusual_calls": unusual,
+                    "flow_detail": f"Call vol {total_call_vol:,.0f} | Put vol {total_put_vol:,.0f}"}
+        except Exception:
+            return empty
+
+
+class NewsCatalystEngine:
+    _HDRS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    TIER1 = [
+        ("fda",      90, "🧬 FDA CATALYST",    ["fda approval","fda approved","phase 3","phase 2 results","pdufa","nda ","bla ","breakthrough therapy","primary endpoint met"]),
+        ("ma",       95, "🤝 M&A CATALYST",    ["acquisition","merger","buyout","takeover","acquired by","definitive agreement","all-cash offer"]),
+        ("squeeze",  75, "🔥 SQUEEZE CATALYST",["short squeeze","gamma squeeze","heavily shorted","most shorted"]),
+        ("contract", 70, "📋 CONTRACT",        ["contract awarded","government contract","dod contract","billion dollar","multi-year agreement","exclusive agreement"]),
+        ("activist", 65, "🏦 ACTIVIST",        ["13d filing","activist investor","strategic review","exploring strategic","board seat"]),
+    ]
+    TIER2 = [
+        ("earnings", 45, "📊 EARNINGS BEAT",   ["beats estimates","earnings beat","raises guidance","record revenue","exceeded expectations"]),
+        ("product",  40, "🚀 PRODUCT LAUNCH",  ["launches","unveiled","breakthrough","patent granted","world's first","first-ever"]),
+        ("uplist",   50, "📈 UPLISTING",        ["nyse uplisting","nasdaq uplisting","uplisting","approved for listing"]),
+        ("insider",  35, "👤 INSIDER BUYING",  ["insider purchase","ceo buys","director purchases","open market purchase"]),
+        ("upgrade",  30, "⭐ UPGRADE",         ["upgraded to buy","price target raised","outperform","initiation of coverage"]),
+    ]
+    NEGATIVE = [
+        ("dilution", -30, "⚠️ DILUTION RISK",  ["public offering","share offering","atm offering","registered direct","private placement","dilutive"]),
+        ("legal",    -50, "🚨 LEGAL RISK",      ["sec investigation","securities fraud","class action","delisting notice"]),
+        ("miss",     -20, "📉 MISS",            ["misses estimates","earnings miss","cuts guidance","disappointing results"]),
+    ]
+
+    def fetch_news(self, ticker: str) -> list:
+        news = []
+        cutoff = datetime.now() - timedelta(days=7)
+
+        # yfinance news
+        try:
+            for item in (yf.Ticker(ticker).news or [])[:15]:
+                ts = item.get("providerPublishTime", 0)
+                pub = datetime.fromtimestamp(ts) if ts else datetime.now()
+                if pub >= cutoff:
+                    news.append({"title": item.get("title",""), "date": pub,
+                                 "source": item.get("publisher","yf")})
+        except Exception:
+            pass
+
+        # Yahoo RSS
+        try:
+            if _HAS_FEEDPARSER:
+                feed = feedparser.parse(
+                    f"https://feeds.finance.yahoo.com/rss/2.0/headline"
+                    f"?s={ticker}&region=US&lang=en-US")
+                import email.utils
+                for e in feed.entries[:10]:
+                    try:
+                        pub = datetime(*email.utils.parsedate(e.get("published",""))[:6])
+                    except Exception:
+                        pub = datetime.now()
+                    if pub >= cutoff:
+                        news.append({"title": e.get("title",""), "date": pub, "source": "RSS"})
+        except Exception:
+            pass
+
+        # Reddit WSB
+        try:
+            url  = (f"https://www.reddit.com/r/wallstreetbets/search.json"
+                    f"?q={ticker}&sort=new&limit=25&restrict_sr=on")
+            resp = requests.get(url, headers=self._HDRS, timeout=5)
+            if resp.status_code == 200:
+                posts   = resp.json().get("data",{}).get("children",[])
+                recent  = sum(1 for p in posts
+                              if datetime.fromtimestamp(p["data"].get("created_utc",0)) >= cutoff)
+                if recent >= 5:
+                    news.append({"title": f"WSB: {recent} mentions in last 7 days",
+                                 "date": datetime.now(), "source": "Reddit",
+                                 "_wsb": recent})
+        except Exception:
+            pass
+
+        return news
+
+    def classify(self, news_list: list):
+        score, flags = 0, []
+        text = " ".join(n["title"].lower() for n in news_list)
+
+        for groups in [self.TIER1, self.TIER2]:
+            for _, base, flag, kws in groups:
+                if not any(k in text for k in kws):
+                    continue
+                score += base
+                hl, ds = "", ""
+                for n in news_list:
+                    if any(k in n["title"].lower() for k in kws):
+                        hl = n["title"][:80]
+                        ds = n["date"].strftime("%m-%d %H:%M") if hasattr(n["date"],"strftime") else ""
+                        break
+                flags.append({"flag": flag, "score": base, "headline": hl, "date": ds})
+
+        for _, pen, flag, kws in self.NEGATIVE:
+            if any(k in text for k in kws):
+                score += pen
+                flags.append({"flag": flag, "score": pen, "headline": "", "date": ""})
+
+        wsb = [n for n in news_list if "_wsb" in n]
+        if wsb:
+            cnt = wsb[0]["_wsb"]
+            p   = 20 if cnt >= 10 else 10
+            score += p
+            flags.append({"flag": "📱 SOCIAL", "score": p,
+                          "headline": f"{cnt} WSB mentions", "date": ""})
+
+        return max(0, min(100, score)), flags
+
+    def scan(self, ticker: str) -> dict:
+        try:
+            news  = self.fetch_news(ticker)
+            sc, fl = self.classify(news)
+            top_flag = fl[0]["flag"] if fl else ""
+            top_hl   = fl[0]["headline"] if fl else ""
+        except Exception:
+            sc, fl, top_flag, top_hl = 0, [], "", ""
+        return {"ticker": ticker, "catalyst_score": sc, "catalyst_flags": fl,
+                "top_flag": top_flag, "top_headline": top_hl[:60]}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UNIVERSE BUILDER
+# ══════════════════════════════════════════════════════════════════════════════
+class UniverseBuilder:
+    _HDRS    = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    _SCREENS = [
+        "https://finviz.com/screener.ashx?v=111&f=cap_small,cap_micro,ta_highlow52w_b0to10h,sh_float_u50,sh_avgvol_o300&ft=4",
+        "https://finviz.com/screener.ashx?v=111&f=cap_small,cap_micro,sh_short_o15&ft=4",
+        "https://finviz.com/screener.ashx?v=111&f=cap_micro,cap_nano,ta_highlow52w_b0to5h&ft=4",
+        "https://finviz.com/screener.ashx?v=111&f=cap_small,cap_micro,sh_relvol_o2&ft=4",
+    ]
+    _FALLBACK = ["AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","JPM","V","UNH",
+                 "XOM","PG","MA","HD","CVX","MRK","LLY","ABBV","KO","PEP",
+                 "COST","AVGO","CSCO","TMO","ACN","MCD","ABT","CRM","NKE","ADBE"]
+
+    # ── 1000+ curated active small-cap tickers ────────────────────────────────
+    _SMALLCAP = [
+        # Biotech / Pharma
+        "ACAD","ACRS","ADAP","ADAG","ADMA","ADUS","AGEN","AGRX","AGIO","AKRO",
+        "ALBO","ALDX","ALEC","ALKS","ALPN","ALRN","ALXO","AMPH","AMRX","AMTI",
+        "ANAB","ANIP","APLS","APLT","APVO","ARDX","ARIA","ARCT","AROA","ARQT",
+        "ARVN","ARWR","ASND","ASRT","ATAI","ATNX","ATRC","ATXI","AUTL","AUPH",
+        "AVDL","AVEO","AVXL","AXGN","AXSM","AZRX","BCRX","BDTX","BHVN","BIOL",
+        "BLCM","BLFS","BLUE","BNGO","BPMC","BTAI","BYSI","CAPR","CARA","CASI",
+        "CCRN","CDTX","CELC","CEMI","CERS","CERT","CGEM","CLDX","CLLS","CLPT",
+        "CLRB","CLSD","CLVS","CMRX","CNCE","CODX","CORT","CPRX","CRBU","CRDF",
+        "CRIS","CRVS","CTMX","CYTK","DCPH","DERM","DNLI","DVAX","DYAI","EDIT",
+        "EIDX","EPZM","ERAS","ETNB","EVFM","EVLO","EXEL","FATE","FDMT","FGEN",
+        "FIXX","FOLD","FMTX","FSTX","FULC","GALT","GBIO","GLSI","GNPX","GPCR",
+        "GRTS","GTHX","HALO","HOOK","HRMY","HUMA","ICVX","IDYA","IGMS","IMAB",
+        "IMMP","IMTX","IMUX","IMVT","INSM","IONS","IRTC","ITOS","JNCE","KARX",
+        "KDNY","KPTI","KRTX","KYMR","KZIA","LBPH","LENZ","LGND","LNTH","LQDA",
+        "MACK","MCRB","MDGL","MGTA","MGTX","MIRM","MNKD","MNMD","MRUS","MYOV",
+        "NKTR","NNOX","NRIX","NTLA","NVAX","NVCR","OCGN","OCSL","OMER","ORGO",
+        "PAHC","PCVX","PCYG","PDCO","PLRX","PLSE","PMVP","PRAX","PRLD","PRME",
+        "PTCT","PTGX","RAPT","RCKT","RETA","RGEN","RIGL","RLAY","RNAC","RPRX",
+        "SAGE","SAVA","SEER","SGMO","SGTX","SNDX","SRNE","STRO","SURF","SVRA",
+        "SYRS","TBPH","TGTX","TMDX","TNXP","TPTX","TRVN","TTOO","TVTX","TWST",
+        "TXMD","URGN","VBIV","VERA","VERV","VKTX","VNDA","VRNA","VSTM","VYGR",
+        "XENE","XNCR","ZYME",
+        # Technology / Software
+        "ACLS","ACMR","AEHR","AEIS","AIXI","ALKT","ALLT","AMBA","AMPL","ANGI",
+        "AOSL","APPS","ARQQ","ASLE","ASPU","ATEN","ATNI","AUDC","AVNW","BAND",
+        "BBAI","BIGC","BLKB","BLNK","BLZE","BMBL","CALX","CASA","CDLX","CHPT",
+        "CLBT","COHU","CRAI","CRSR","CSGS","DCBO","DFIN","DGII","DMRC","DOMO",
+        "DSGX","DTIL","DUOS","EGHT","EGAN","EGIO","EMKR","ENFN","EVBG","EVLV",
+        "EXLS","EXPI","EXTR","FARO","FIVN","FORM","FOUR","FRGE","GCTS","GDYN",
+        "GENI","GLBE","GRPN","GTLB","HOLI","IBEX","ICHR","IDCC","IESC","IIIV",
+        "IMXI","INFU","INPX","INSG","IONQ","IRIX","IRMD","JAMF","KLIC","LASR",
+        "LPSN","MAPS","MARK","MCRI","MGNI","MNTV","MRAM","MRCY","MRVI","MYPS",
+        "NCNO","NEOG","NEON","NOVA","NOVT","NRDS","NTNX","NVTS","ONDS","OUST",
+        "PAYA","PLAB","PLUG","POWI","PRFT","PRKR","PRTS","PSIX","PXLW","PYCR",
+        "QNST","QUBT","QUIK","RBBN","RCII","RELY","RMNI","RNET","ROLL","RPAY",
+        "RSKD","RXRX","SMSI","SOFI","SOUN","SQSP","SSYS","STEM","STNE","STRM",
+        "SWIR","TASK","TDUP","TTEC","TTGT","TWKS","VLTA","WKHS",
+        # Energy / Oil & Gas / Shipping
+        "BATL","BCEI","BSM","BRY","CDEV","CHRD","CIVI","CRK","CRGY","DHT",
+        "DKL","DNN","DSX","DUNE","EGLE","EGY","EPM","ESTE","FTCI","GFI",
+        "GHM","GLNG","GNLN","GNE","GORO","GPOR","GPRE","HEP","HESM","HY",
+        "IMPP","INDO","INSW","KILM","KOS","LBRT","LTHM","MGY","MNRL","MOD",
+        "MRC","MVO","NGD","NTIC","NOG","OII","PARR","PTEN","REI","ROAN",
+        "SBR","SBOW","SD","SFL","SMR","SOI","SPND","STNG","TALO","TGA",
+        "TRMD","TUSK","UAN","VGR","VOC","WTI","MXC","MARPS",
+        "ASC","CMRE","DAC","DLNG","EGLE","ESEA","GNK","GOGL","ICON","NMM",
+        "PANL","SALT","SBLK","TK","FREE","SB","TOPS","PSHG","SHIP",
+        # Financials / Community Banks / Insurance
+        "ACNB","ACEL","ATLC","BANF","BANR","BHLB","BKSC","BMTC","BPFH",
+        "BRKL","BSRR","BYFC","CATY","CBMB","CCBG","CFFI","CFFN","CHCO",
+        "CIVB","CLBK","CNOB","COFS","CRWS","CSFL","CTBI","CVBF","CWBC",
+        "DCOM","ESSA","EVBN","FBMS","FBNC","FBP","FCBP","FCCO","FCF",
+        "FFIN","FFNW","FGBI","FISI","FLIC","FLMN","FMAO","FNLC","FRAF",
+        "FRBA","FRST","FSBC","FSBW","FSFG","FSTR","GFED","GNTY","HAFC",
+        "HBCP","HBIA","HBMD","HFBL","HFWA","HMST","HTBI","HTBK","HTLF",
+        "HWBK","IBCP","IBOC","IROQ","ISBA","ISTR","JMSB","LBAI","LCNB",
+        "LKFN","MBWM","MCBC","MCBS","METC","MFNC","MNSB","MPB","NBTB",
+        "NKSH","NRIM","NWIN","OBNK","OFG","OLBK","OPBK","ORRF","OSBC",
+        "OVBC","PBHC","PBIP","PFIS","PLBC","PLMR","PNFP","PPBI",
+        # Consumer / Retail / Restaurants
+        "ARKO","ARLO","BLMN","BOOT","BRC","CAKE","CHUY","CNXN","COKE",
+        "CONN","COUR","CTRN","CULP","DINE","DNUT","DOOR","DRVN","EFC",
+        "ENVA","EPAC","ERII","ESNT","EXPR","EVA","EVRI","FCFS","FIZZ",
+        "FWONK","GES","GIL","GMS","GOED","GPC","GRWG","HAYN","HCI","HIMS",
+        "HLLY","HTHT","HURC","HVT","HWKN","IPAR","JACK","JBSS","KFRC",
+        "KRUS","KW","LCUT","LILA","LINC","LOVE","MATW","MBUU","MCFT",
+        "MFAC","MGPI","MMSI","MODV","MRTN","NATH","NDLS","NTGR","OLPX",
+        # Industrials / Defense / Manufacturing
+        "AVAV","AXON","BKTI","BOOM","BORR","CACI","CNXN","EPAC","FLIR",
+        "GHM","HII","HURC","HWKN","KTOS","LDOS","LMT","MANT","MRCY",
+        "MTRX","OSIS","PAE","PLTR","POWL","PRFT","RGR","ROLL","RRBI",
+        "SASR","SCSC","SPAR","SPSC","STRL","SWBI","TAIT","TECL","TITN",
+        "TRMK","TRMR","TRNO","TRUP","TTEC","TTGT","TURA","TWKS","TXRH",
+        "TYRA","UAVS","UFPI","UHAL","ULTA","UMBF","UMPQ","UNFI","UNIT",
+        "UPLD","UPWK","URBN","USCR","USPH","UTMD","UUUU","VCEL","VCNX",
+        # Materials / Mining / Metals
+        "AUMN","AXU","BTG","DNN","EGO","ERO","FSM","FURY","GFI","GORO",
+        "GPL","GSS","HMY","HL","IAG","IAUX","KORE","LODE","MAG","MTA",
+        "MTAL","MUX","NGD","NMG","OR","ORLA","PAAS","RBY","SBSW","SILV",
+        "SSRM","TMQ","USAS","WDO","WRN","GATO","ZNOG",
+        # Healthcare Services / Devices
+        "ACCD","ACHC","AORT","APAM","ARAY","ATRC","ATRI","AXNX","BCOR",
+        "BFAM","CANO","CCXI","CHNG","CRVL","CSII","DXCM","EHTH","ELMD",
+        "ENSG","EVFM","FLGT","FWRD","GDRX","GKOS","GPRO","HAAC","HCAT",
+        "HCSG","HIMS","HMHC","HOLX","HUMA","HWBK","IART","ICAD","ICUI",
+        "IDXX","INVA","IRTC","ITGR","JNCE","KDNY","LHCG","LIVN","MDRX",
+        "MDSO","MEDNAX","MMSI","MNMD","MODN","NARI","NEOG","NKTR","NVCR",
+        "NVST","OBDC","OFIX","OMCL","OPCH","OSIS","PDCO","PNTG","PRSC",
+        "PRVA","PSTG","QTWO","RGEN","RMTI","RNST","ROIC","RXRX","SCPH",
+        # Real Estate / REITs
+        "AIV","APTS","BRT","CLDT","CPLG","ELME","EFC","FCPT","GMRE",
+        "HIW","HPP","INN","JBGS","KRG","LTC","MDV","MDRR","NREF","NXRT",
+        "OFC","PKST","PLYM","PSTL","RC","RLJ","ROIC","RPT","SAFE",
+        "SHO","SILA","SKT","SLG","STAR","STRS","STWD","UHT","VRE","ESRT",
+        # Cannabis
+        "ACB","APHA","IIPR","KERN","SNDL","TLRY","YOLO","ZYNE",
+    ]
+
+    # ── US Exchange fetchers ──────────────────────────────────────────────────
+
+    # Exchange name normalisation for the SEC tickers file
+    _SEC_EXCH_MAP = {
+        "nasdaq":    "NASDAQ",
+        "nyse":      "NYSE",
+        "nyse mkt":  "NYSE",   # NYSE American
+        "nyse arca": "NYSE",
+        "cboe":      "CBOE",
+        "otc":       "OTC",
+    }
+
+    def _sec_tickers(self) -> list:
+        """All US-listed equities from SEC EDGAR company_tickers_exchange.json.
+        Returns list of (ticker, exchange_normalised) tuples."""
+        try:
+            r = requests.get(
+                "https://www.sec.gov/files/company_tickers_exchange.json",
+                headers={**self._HDRS,
+                         "Accept": "application/json",
+                         "Host": "www.sec.gov"},
+                timeout=30)
+            if r.status_code != 200:
+                return []
+            data  = r.json()
+            fields = [f.lower() for f in data.get("fields", [])]
+            ti = next((i for i, f in enumerate(fields) if "ticker" in f), None)
+            ei = next((i for i, f in enumerate(fields) if "exchange" in f), None)
+            if ti is None:
+                return []
+            out = []
+            for row in data.get("data", []):
+                sym  = str(row[ti]).strip().upper() if ti < len(row) else ""
+                exch = str(row[ei]).strip().lower() if (ei is not None and ei < len(row)) else ""
+                if not sym or len(sym) > 5 or any(c in sym for c in ("$","^","."," ")):
+                    continue
+                exch_norm = self._SEC_EXCH_MAP.get(exch, exch.upper())
+                out.append((sym, exch_norm))
+            return out
+        except Exception as e:
+            print(f"  [warn] SEC tickers: {e}")
+            return []
+
+    def _us_nasdaq(self) -> list:
+        """NASDAQ-listed equities."""
+        # Primary: SEC EDGAR
+        rows = self._sec_tickers()
+        if rows:
+            return [sym for sym, ex in rows if ex == "NASDAQ"]
+        # Fallback: NASDAQ Trader FTP
+        tickers = []
+        for proto in ("http", "https"):
+            try:
+                r = requests.get(
+                    f"{proto}://ftp.nasdaqtrader.com/SymbolDirectory/nasdaqlisted.txt",
+                    headers=self._HDRS, timeout=20)
+                if r.status_code == 200 and "|" in r.text:
+                    for line in r.text.splitlines()[1:]:
+                        parts = line.split("|")
+                        if len(parts) < 7: continue
+                        sym = parts[0].strip()
+                        if not sym or sym == "File Creation Time": continue
+                        if len(sym) > 5 or any(c in sym for c in ("$","^",".")): continue
+                        if parts[6].strip() == "Y": continue
+                        tickers.append(sym)
+                    break
+            except Exception:
+                continue
+        return tickers
+
+    def _us_other(self, exchanges: set = None) -> list:
+        """NYSE / NYSE Arca / CBOE / etc.
+        exchanges: set of normalised names like {'NYSE','CBOE'}; None = all non-NASDAQ."""
+        rows = self._sec_tickers()
+        if rows:
+            return [sym for sym, ex in rows
+                    if ex != "NASDAQ" and ex != "OTC"
+                    and (exchanges is None or ex in exchanges)]
+        # Fallback: NASDAQ Trader FTP otherlisted.txt
+        # Exchange codes: N=NYSE, A=NYSE American, P=NYSE Arca, Z=CBOE BZX
+        ftp_map = {"NYSE": {"N","A","P"}, "CBOE": {"Z"}}
+        ftp_codes: set = set()
+        if exchanges:
+            for ex in exchanges:
+                ftp_codes |= ftp_map.get(ex, set())
+        tickers = []
+        for proto in ("http", "https"):
+            try:
+                r = requests.get(
+                    f"{proto}://ftp.nasdaqtrader.com/SymbolDirectory/otherlisted.txt",
+                    headers=self._HDRS, timeout=20)
+                if r.status_code == 200 and "|" in r.text:
+                    for line in r.text.splitlines()[1:]:
+                        parts = line.split("|")
+                        if len(parts) < 5: continue
+                        sym  = parts[0].strip()
+                        exch = parts[2].strip()
+                        if not sym or sym == "File Creation Time": continue
+                        if len(sym) > 5 or any(c in sym for c in ("$","^",".")): continue
+                        if ftp_codes and exch not in ftp_codes: continue
+                        if parts[4].strip() == "Y": continue
+                        tickers.append(sym)
+                    break
+            except Exception:
+                continue
+        return tickers
+
+    def _otc_select(self) -> list:
+        """OTCQX (Expert) and OTCQB (Premium) tier stocks — Select OTC."""
+        tickers = []
+        for market in ("Expert", "Premium"):
+            for proto in ("https", "http"):
+                try:
+                    url = (f"{proto}://backend.otcmarkets.com/otcapi/companies/"
+                           f"securities/all/csv?market={market}")
+                    r = requests.get(url, headers=self._HDRS, timeout=20)
+                    if r.status_code == 200 and len(r.text) > 200:
+                        import csv as _csv, io as _io
+                        reader = _csv.DictReader(_io.StringIO(r.text))
+                        for row in reader:
+                            sym = (row.get("Symbol") or row.get("symbol","")).strip().upper()
+                            if sym and 1 <= len(sym) <= 5 and sym.isalpha():
+                                tickers.append(sym)
+                        break
+                except Exception:
+                    continue
+        if not tickers:
+            for furl in [
+                "https://finviz.com/screener.ashx?v=111&f=exch_otcqx,cap_small,cap_micro&ft=4",
+                "https://finviz.com/screener.ashx?v=111&f=exch_otcqb,cap_small,cap_micro&ft=4",
+            ]:
+                tickers.extend(self._finviz_page(furl))
+        return list(set(tickers))
+
+    # ── Canadian Exchange fetchers ────────────────────────────────────────────
+
+    # Curated fallback lists for when live fetches fail
+    _TSX_BASE = [
+        # Banks & Financials
+        "RY.TO","TD.TO","BNS.TO","BMO.TO","CM.TO","NA.TO","MFC.TO","SLF.TO",
+        "POW.TO","FFH.TO","GWO.TO","IAG.TO","EQB.TO","IFC.TO","TRI.TO",
+        # Energy
+        "CNQ.TO","SU.TO","CVE.TO","IMO.TO","TRP.TO","ENB.TO","PPL.TO",
+        "ARC.TO","PEY.TO","TVE.TO","CPG.TO","MEG.TO","VET.TO","ERF.TO",
+        "BTE.TO","WCP.TO","BIR.TO","PXT.TO","KEL.TO","GTE.TO","CJ.TO",
+        # Mining & Materials
+        "ABX.TO","AGI.TO","AEM.TO","FM.TO","K.TO","LUN.TO","WPM.TO",
+        "TECK.TO","CS.TO","OR.TO","EDV.TO","SSL.TO","FNV.TO","PAAS.TO",
+        "HBM.TO","CG.TO","IMG.TO","AR.TO","NGT.TO","MAG.TO","ELD.TO",
+        "PVG.TO","SVM.TO","MUX.TO","KNT.TO","IAU.TO","DPM.TO",
+        # Tech & Telecom
+        "SHOP.TO","CSU.TO","LSPD.TO","BCE.TO","T.TO","QBR-B.TO","RCI-B.TO",
+        "OTEX.TO","DSG.TO","DND.TO","ENGH.TO","TVA-B.TO","KXS.TO",
+        "HUT.TO","BITF.TO","MOGO.TO","TOI.TO","CIGI.TO","GIB-A.TO",
+        # Utilities & Infrastructure
+        "FTS.TO","H.TO","AQN.TO","EMA.TO","CU.TO","NPI.TO","BEP-UN.TO",
+        "INE.TO","ACO-X.TO","CPX.TO","TA.TO","RNW.TO","BEPC.TO",
+        # Consumer & Retail
+        "ATD.TO","L.TO","MRU.TO","EMP-A.TO","DOL.TO","CTC-A.TO",
+        "CCL-B.TO","QSP-UN.TO","RECP.TO","MTY.TO","PZA.TO","FOOD.TO",
+        # Healthcare
+        "SIA.TO","WELL.TO","DRT.TO","HLS.TO","DTOL.TO","PMZ-UN.TO",
+        # Real Estate
+        "H.TO","CAR-UN.TO","DIR-UN.TO","AP-UN.TO","HR-UN.TO","SRU-UN.TO",
+        "CRR-UN.TO","GRT-UN.TO","AAR-UN.TO","IIP-UN.TO","CHP-UN.TO",
+        # Other
+        "CNR.TO","CP.TO","WN.TO","MX.TO","PAR.TO","PLC.TO","ACB.TO",
+        "TLRY.TO","HEXO.TO","CRON.TO","WEED.TO","OGI.TO","NRGI.TO",
+    ]
+
+    _TSXV_BASE = [
+        # Junior Mining (gold, silver, copper, lithium)
+        "AAB.V","ABN.V","ACN.V","AFM.V","AGM.V","AHR.V","AKG.V","ALO.V",
+        "AMK.V","ANX.V","AOT.V","APM.V","ARG.V","ARL.V","ARM.V","ASM.V",
+        "ATX.V","AUN.V","AZM.V","BAR.V","BBB.V","BCM.V","BHS.V","BRD.V",
+        "BSX.V","BTT.V","BYN.V","CAD.V","CBK.V","CCW.V","CDG.V","CGC.V",
+        "CLM.V","CLZ.V","CMA.V","CMC.V","CNL.V","COG.V","COR.V","CPP.V",
+        "CRE.V","CRJ.V","CRS.V","CSD.V","CSR.V","CTM.V","CUU.V","CWM.V",
+        "DAU.V","DCC.V","DEF.V","DGO.V","DIO.V","DLR.V","DMX.V","DNG.V",
+        "EAU.V","EFM.V","EGM.V","ELC.V","EMM.V","EPO.V","ERO.V","ESM.V",
+        "ETG.V","EXG.V","FEL.V","FGD.V","FIL.V","FMG.V","FRG.V","FRK.V",
+        "FSX.V","GBR.V","GCX.V","GGO.V","GLD.V","GLG.V","GLO.V","GMX.V",
+        "GNX.V","GOG.V","GPM.V","GSP.V","GTT.V","GUA.V","GUN.V","GWG.V",
+        # Cannabis (TSXV)
+        "APHA.V","CRON.V","ACB.V","VFF.V","LABS.V","TRST.V","PLTH.V",
+        # Tech & Other
+        "HOM.V","HWY.V","IAU.V","ICG.V","ILC.V","ILS.V","IMC.V","INX.V",
+        "IPA.V","IPT.V","ISC.V","ISV.V","IVN.V","JOY.V","KBG.V","KCC.V",
+        "KDX.V","KGC.V","KNT.V","KOR.V","KRR.V","KTN.V","LAB.V","LGO.V",
+        "LIO.V","LIS.V","LIT.V","LME.V","LOT.V","LRS.V","LSG.V","LTO.V",
+        "MAI.V","MAO.V","MAY.V","MBX.V","MCB.V","MCG.V","MCM.V","MDA.V",
+        "MDI.V","MDO.V","MEI.V","MER.V","MES.V","MGI.V","MIL.V","MIS.V",
+        "MLA.V","MLX.V","MMG.V","MNB.V","MND.V","MOD.V","MON.V","MPH.V",
+        "MRC.V","MRD.V","MRG.V","MSG.V","MTB.V","MTO.V","MTS.V","MVG.V",
+    ]
+
+    _CSE_BASE = [
+        # Cannabis
+        "APHA.CN","ACB.CN","CRON.CN","OGI.CN","HEXO.CN","FIRE.CN","TGOD.CN",
+        "TLRY.CN","NRGI.CN","CBDT.CN","XTRX.CN","GTII.CN","CURA.CN",
+        # Crypto / Blockchain
+        "BTCX.CN","EBIT.CN","GBTC.CN","BLOC.CN","DMGI.CN","HASH.CN",
+        # Mining
+        "CSE.CN","GGD.CN","GIGA.CN","GWX.CN","HAV.CN","HMX.CN","HPQ.CN",
+        "HUB.CN","IBG.CN","IDM.CN","ILC.CN","IMG.CN","IMV.CN","INX.CN",
+        "ION.CN","IPA.CN","IRM.CN","ISS.CN","IZZ.CN","JAG.CN","JNC.CN",
+        # Tech
+        "MAGT.CN","MARA.CN","MAPS.CN","MEDI.CN","MEDS.CN","META.CN",
+        "MFON.CN","MGB.CN","MGMT.CN","MGR.CN","MHM.CN","MIA.CN",
+        "NILI.CN","NIO.CN","NKL.CN","NLC.CN","NMI.CN","NNRG.CN",
+        # Other
+        "OGEN.CN","OGN.CN","OIII.CN","OMG.CN","ONE.CN","ONEX.CN",
+        "ONOV.CN","OPC.CN","OPCT.CN","OPEN.CN","OR.CN","OREA.CN",
+    ]
+
+    _NEO_BASE = [
+        # Major NEO-listed issuers
+        "EGLX.NE","QBTC.NE","QETH.NE","BTCQ.NE","ETHQ.NE","BFIN.NE",
+        "BANK.NE","PAYS.NE","PAYO.NE","HLTH.NE","WELL.NE","MEDI.NE",
+        "HIVE.NE","BITF.NE","HUT.NE","GIGA.NE","BNXG.NE","DEFI.NE",
+        "CBDC.NE","NBIT.NE","BTCC.NE","ETHH.NE","AVAX.NE","DOGE.NE",
+        "PRBL.NE","SMCC.NE","MONA.NE","REAL.NE","BTRE.NE","BLDS.NE",
+        "LIXT.NE","LIFE.NE","LQRT.NE","MSFT.NE","AMZN.NE","AAPL.NE",
+        "NVDA.NE","GOOG.NE","TSLA.NE","META.NE","NFLX.NE","SHOP.NE",
+    ]
+
+    def _tsx(self) -> list:
+        """TSX-listed companies with .TO suffix for yfinance."""
+        tickers = []
+        # Method 1: Wikipedia S&P/TSX Composite Index
+        for wiki_url in [
+            "https://en.wikipedia.org/wiki/S%26P/TSX_Composite_Index",
+            "https://en.wikipedia.org/wiki/S%26P/TSX_60",
+        ]:
+            try:
+                for t in pd.read_html(wiki_url):
+                    for col in ("Ticker symbol","Symbol","Ticker","Ticker Symbol"):
+                        if col in t.columns:
+                            for sym in t[col].dropna():
+                                s = str(sym).strip().replace(".","-")
+                                if s and 1 <= len(s) <= 8 and s not in ("Symbol","Ticker"):
+                                    tickers.append(s + ".TO")
+                            break
+                if tickers:
+                    break
+            except Exception:
+                continue
+        # Always add base list to ensure solid coverage
+        tickers.extend(self._TSX_BASE)
+        return list(set(tickers))
+
+    def _tsxv(self) -> list:
+        """TSXV-listed companies with .V suffix for yfinance."""
+        return list(set(self._TSXV_BASE))
+
+    def _cse(self) -> list:
+        """CSE-listed companies with .CN suffix for yfinance."""
+        tickers = list(self._CSE_BASE)
+        # Try live CSE API
+        for api_url in [
+            "https://thecse.com/api/v1/securities?format=json&limit=2000",
+            "https://thecse.com/en/listings/listed-securities.json",
+        ]:
+            try:
+                r = requests.get(api_url, headers=self._HDRS, timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
+                    items = data if isinstance(data, list) else data.get("results", data.get("data", []))
+                    for item in items:
+                        sym = (item.get("symbol") or item.get("ticker","")).strip().upper()
+                        if sym and 1 <= len(sym) <= 6 and " " not in sym:
+                            tickers.append(sym if sym.endswith(".CN") else sym + ".CN")
+                    break
+            except Exception:
+                continue
+        return list(set(tickers))
+
+    def _neo(self) -> list:
+        """NEO / CBOE Canada listed companies with .NE suffix for yfinance."""
+        tickers = list(self._NEO_BASE)
+        # Try live fetch
+        for api_url in [
+            "https://api.cboe.ca/api/v1/equities/listed-issuers",
+            "https://www.neo.inc/en/neo-exchange/listed-issuers",
+        ]:
+            try:
+                r = requests.get(api_url, headers=self._HDRS, timeout=15)
+                if r.status_code == 200 and r.headers.get("content-type","").startswith("application/json"):
+                    data = r.json()
+                    items = data if isinstance(data, list) else data.get("data", data.get("results", []))
+                    for item in items:
+                        sym = (item.get("symbol") or item.get("ticker","")).strip().upper()
+                        if sym and 1 <= len(sym) <= 6:
+                            tickers.append(sym if sym.endswith(".NE") else sym + ".NE")
+                    break
+            except Exception:
+                continue
+        return list(set(tickers))
+
+    # ── Legacy method (kept for --universe nasdaq backward compat) ────────────
+
+    def _nasdaq(self) -> list:
+        """All US equities from NASDAQ Trader FTP (both files). Legacy."""
+        return list(set(self._us_nasdaq() + self._us_other()))
+
+    def _load_file(self, path: str) -> list:
+        """Load tickers from a text or CSV file (one per line, or comma-separated)."""
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                raw = f.read()
+            # support comma, newline, semicolon, tab delimiters
+            import re
+            tokens = re.split(r"[,\n;\t]+", raw)
+            return [t.strip().upper() for t in tokens if t.strip()]
+        except Exception as e:
+            print(f"  [warn] Could not load file '{path}': {e}")
+            return []
+
+    def _finviz_page(self, url: str) -> list:
+        tickers = []
+        try:
+            offset = 1
+            while True:
+                r    = requests.get(url + f"&r={offset}", headers=self._HDRS, timeout=10)
+                soup = BeautifulSoup(r.text, "lxml")
+                cells = soup.select("a.screener-link-primary")
+                if not cells:
+                    break
+                batch = [c.text.strip() for c in cells]
+                tickers.extend(batch)
+                if len(batch) < 20:
+                    break
+                offset += 20
+                time.sleep(0.4)
+        except Exception:
+            pass
+        return tickers
+
+    def _russell2000(self) -> list:
+        try:
+            url = "https://en.wikipedia.org/wiki/Russell_2000_Index"
+            for t in pd.read_html(url):
+                for col in ("Symbol", "Ticker"):
+                    if col in t.columns:
+                        return t[col].str.replace(".", "-", regex=False).dropna().tolist()
+        except Exception:
+            pass
+        return []
+
+    def _sp500(self) -> list:
+        try:
+            url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+            return pd.read_html(url)[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
+        except Exception:
+            return []
+
+    def build(self, universe_type: str = "all", file_path: str = None) -> list:
+        tickers: set = set()
+
+        # ── File override ──────────────────────────────────────────────────────
+        if file_path:
+            batch = self._load_file(file_path)
+            tickers.update(batch)
+            print(f"  File '{file_path}': {len(batch)} tickers")
+            return list(tickers)
+
+        # ── Single-exchange shortcuts ──────────────────────────────────────────
+        if universe_type == "nasdaq":
+            batch = self._us_nasdaq()
+            tickers.update(batch)
+            print(f"  NASDAQ: {len(batch)} tickers")
+            return list(tickers)
+
+        if universe_type == "nyse":
+            batch = self._us_other({"NYSE"})
+            tickers.update(batch)
+            print(f"  NYSE/NYSE Arca/NYSE American: {len(batch)} tickers")
+            return list(tickers)
+
+        if universe_type == "cboe":
+            batch = self._us_other({"CBOE"})
+            tickers.update(batch)
+            print(f"  CBOE BZX: {len(batch)} tickers")
+            return list(tickers)
+
+        if universe_type == "otc":
+            batch = self._otc_select()
+            tickers.update(batch)
+            print(f"  OTC Select (OTCQX/OTCQB): {len(batch)} tickers")
+            return list(tickers)
+
+        if universe_type == "tsx":
+            batch = self._tsx()
+            tickers.update(batch)
+            print(f"  TSX (.TO): {len(batch)} tickers")
+            return list(tickers)
+
+        if universe_type == "tsxv":
+            batch = self._tsxv()
+            tickers.update(batch)
+            print(f"  TSXV (.V): {len(batch)} tickers")
+            return list(tickers)
+
+        if universe_type == "cse":
+            batch = self._cse()
+            tickers.update(batch)
+            print(f"  CSE (.CN): {len(batch)} tickers")
+            return list(tickers)
+
+        if universe_type == "neo":
+            batch = self._neo()
+            tickers.update(batch)
+            print(f"  NEO/CBOE Canada (.NE): {len(batch)} tickers")
+            return list(tickers)
+
+        # ── Canadian-only preset ───────────────────────────────────────────────
+        if universe_type == "canadian":
+            for name, fn, suffix in [
+                ("TSX",            self._tsx,  ".TO"),
+                ("TSXV",           self._tsxv, ".V"),
+                ("CSE",            self._cse,  ".CN"),
+                ("NEO/CBOE Canada",self._neo,  ".NE"),
+            ]:
+                batch = fn()
+                tickers.update(batch)
+                print(f"  {name:<18}: {len(batch)} tickers ({suffix})")
+            return list(tickers)
+
+        # ── US-only preset ─────────────────────────────────────────────────────
+        if universe_type == "us":
+            batch = self._us_nasdaq()
+            tickers.update(batch)
+            print(f"  NASDAQ           : {len(batch)} tickers")
+            batch = self._us_other({"NYSE"})
+            tickers.update(batch)
+            print(f"  NYSE             : {len(batch)} tickers")
+            batch = self._us_other({"CBOE"})
+            tickers.update(batch)
+            print(f"  CBOE BZX         : {len(batch)} tickers")
+            batch = self._otc_select()
+            tickers.update(batch)
+            print(f"  OTC Select       : {len(batch)} tickers")
+            return list(tickers)
+
+        # ── Default "all" — all specified exchanges ────────────────────────────
+        if universe_type == "all":
+            # Canadian exchanges
+            for name, fn, suffix in [
+                ("TSX",            self._tsx,  ".TO"),
+                ("TSXV",           self._tsxv, ".V"),
+                ("CSE",            self._cse,  ".CN"),
+                ("NEO/CBOE Canada",self._neo,  ".NE"),
+            ]:
+                batch = fn()
+                tickers.update(batch)
+                print(f"  {name:<18}: {len(batch)} tickers ({suffix})")
+            # US exchanges
+            batch = self._us_nasdaq()
+            tickers.update(batch)
+            print(f"  NASDAQ           : {len(batch)} tickers")
+            batch = self._us_other({"NYSE"})
+            tickers.update(batch)
+            print(f"  NYSE             : {len(batch)} tickers")
+            batch = self._us_other({"CBOE"})
+            tickers.update(batch)
+            print(f"  CBOE BZX         : {len(batch)} tickers")
+            batch = self._otc_select()
+            tickers.update(batch)
+            print(f"  OTC Select       : {len(batch)} tickers")
+
+        # ── Legacy presets (still accessible via --universe) ──────────────────
+        if universe_type == "smallcap":
+            tickers.update(self._SMALLCAP)
+            print(f"  Small-cap list   : {len(self._SMALLCAP)} tickers")
+
+        if universe_type == "russell2000":
+            batch = self._russell2000()
+            tickers.update(batch)
+            print(f"  Russell 2000     : {len(batch)} tickers")
+
+        if universe_type in ("finviz", "microcap"):
+            for i, url in enumerate(self._SCREENS, 1):
+                batch = self._finviz_page(url)
+                tickers.update(batch)
+                print(f"  Finviz screen {i} : {len(batch)} tickers")
+
+        # ── Fallbacks ──────────────────────────────────────────────────────────
+        if not tickers:
+            batch = self._sp500()
+            tickers.update(batch)
+            print(f"  S&P 500 fallback : {len(batch)} tickers")
+
+        if not tickers:
+            tickers = set(self._FALLBACK)
+            print(f"  Hardcoded fallback: {len(tickers)} tickers")
+
+        return list(tickers)
+
+    def quick_filter(self, tickers: list, args) -> list:
+        max_cap   = getattr(args, "max_cap",   None)
+        max_float = getattr(args, "max_float", None)
+
+        def _check(ticker):
+            info = {}
+            try:
+                info = yf.Ticker(ticker).info or {}
+            except Exception:
+                pass
+
+            # If info came back empty (401/rate-limit), do a lightweight price check
+            price = float(info.get("currentPrice", 0) or info.get("regularMarketPrice", 0) or 0)
+            if price == 0 and not info:
+                try:
+                    end   = datetime.now()
+                    start = end - timedelta(days=10)
+                    raw   = yf.download(ticker, start=start, end=end,
+                                        progress=False, auto_adjust=True)
+                    if raw.empty:
+                        return None
+                    df_  = _norm(raw)
+                    price = float(df_["Close"].iloc[-1])
+                    avg_v = float(df_["Volume"].mean())
+                    if price < 0.50 or avg_v < 50_000:
+                        return None
+                    return {"ticker": ticker, "market_cap": 0, "price": price,
+                            "avg_vol": avg_v, "float_shares": 0,
+                            "short_pct": 0, "short_ratio": 0,
+                            "sector": "", "qs": 0, "info": {}}
+                except Exception:
+                    return None
+
+            qt = info.get("quoteType", "")
+            if qt and qt != "EQUITY":
+                return None
+            mkt_cap = float(info.get("marketCap", 0) or 0)
+            avg_vol = float(info.get("averageVolume", 0) or 0)
+            if price < 0.50 or avg_vol < 50_000:
+                return None
+            if max_cap   and mkt_cap > max_cap   * 1e6: return None
+            if max_float:
+                fs = float(info.get("floatShares", 0) or 0)
+                if fs > max_float * 1e6: return None
+            h52  = float(info.get("fiftyTwoWeekHigh", price) or price)
+            near = h52 > 0 and (h52 - price) / h52 <= 0.10
+            sp   = float(info.get("shortPercentOfFloat", 0) or 0)
+            qs   = int(near) + int(sp > 0.10)
+            return {"ticker": ticker, "market_cap": mkt_cap, "price": price,
+                    "avg_vol": avg_vol,
+                    "float_shares": float(info.get("floatShares", 0) or 0),
+                    "short_pct":    sp,
+                    "short_ratio":  float(info.get("shortRatio", 0) or 0),
+                    "sector":       info.get("sector", ""),
+                    "qs":           qs,
+                    "info":         info}
+
+        passed = []
+        with ThreadPoolExecutor(max_workers=8) as ex:   # 8 workers avoids 401 rate-limits
+            futs = {ex.submit(_check, t): t for t in tickers}
+            with tqdm(total=len(tickers), desc="  Quick filter", unit="stock", ncols=80) as bar:
+                for fut in as_completed(futs):
+                    r = fut.result()
+                    if r:
+                        passed.append(r)
+                    bar.update(1)
+
+        # sort: near-52W-high + high short interest first, cap at 400
+        passed.sort(key=lambda x: (x.get("qs", 0), x["short_pct"]), reverse=True)
+        return passed[:400]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BACKTEST ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+class BacktestEngine:
+    """
+    Replays pattern detection at historical dates and measures forward outcomes.
+    For each ticker:
+      - Fetches 400 days of data
+      - Steps backward in 10-day increments over the backtest window
+      - At each point, runs detection on data up to that day (no look-ahead)
+      - Records outcome: did price hit the target or stop in the next `hold` days?
+    """
+
+    def __init__(self, scanner: "BreakoutScanner", days: int = 60, hold: int = 20):
+        self.scanner = scanner
+        self.days    = days   # how far back to generate signals
+        self.hold    = hold   # forward window to check outcome
+        self.signals = []
+
+    def run(self, tickers: list) -> list:
+        print(f"\nBacktest: last {self.days} trading days  |  {self.hold}-day hold  |  {len(tickers)} tickers\n")
+        with ThreadPoolExecutor(max_workers=self.scanner.cfg["max_workers"]) as ex:
+            futs = {ex.submit(self._replay_ticker, t): t for t in tickers}
+            with tqdm(total=len(tickers), desc="Backtesting", unit="stock", ncols=80) as bar:
+                for fut in as_completed(futs):
+                    try:
+                        sigs = fut.result()
+                        if sigs:
+                            self.signals.extend(sigs)
+                    except Exception:
+                        pass
+                    finally:
+                        bar.update(1)
+        print(f"\n  {len(self.signals)} historical signals found across {len(tickers)} tickers\n")
+        return self.signals
+
+    def _replay_ticker(self, ticker: str) -> list:
+        try:
+            end   = datetime.now()
+            start = end - timedelta(days=400)
+            raw   = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+            if raw.empty or len(raw) < 80:
+                return []
+            df_full = _norm(raw)
+        except Exception:
+            return []
+
+        n       = len(df_full)
+        signals = []
+        # Earliest point where we have enough history + a full forward window
+        end_back   = min(self.days + self.hold + 20, n - self.hold)
+        start_back = self.hold + 20
+
+        for back in range(end_back, start_back - 1, -10):
+            cutoff = n - back
+            if cutoff < 60:
+                continue
+            df_slice = df_full.iloc[:cutoff].copy()
+            df_fwd   = df_full.iloc[cutoff:cutoff + self.hold]
+            if len(df_fwd) < 5:
+                continue
+
+            try:
+                df_ind = self.scanner._indicators(df_slice)
+                det    = PatternDetector(df_ind, None, self.scanner.cfg)
+                pats   = det.run_all()
+                eng    = BreakoutProbabilityEngine(pats, df_ind, None, self.scanner.cfg)
+                prob   = eng.calculate_probability()
+            except Exception:
+                continue
+
+            if prob["probability"] < 50:
+                continue
+
+            entry   = float(df_slice["Close"].iloc[-1])
+            atr_s   = _fcol(df_ind, "ATRr")
+            atr_val = float(atr_s.iloc[-1]) if not atr_s.empty else entry * 0.02
+            stop    = entry - atr_val * 1.5
+            h_hist  = (float(df_slice["High"].values[-252:].max())
+                       if cutoff >= 252 else float(df_slice["High"].max()))
+            target  = h_hist
+
+            # Walk forward day-by-day: first hit wins
+            outcome = "neutral"
+            for _, row in df_fwd.iterrows():
+                if target > entry and float(row["High"]) >= target:
+                    outcome = "win";  break
+                if float(row["Low"]) <= stop:
+                    outcome = "loss"; break
+            if outcome == "neutral":
+                ret     = (float(df_fwd["Close"].iloc[-1]) - entry) / entry if entry > 0 else 0
+                outcome = "win" if ret > 0.02 else ("loss" if ret < -0.02 else "neutral")
+
+            fwd_return = (float(df_fwd["Close"].iloc[-1]) - entry) / entry if entry > 0 else 0
+
+            signals.append({
+                "ticker":      ticker,
+                "signal_date": str(df_slice.index[-1].date()),
+                "pattern":     prob["primary_pattern"],
+                "probability": prob["probability"],
+                "outcome":     outcome,
+                "fwd_return":  round(fwd_return, 4),
+                "entry":       round(entry, 2),
+                "stop":        round(stop, 2),
+                "target":      round(target, 2),
+                "modifiers":   prob["positive_mods"] + prob["negative_mods"],
+            })
+
+        return signals
+
+    def print_report(self):
+        if not self.signals:
+            print("No signals generated in the backtest window.")
+            return
+
+        df    = pd.DataFrame(self.signals)
+        total = len(df)
+        wins  = (df["outcome"] == "win").sum()
+        losses= (df["outcome"] == "loss").sum()
+        neut  = (df["outcome"] == "neutral").sum()
+        wr    = wins / total * 100 if total > 0 else 0
+        avg_r = df["fwd_return"].mean() * 100
+
+        sep = "=" * 62
+        print(f"\n{sep}")
+        print(f"  BACKTEST RESULTS  |  {total} signals  |  {self.hold}-day hold period")
+        print(f"{sep}")
+        print(f"  Overall Win Rate  : {wr:.1f}%   ({wins}W / {losses}L / {neut} neutral)")
+        print(f"  Avg Forward Return: {avg_r:+.2f}%")
+        print()
+
+        # Per-pattern breakdown
+        print(f"  {'Pattern':<26} {'N':>4}  {'Win%':>6}  {'AvgRet':>8}")
+        print(f"  {'-'*26} {'-'*4}  {'-'*6}  {'-'*8}")
+        for pat, grp in df.groupby("pattern"):
+            pw  = (grp["outcome"] == "win").sum()
+            pr  = grp["fwd_return"].mean() * 100
+            pwr = pw / len(grp) * 100
+            print(f"  {pat:<26} {len(grp):>4}  {pwr:>5.1f}%  {pr:>+7.2f}%")
+
+        # Modifier correlation analysis
+        win_mods  = {}
+        loss_mods = {}
+        for _, row in df.iterrows():
+            bucket = win_mods if row["outcome"] == "win" else loss_mods
+            for lbl, _ in row["modifiers"]:
+                bucket[lbl] = bucket.get(lbl, 0) + 1
+
+        all_mods = set(win_mods) | set(loss_mods)
+        mod_data = []
+        for m in all_mods:
+            w = win_mods.get(m, 0); l = loss_mods.get(m, 0)
+            if w + l >= 3:
+                mod_data.append((m, w, l, w / (w + l) * 100))
+
+        if mod_data:
+            print(f"\n  Best modifiers (highest win rate, min 3 occurrences):")
+            print(f"  {'Modifier':<50} {'N':>4}  {'Win%':>6}")
+            print(f"  {'-'*50} {'-'*4}  {'-'*6}")
+            for m, w, l, wr_ in sorted(mod_data, key=lambda x: -x[3])[:8]:
+                print(f"  {m[:50]:<50} {w+l:>4}  {wr_:>5.1f}%")
+
+            print(f"\n  Worst modifiers (lowest win rate):")
+            for m, w, l, wr_ in sorted(mod_data, key=lambda x: x[3])[:5]:
+                print(f"  {m[:50]:<50} {w+l:>4}  {wr_:>5.1f}%")
+        print()
+
+    def to_csv(self) -> str | None:
+        if not self.signals:
+            return None
+        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = f"backtest_{ts}.csv"
+        rows = [{k: v for k, v in s.items() if k != "modifiers"} for s in self.signals]
+        pd.DataFrame(rows).to_csv(path, index=False)
+        print(f"  Backtest exported: {path}")
+        return path
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WEIGHT OPTIMIZER
+# ══════════════════════════════════════════════════════════════════════════════
+class WeightOptimizer:
+    """
+    Analyzes BacktestEngine results and updates weights.json.
+
+    Logic:
+      - Compute baseline win rate across all backtest signals
+      - For each modifier, compute its empirical win rate
+      - If a modifier's win rate deviates >10% from baseline, adjust its weight
+        (+1 point per 10% deviation, capped at ±5 points)
+      - Blend empirical base rates into BASE_RATES adjustments (30% weight)
+    Results accumulate across runs — each --backtest --learn pass refines further.
+    """
+
+    def update(self, signals: list, verbose: bool = True):
+        if len(signals) < 10:
+            print(f"  Only {len(signals)} signals — need 10+ to learn. "
+                  "Use a larger watchlist or wider --backtest window.")
+            return
+
+        df           = pd.DataFrame(signals)
+        baseline_wr  = (df["outcome"] == "win").sum() / len(df)
+
+        # Collect per-modifier win/loss counts
+        mod_stats: dict = {}
+        for _, row in df.iterrows():
+            is_win = row["outcome"] == "win"
+            for lbl, val in row["modifiers"]:
+                if lbl not in mod_stats:
+                    mod_stats[lbl] = {"wins": 0, "total": 0, "default": val}
+                mod_stats[lbl]["total"] += 1
+                if is_win:
+                    mod_stats[lbl]["wins"] += 1
+
+        data        = _load_weights()
+        adjustments = data.get("adjustments", {})
+        changed     = []
+
+        for lbl, stats in mod_stats.items():
+            if stats["total"] < 3:
+                continue
+            mod_wr  = stats["wins"] / stats["total"]
+            delta   = mod_wr - baseline_wr
+            new_adj = int(round(delta * 10))
+            new_adj = max(-5, min(5, new_adj))
+            old_adj = adjustments.get(lbl, 0)
+            if abs(new_adj - old_adj) >= 1:
+                adjustments[lbl] = new_adj
+                changed.append((lbl, old_adj, new_adj, mod_wr * 100, stats["total"]))
+
+        # Blend empirical base rates
+        br_adj = data.get("base_rate_adjustments", {})
+        for pat, grp in df.groupby("pattern"):
+            if len(grp) >= 5:
+                emp_wr  = (grp["outcome"] == "win").sum() / len(grp) * 100
+                current = BASE_RATES.get(pat, 50)
+                delta   = int(round((emp_wr - current) * 0.3))
+                br_adj[pat] = max(-10, min(10, delta))
+
+        data.update({
+            "adjustments":            adjustments,
+            "base_rate_adjustments":  br_adj,
+            "samples":                data.get("samples", 0) + len(signals),
+            "last_updated":           datetime.now().strftime("%Y-%m-%d %H:%M"),
+        })
+        _save_weights(data)
+
+        # Refresh in-memory weights immediately
+        global LEARNED_WEIGHTS
+        LEARNED_WEIGHTS = data
+
+        if verbose:
+            print(f"\n  Learning complete — {len(signals)} signals analyzed")
+            print(f"  Baseline win rate: {baseline_wr*100:.1f}%")
+            if changed:
+                print(f"  {len(changed)} weight adjustments applied:")
+                for lbl, old, new, wr, n in sorted(changed, key=lambda x: abs(x[2] - x[1]), reverse=True):
+                    print(f"    {lbl[:50]:<50}  {old:+d} -> {new:+d}  "
+                          f"(win rate {wr:.0f}%, n={n})")
+            else:
+                print("  No significant adjustments needed with current sample.")
+            print(f"  Accumulated samples: {data['samples']}")
+            print(f"  Saved to {WEIGHTS_FILE}")
+
+    def reset(self):
+        global LEARNED_WEIGHTS
+        if os.path.exists(WEIGHTS_FILE):
+            os.remove(WEIGHTS_FILE)
+            print(f"  Weights reset — {WEIGHTS_FILE} deleted.")
+        else:
+            print("  No weights file found (already at defaults).")
+        LEARNED_WEIGHTS = {"adjustments": {}, "base_rate_adjustments": {}, "samples": 0}
+
+    @staticmethod
+    def status():
+        data = _load_weights()
+        n    = data.get("samples", 0)
+        ts   = data.get("last_updated", "never")
+        adjs = data.get("adjustments", {})
+        print(f"\n  Weights file : {WEIGHTS_FILE}")
+        print(f"  Last updated : {ts}")
+        print(f"  Samples seen : {n}")
+        print(f"  Adjustments  : {len(adjs)} modifiers tuned")
+        if adjs:
+            for lbl, val in sorted(adjs.items(), key=lambda x: -abs(x[1])):
+                print(f"    {lbl[:52]:<52}  {val:+d}")
+        print()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PORTFOLIO TRACKER & HISTORICAL CALL LOGGER
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DB_FILE  = "trading_scanner_history.db"
+_POS_SIZE = 10_000.0   # virtual $ per tracked position
+
+
+class CallLogger:
+    """Records every scanner call and tracks outcomes persistently via SQLite."""
+
+    MIN_SCORE = 40
+    MIN_PROB  = 55
+
+    def __init__(self, db: str = _DB_FILE):
+        self.db   = db
+        self.conn = sqlite3.connect(db, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self._init_schema()
+
+    def close(self):
+        self.conn.close()
+
+    def _init_schema(self):
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS calls (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id           TEXT,
+                scan_timestamp    DATETIME,
+                ticker            TEXT,
+                entry_price       REAL,
+                entry_date        DATE,
+                explosive_score   REAL,
+                explosive_grade   TEXT,
+                breakout_prob     REAL,
+                breakout_prob_band REAL,
+                pattern_detected  TEXT,
+                catalyst_flag     TEXT,
+                catalyst_score    REAL,
+                short_pct         REAL,
+                float_shares      REAL,
+                market_cap        REAL,
+                target_price      REAL,
+                stop_loss         REAL,
+                est_move_pct_low  REAL,
+                est_move_pct_high REAL,
+                est_duration_min  INTEGER,
+                est_duration_max  INTEGER,
+                peak_day          INTEGER,
+                urgency           TEXT,
+                trade_type        TEXT,
+                reward_risk       REAL,
+                outcome_price     REAL,
+                outcome_date      DATE,
+                outcome_pct       REAL,
+                peak_price        REAL,
+                peak_pct          REAL,
+                trough_price      REAL,
+                trough_pct        REAL,
+                hit_target        INTEGER,
+                hit_stop          INTEGER,
+                result            TEXT DEFAULT 'PENDING',
+                result_reason     TEXT,
+                actual_duration   INTEGER,
+                duration_accurate INTEGER,
+                notes             TEXT
+            );
+            CREATE TABLE IF NOT EXISTS portfolio (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_id       INTEGER,
+                ticker        TEXT,
+                position_type TEXT DEFAULT 'VIRTUAL',
+                shares        REAL,
+                entry_price   REAL,
+                entry_date    DATE,
+                status        TEXT DEFAULT 'OPEN',
+                current_price REAL,
+                current_pct   REAL,
+                current_value REAL,
+                exit_price    REAL,
+                exit_date     DATE,
+                exit_reason   TEXT,
+                realized_pct  REAL,
+                realized_pnl  REAL,
+                FOREIGN KEY (call_id) REFERENCES calls(id)
+            );
+            CREATE TABLE IF NOT EXISTS scan_runs (
+                scan_id          TEXT PRIMARY KEY,
+                timestamp        DATETIME,
+                universe_size    INTEGER,
+                patterns_found   INTEGER,
+                calls_made       INTEGER,
+                spy_price        REAL,
+                spy_vs_sma50     REAL,
+                market_condition TEXT,
+                notes            TEXT
+            );
+            CREATE TABLE IF NOT EXISTS performance_stats (
+                stat_date     DATE PRIMARY KEY,
+                total_calls   INTEGER,
+                wins          INTEGER,
+                losses        INTEGER,
+                breakeven     INTEGER,
+                pending       INTEGER,
+                win_rate      REAL,
+                avg_win_pct   REAL,
+                avg_loss_pct  REAL,
+                avg_hold_days REAL,
+                profit_factor REAL,
+                expectancy    REAL,
+                best_call     TEXT,
+                worst_call    TEXT,
+                best_pattern  TEXT,
+                best_catalyst TEXT
+            );
+        """)
+        self.conn.commit()
+
+    # ── Logging ───────────────────────────────────────────────────────────────
+
+    def log_scan_results(self, results: list, meta: dict) -> int:
+        scan_id = meta.get("scan_id", str(_uuid.uuid4())[:8])
+        ts      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        today   = datetime.now().strftime("%Y-%m-%d")
+
+        qualifying = [r for r in results
+                      if r.get("explosive_score", 0) >= self.MIN_SCORE
+                      or r.get("probability", 0) >= self.MIN_PROB]
+        added = 0
+        for r in qualifying:
+            tk = r["ticker"]
+            if self.conn.execute(
+                    "SELECT id FROM calls WHERE ticker=? AND entry_date=?",
+                    (tk, today)).fetchone():
+                continue
+            t = r.get("timing", {}) or {}
+            self.conn.execute("""
+                INSERT INTO calls (
+                    scan_id, scan_timestamp, ticker, entry_price, entry_date,
+                    explosive_score, explosive_grade, breakout_prob, breakout_prob_band,
+                    pattern_detected, catalyst_flag, catalyst_score,
+                    short_pct, float_shares, market_cap,
+                    target_price, stop_loss, est_move_pct_low, est_move_pct_high,
+                    est_duration_min, est_duration_max, peak_day, urgency, trade_type,
+                    reward_risk, result
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                scan_id, ts, tk, r.get("price"), today,
+                r.get("explosive_score", 0), r.get("explosive_grade", ""),
+                r.get("probability", 0),     r.get("conf_band", 0),
+                r.get("pattern", "No Pattern"),
+                r.get("top_flag", ""),       r.get("catalyst_score", 0),
+                r.get("expl_short_pct", 0),  r.get("expl_float", 0),
+                r.get("market_cap", 0),
+                r.get("tgt_price"),          r.get("stop_price"),
+                r.get("move_low"),           r.get("move_high"),
+                t.get("min_days"),           t.get("max_days"),
+                t.get("peak_day"),           t.get("urgency_key", ""),
+                t.get("trade_type", ""),     r.get("rr", 0),
+                "PENDING",
+            ))
+            cid = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            ep  = r.get("price") or 1
+            self.conn.execute("""
+                INSERT INTO portfolio
+                (call_id, ticker, position_type, shares, entry_price, entry_date,
+                 status, current_price, current_pct, current_value)
+                VALUES (?,?,'VIRTUAL',?,?,?,'OPEN',?,0.0,?)
+            """, (cid, tk, _POS_SIZE / ep, ep, today, ep, _POS_SIZE))
+            added += 1
+
+        # Log scan run metadata
+        spy_df = meta.get("spy")
+        spy_px = spy_vs = 0.0
+        mkt    = "NEUTRAL"
+        if spy_df is not None and not spy_df.empty:
+            sp     = spy_df["Close"].values
+            spy_px = float(sp[-1])
+            if len(sp) >= 50:
+                sma50  = float(sp[-50:].mean())
+                spy_vs = (spy_px - sma50) / sma50
+                mkt    = "BULL" if spy_px > sma50 else "BEAR"
+        n_pats = sum(1 for r in results
+                     if r.get("pattern", "No Pattern") != "No Pattern")
+        try:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO scan_runs
+                (scan_id, timestamp, universe_size, patterns_found, calls_made,
+                 spy_price, spy_vs_sma50, market_condition)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (scan_id, ts, meta.get("universe_size", len(results)),
+                  n_pats, added, spy_px, spy_vs, mkt))
+        except Exception:
+            pass
+        self.conn.commit()
+        return added
+
+    # ── Outcome updater ───────────────────────────────────────────────────────
+
+    def update_calls(self) -> int:
+        pending = self.conn.execute("""
+            SELECT id, ticker, entry_price, entry_date,
+                   target_price, stop_loss, est_duration_min, est_duration_max
+            FROM calls WHERE result = 'PENDING'
+        """).fetchall()
+        if not pending:
+            return 0
+
+        today   = datetime.now().date()
+        updated = 0
+
+        for row in pending:
+            cid     = row["id"]
+            tk      = row["ticker"]
+            ep      = row["entry_price"] or 0
+            entry_s = row["entry_date"]
+            target  = row["target_price"]
+            stop    = row["stop_loss"]
+            dur_min = row["est_duration_min"] or 0
+            dur_max = row["est_duration_max"] or 20
+
+            try:
+                edate = datetime.strptime(entry_s, "%Y-%m-%d").date()
+            except Exception:
+                continue
+            held = (today - edate).days
+            if held < 0:
+                continue
+
+            try:
+                hist = yf.download(
+                    tk, start=entry_s,
+                    end=(today + timedelta(days=1)).strftime("%Y-%m-%d"),
+                    progress=False, auto_adjust=True)
+                if isinstance(hist.columns, pd.MultiIndex):
+                    hist.columns = hist.columns.get_level_values(0)
+                if hist.empty:
+                    continue
+            except Exception:
+                continue
+
+            C = hist["Close"].values if "Close" in hist.columns else None
+            H = hist["High"].values  if "High"  in hist.columns else None
+            L = hist["Low"].values   if "Low"   in hist.columns else None
+            if C is None or len(C) == 0:
+                continue
+
+            cur_px  = float(C[-1])
+            peak_px = float(H.max()) if H is not None else cur_px
+            trgh_px = float(L.min()) if L is not None else cur_px
+            out_pct = (cur_px  - ep) / ep if ep else 0
+            pk_pct  = (peak_px - ep) / ep if ep else 0
+            tr_pct  = (trgh_px - ep) / ep if ep else 0
+
+            hit_tgt = hit_stp = 0
+            stp_first = False
+            if H is not None and L is not None:
+                for i in range(len(C)):
+                    if stop   and float(L[i]) <= stop   and not stp_first:
+                        hit_stp = 1; stp_first = True; break
+                    if target and float(H[i]) >= target:
+                        hit_tgt = 1; break
+            else:
+                if target and peak_px >= target: hit_tgt = 1
+                if stop   and trgh_px <= stop:   hit_stp = 1
+
+            expired = held > dur_max
+            if stp_first:
+                result = "LOSS";      reason = f"Stop hit on Day {held}"
+            elif hit_tgt:
+                result = "WIN";       reason = f"Target hit on Day {held}"
+            elif expired:
+                if   out_pct >  0.02: result = "WIN";       reason = f"Expired +{out_pct:.1%}"
+                elif out_pct < -0.02: result = "LOSS";      reason = f"Expired {out_pct:.1%}"
+                else:                 result = "BREAKEVEN";  reason = f"Expired flat ({out_pct:.1%})"
+            else:
+                result = "PENDING";   reason = None
+
+            dur_acc = 1 if (dur_min and dur_min <= held <= dur_max) else 0
+
+            self.conn.execute("""
+                UPDATE calls SET
+                    outcome_price=?, outcome_date=?, outcome_pct=?,
+                    peak_price=?, peak_pct=?, trough_price=?, trough_pct=?,
+                    hit_target=?, hit_stop=?, result=?, result_reason=?,
+                    actual_duration=?, duration_accurate=?
+                WHERE id=?
+            """, (cur_px, today.strftime("%Y-%m-%d"), out_pct,
+                  peak_px, pk_pct, trgh_px, tr_pct,
+                  hit_tgt, hit_stp, result, reason, held, dur_acc, cid))
+
+            if result != "PENDING":
+                xr   = ("TARGET_HIT" if hit_tgt and not stp_first
+                         else "STOP_HIT" if stp_first else "EXPIRED")
+                rpnl = out_pct * _POS_SIZE
+                self.conn.execute("""
+                    UPDATE portfolio SET
+                        status='CLOSED', current_price=?, current_pct=?,
+                        current_value=?, exit_price=?, exit_date=?,
+                        exit_reason=?, realized_pct=?, realized_pnl=?
+                    WHERE call_id=? AND status='OPEN'
+                """, (cur_px, out_pct * 100, _POS_SIZE * (1 + out_pct),
+                      cur_px, today.strftime("%Y-%m-%d"), xr,
+                      out_pct * 100, rpnl, cid))
+            else:
+                self.conn.execute("""
+                    UPDATE portfolio SET current_price=?, current_pct=?, current_value=?
+                    WHERE call_id=? AND status='OPEN'
+                """, (cur_px, out_pct * 100, _POS_SIZE * (1 + out_pct), cid))
+            updated += 1
+
+        self.conn.commit()
+        self._refresh_stats()
+        return updated
+
+    def _refresh_stats(self):
+        rows = self.conn.execute("""
+            SELECT ticker, result, outcome_pct, pattern_detected,
+                   catalyst_flag, actual_duration
+            FROM calls WHERE result != 'PENDING'
+        """).fetchall()
+        if not rows:
+            return
+
+        wins   = [r for r in rows if r["result"] == "WIN"]
+        losses = [r for r in rows if r["result"] == "LOSS"]
+        be     = [r for r in rows if r["result"] == "BREAKEVEN"]
+        pend   = self.conn.execute(
+            "SELECT COUNT(*) FROM calls WHERE result='PENDING'").fetchone()[0]
+
+        n_wins = len(wins); n_loss = len(losses)
+        res    = n_wins + n_loss
+        wr     = n_wins / res if res > 0 else 0
+        aw     = float(np.mean([r["outcome_pct"] for r in wins]))   * 100 if wins   else 0
+        al     = float(np.mean([r["outcome_pct"] for r in losses])) * 100 if losses else 0
+        ws     = sum(r["outcome_pct"] or 0 for r in wins)
+        ls     = abs(sum(r["outcome_pct"] or 0 for r in losses))
+        pf     = ws / ls if ls > 0 else (999.0 if ws > 0 else 0.0)
+        holds  = [r["actual_duration"] for r in rows if r["actual_duration"]]
+        ah     = float(np.mean(holds)) if holds else 0
+
+        all_s     = sorted(rows, key=lambda r: r["outcome_pct"] or 0, reverse=True)
+        best_call  = all_s[0]["ticker"]  if all_s else ""
+        worst_call = all_s[-1]["ticker"] if all_s else ""
+
+        pd_  = defaultdict(lambda: [0, 0])
+        cd_  = defaultdict(lambda: [0, 0])
+        for r in rows:
+            p = r["pattern_detected"] or "Unknown"
+            c = (r["catalyst_flag"] or "None")[:20]
+            pd_[p][1] += 1; cd_[c][1] += 1
+            if r["result"] == "WIN":
+                pd_[p][0] += 1; cd_[c][0] += 1
+
+        def _best(d):
+            return max(d.keys(),
+                       key=lambda k: d[k][0] / d[k][1] if d[k][1] >= 3 else 0,
+                       default="")
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        self.conn.execute("""
+            INSERT OR REPLACE INTO performance_stats
+            (stat_date, total_calls, wins, losses, breakeven, pending,
+             win_rate, avg_win_pct, avg_loss_pct, avg_hold_days,
+             profit_factor, expectancy, best_call, worst_call,
+             best_pattern, best_catalyst)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (today, len(rows), n_wins, n_loss, len(be), pend,
+              wr * 100, aw, al, ah, pf,
+              wr * aw + (1 - wr) * al,
+              best_call, worst_call, _best(pd_), _best(cd_)))
+        self.conn.commit()
+
+    # ── Manual operations ─────────────────────────────────────────────────────
+
+    def add_manual_call(self, ticker: str):
+        print(f"\nAdding manual call for {ticker.upper()}")
+        try:
+            ep  = float(input("  Entry price   : $").strip())
+            tgt = float(input("  Target price  : $").strip())
+            stp = float(input("  Stop loss     : $").strip())
+            nts = input("  Notes (optional): ").strip()
+        except (ValueError, KeyboardInterrupt):
+            print("  Cancelled."); return
+        today = datetime.now().strftime("%Y-%m-%d")
+        ts    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute("""
+            INSERT INTO calls
+            (scan_id, scan_timestamp, ticker, entry_price, entry_date,
+             target_price, stop_loss, result, notes)
+            VALUES ('MANUAL',?,?,?,?,?,?,'PENDING',?)
+        """, (ts, ticker.upper(), ep, today, tgt, stp, nts))
+        cid = self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute("""
+            INSERT INTO portfolio
+            (call_id, ticker, position_type, shares, entry_price, entry_date,
+             status, current_price, current_pct, current_value)
+            VALUES (?,?,'REAL',?,?,?,'OPEN',?,0.0,?)
+        """, (cid, ticker.upper(), _POS_SIZE / ep if ep > 0 else 0,
+              ep, today, ep, _POS_SIZE))
+        self.conn.commit()
+        print(f"  ✅ Call #{cid}: {ticker.upper()} @ ${ep:.2f}  "
+              f"Target ${tgt:.2f}  Stop ${stp:.2f}")
+
+    def close_call(self, call_id: int):
+        row = self.conn.execute(
+            "SELECT ticker, entry_price FROM calls WHERE id=?",
+            (call_id,)).fetchone()
+        if not row:
+            print(f"  Call #{call_id} not found."); return
+        tk, ep = row["ticker"], row["entry_price"] or 0
+        try:
+            xp  = float(input(f"  Exit price for {tk} (entry ${ep:.2f}): $").strip())
+            why = input("  Reason (TARGET_HIT/STOP_HIT/MANUAL): ").strip().upper() or "MANUAL"
+        except (ValueError, KeyboardInterrupt):
+            print("  Cancelled."); return
+        pct   = (xp - ep) / ep if ep else 0
+        rpnl  = pct * _POS_SIZE
+        today = datetime.now().strftime("%Y-%m-%d")
+        res   = "WIN" if pct > 0.02 else ("LOSS" if pct < -0.02 else "BREAKEVEN")
+        self.conn.execute("""
+            UPDATE calls SET result=?, result_reason=?,
+                outcome_price=?, outcome_date=?, outcome_pct=? WHERE id=?
+        """, (res, why, xp, today, pct, call_id))
+        self.conn.execute("""
+            UPDATE portfolio SET
+                status='CLOSED', exit_price=?, exit_date=?, exit_reason=?,
+                realized_pct=?, realized_pnl=?, current_price=?
+            WHERE call_id=? AND status='OPEN'
+        """, (xp, today, why, pct * 100, rpnl, xp, call_id))
+        self.conn.commit()
+        self._refresh_stats()
+        sign = "+" if rpnl >= 0 else "-"
+        print(f"  ✅ #{call_id} {tk}: ${xp:.2f}  {pct:+.1%}  ({sign}${abs(rpnl):.0f})")
+
+    def export_history_csv(self):
+        df = pd.read_sql_query(
+            "SELECT * FROM calls ORDER BY scan_timestamp DESC", self.conn)
+        fn = f"call_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        df.to_csv(fn, index=False)
+        print(f"  ✅ Exported {len(df)} calls → {fn}")
+
+    def reset_history(self):
+        resp = input(
+            "  ⚠️  Delete ALL call history? Type YES to confirm: ").strip()
+        if resp != "YES":
+            print("  Cancelled."); return
+        self.conn.executescript("""
+            DELETE FROM calls; DELETE FROM portfolio;
+            DELETE FROM scan_runs; DELETE FROM performance_stats;
+        """)
+        self.conn.commit()
+        print("  ✅ All history deleted.")
+
+
+class PortfolioTracker:
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def get_open_positions(self) -> list:
+        rows = self.conn.execute("""
+            SELECT p.id, p.call_id, p.ticker, p.position_type, p.shares,
+                   p.entry_price, p.entry_date, p.current_price, p.current_pct,
+                   p.current_value, c.target_price, c.stop_loss,
+                   c.est_duration_max, c.pattern_detected, c.catalyst_flag,
+                   c.explosive_grade
+            FROM portfolio p
+            JOIN calls c ON p.call_id = c.id
+            WHERE p.status = 'OPEN'
+            ORDER BY p.entry_date ASC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_closed_positions(self, days_back: int = 90) -> list:
+        cutoff = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        rows   = self.conn.execute("""
+            SELECT p.*, c.pattern_detected, c.catalyst_flag,
+                   c.explosive_grade, c.explosive_score, c.breakout_prob
+            FROM portfolio p
+            JOIN calls c ON p.call_id = c.id
+            WHERE p.status = 'CLOSED' AND p.exit_date >= ?
+            ORDER BY p.realized_pct DESC
+        """, (cutoff,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_portfolio_summary(self) -> dict:
+        open_p   = self.get_open_positions()
+        unreal   = sum((p.get("current_pct") or 0) / 100 * _POS_SIZE for p in open_p)
+        real_pnl = self.conn.execute(
+            "SELECT COALESCE(SUM(realized_pnl),0) FROM portfolio WHERE status='CLOSED'"
+        ).fetchone()[0]
+        top_w  = max(open_p, key=lambda p: p.get("current_pct") or 0, default=None)
+        top_l  = min(open_p, key=lambda p: p.get("current_pct") or 0, default=None)
+        first  = self.conn.execute(
+            "SELECT MIN(entry_date) FROM calls").fetchone()[0] or "—"
+        return {
+            "n_open": len(open_p), "capital": len(open_p) * _POS_SIZE,
+            "unrealized_pnl": unreal, "realized_pnl": float(real_pnl or 0),
+            "top_winner": top_w, "top_loser": top_l, "first_call_date": first,
+        }
+
+
+class PerformanceAnalyzer:
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def _resolved(self, where_extra: str = "", params: list = None) -> list:
+        q = ("SELECT * FROM calls WHERE result IN ('WIN','LOSS','BREAKEVEN')"
+             + (" AND " + where_extra if where_extra else ""))
+        return [dict(r) for r in self.conn.execute(q, params or []).fetchall()]
+
+    def summary(self) -> dict:
+        rows   = self._resolved()
+        wins   = [r for r in rows if r["result"] == "WIN"]
+        losses = [r for r in rows if r["result"] == "LOSS"]
+        res    = len(wins) + len(losses)
+        wr     = len(wins) / res if res > 0 else 0
+        aw     = float(np.mean([r["outcome_pct"] for r in wins]))   * 100 if wins   else 0
+        al     = float(np.mean([r["outcome_pct"] for r in losses])) * 100 if losses else 0
+        pend   = self.conn.execute(
+            "SELECT COUNT(*) FROM calls WHERE result='PENDING'").fetchone()[0]
+        ws = sum(r["outcome_pct"] or 0 for r in wins)
+        ls = abs(sum(r["outcome_pct"] or 0 for r in losses))
+        pf = ws / ls if ls > 0 else (999.0 if ws > 0 else 0.0)
+        exp = wr * aw + (1 - wr) * al
+        return {"total": len(rows), "wins": len(wins), "losses": len(losses),
+                "breakeven": len(rows) - len(wins) - len(losses), "pending": pend,
+                "win_rate": wr * 100, "avg_win": aw, "avg_loss": al,
+                "profit_factor": pf, "expectancy": exp}
+
+    def pattern_ranking(self) -> list:
+        rows = self._resolved()
+        data = defaultdict(lambda: {"w": 0, "n": 0, "wps": [], "lps": []})
+        for r in rows:
+            p = r["pattern_detected"] or "Unknown"
+            data[p]["n"] += 1
+            if r["result"] == "WIN":
+                data[p]["w"] += 1; data[p]["wps"].append(r["outcome_pct"] or 0)
+            elif r["result"] == "LOSS":
+                data[p]["lps"].append(r["outcome_pct"] or 0)
+        out = []
+        for pat, d in data.items():
+            wr = d["w"] / d["n"] if d["n"] > 0 else 0
+            aw = float(np.mean(d["wps"])) * 100 if d["wps"] else 0
+            al = float(np.mean(d["lps"])) * 100 if d["lps"] else 0
+            ws = sum(d["wps"]); ls = abs(sum(d["lps"]))
+            out.append({"pattern": pat, "total": d["n"], "wins": d["w"],
+                        "win_rate": wr * 100, "avg_win": aw, "avg_loss": al,
+                        "pf": ws / ls if ls > 0 else 999.0})
+        return sorted(out, key=lambda x: (x["win_rate"], x["total"]), reverse=True)
+
+    def catalyst_ranking(self) -> list:
+        rows = self._resolved()
+        data = defaultdict(lambda: {"w": 0, "n": 0, "wps": [], "lps": []})
+        for r in rows:
+            c = (r["catalyst_flag"] or "None")[:25]
+            data[c]["n"] += 1
+            if r["result"] == "WIN":
+                data[c]["w"] += 1; data[c]["wps"].append(r["outcome_pct"] or 0)
+            elif r["result"] == "LOSS":
+                data[c]["lps"].append(r["outcome_pct"] or 0)
+        out = []
+        for cat, d in data.items():
+            wr = d["w"] / d["n"] if d["n"] > 0 else 0
+            aw = float(np.mean(d["wps"])) * 100 if d["wps"] else 0
+            al = float(np.mean(d["lps"])) * 100 if d["lps"] else 0
+            out.append({"catalyst": cat, "total": d["n"], "wins": d["w"],
+                        "win_rate": wr * 100, "avg_win": aw, "avg_loss": al})
+        return sorted(out, key=lambda x: (x["win_rate"], x["total"]), reverse=True)
+
+    def score_calibration(self) -> list:
+        out = []
+        for lo, hi in [(60, 70), (70, 80), (80, 90), (90, 101)]:
+            rows = self.conn.execute("""
+                SELECT result FROM calls
+                WHERE breakout_prob >= ? AND breakout_prob < ?
+                AND result IN ('WIN','LOSS','BREAKEVEN')
+            """, (lo, hi)).fetchall()
+            if not rows:
+                continue
+            wins = sum(1 for r in rows if r["result"] == "WIN")
+            n    = len(rows)
+            awr  = wins / n * 100
+            exp  = (lo + hi) / 2
+            out.append({"range": f"{lo}–{hi}%", "n": n,
+                        "expected": exp, "actual": awr, "delta": awr - exp})
+        return out
+
+    def get_streak(self) -> dict:
+        rows = self.conn.execute("""
+            SELECT result FROM calls WHERE result IN ('WIN','LOSS')
+            ORDER BY scan_timestamp ASC
+        """).fetchall()
+        if not rows:
+            return {"current": 0, "direction": "—", "longest_win": 0, "longest_loss": 0}
+        res = [r["result"] for r in rows]
+        cur = 1; cur_dir = res[-1]
+        for i in range(len(res) - 2, -1, -1):
+            if res[i] == cur_dir: cur += 1
+            else: break
+        lw = ll = cs = 0; cr = None
+        for r in res:
+            cs = cs + 1 if r == cr else 1; cr = r
+            if r == "WIN": lw = max(lw, cs)
+            else:          ll = max(ll, cs)
+        return {"current": cur, "direction": cur_dir,
+                "longest_win": lw, "longest_loss": ll}
+
+    def benchmark_vs_spy(self) -> dict:
+        rows = self.conn.execute("""
+            SELECT entry_date, outcome_date, outcome_pct FROM calls
+            WHERE result IN ('WIN','LOSS','BREAKEVEN')
+            AND outcome_date IS NOT NULL AND outcome_pct IS NOT NULL
+        """).fetchall()
+        if not rows:
+            return {"avg_alpha": 0, "n": 0}
+        min_date = min(r["entry_date"] for r in rows)
+        try:
+            spy = yf.download("SPY", start=min_date, progress=False, auto_adjust=True)
+            if isinstance(spy.columns, pd.MultiIndex):
+                spy.columns = spy.columns.get_level_values(0)
+        except Exception:
+            return {"avg_alpha": 0, "n": 0}
+        alphas = []
+        for r in rows:
+            try:
+                s = spy.loc[r["entry_date"]:r["outcome_date"]]["Close"]
+                if len(s) < 2: continue
+                sr = (float(s.iloc[-1]) - float(s.iloc[0])) / float(s.iloc[0])
+                alphas.append((r["outcome_pct"] or 0) - sr)
+            except Exception:
+                continue
+        if not alphas:
+            return {"avg_alpha": 0, "n": 0}
+        return {"avg_alpha": float(np.mean(alphas)) * 100, "n": len(alphas)}
+
+    def duration_accuracy(self) -> dict:
+        rows = self.conn.execute("""
+            SELECT est_duration_min, est_duration_max, actual_duration, duration_accurate
+            FROM calls WHERE result != 'PENDING' AND actual_duration IS NOT NULL
+        """).fetchall()
+        if not rows:
+            return {"pct_accurate": 0, "avg_est": 0, "avg_actual": 0, "n": 0}
+        n_acc   = sum(1 for r in rows if r["duration_accurate"])
+        est_avs = [((r["est_duration_min"] or 0) + (r["est_duration_max"] or 0)) / 2
+                   for r in rows]
+        acts    = [r["actual_duration"] for r in rows]
+        return {"pct_accurate": n_acc / len(rows) * 100,
+                "avg_est": float(np.mean(est_avs)) if est_avs else 0,
+                "avg_actual": float(np.mean(acts)) if acts else 0, "n": len(rows)}
+
+    def suggest_improvements(self, min_n: int = 5) -> list:
+        tips = []
+        for p in self.pattern_ranking():
+            if p["total"] >= min_n and p["win_rate"] < 50:
+                tips.append(
+                    f"Pattern '{p['pattern']}' win rate {p['win_rate']:.0f}% "
+                    f"({p['total']} calls) — below 50%. Recommend raising "
+                    f"min explosive score to 80+ for this pattern only.")
+        rows  = self._resolved()
+        lo_sc = [r for r in rows if 50 <= (r.get("explosive_score") or 0) < 65]
+        hi_sc = [r for r in rows if (r.get("explosive_score") or 0) >= 70]
+        if len(lo_sc) >= min_n and len(hi_sc) >= min_n:
+            lwr = sum(1 for r in lo_sc if r["result"] == "WIN") / len(lo_sc) * 100
+            hwr = sum(1 for r in hi_sc if r["result"] == "WIN") / len(hi_sc) * 100
+            if hwr > lwr + 15:
+                tips.append(
+                    f"Explosive score 50–65 wins {lwr:.0f}%, score 70+ wins {hwr:.0f}%. "
+                    f"Recommend raising --min-explosive to ~68.")
+        dur = self.duration_accuracy()
+        if dur["n"] >= min_n and dur["pct_accurate"] < 60:
+            tips.append(
+                f"Duration accuracy {dur['pct_accurate']:.0f}%. "
+                f"Avg actual hold {dur['avg_actual']:.1f}d vs est {dur['avg_est']:.1f}d. "
+                f"Consider hard exit at Day {int(dur['avg_actual']) + 2}.")
+        for c in self.catalyst_ranking():
+            if c["total"] >= min_n and c["win_rate"] < 45:
+                tips.append(
+                    f"Catalyst '{c['catalyst']}' wins {c['win_rate']:.0f}% "
+                    f"({c['total']} calls) — recommend reducing catalyst score weight.")
+        return tips
+
+
+# ── Dashboard & display helpers ───────────────────────────────────────────────
+
+def _print_dashboard(tracker: PortfolioTracker,
+                     analyzer: PerformanceAnalyzer,
+                     logger: CallLogger):
+    s    = analyzer.summary()
+    port = tracker.get_portfolio_summary()
+    stk  = analyzer.get_streak()
+    spy  = analyzer.benchmark_vs_spy()
+    dur  = analyzer.duration_accuracy()
+    pats = analyzer.pattern_ranking()
+    cats = analyzer.catalyst_ranking()
+    W    = 66
+
+    if s["total"] == 0:
+        print("\n  📊 No call history yet — scanner will begin tracking from this run.\n")
+        return
+
+    def _ln(txt=""):
+        inner = ("  " + txt).ljust(W - 2)
+        try:    print("║" + inner + "║")
+        except: print("|" + inner.encode("ascii", "replace").decode() + "|")
+
+    def _sep(c="═"):
+        try:    print("╠" + c * (W - 2) + "╣")
+        except: print("+" + "-" * (W - 2) + "+")
+
+    def _top():
+        try:    print("╔" + "═" * (W - 2) + "╗")
+        except: print("+" + "=" * (W - 2) + "+")
+
+    def _bot():
+        try:    print("╚" + "═" * (W - 2) + "╝")
+        except: print("+" + "=" * (W - 2) + "+")
+
+    _top()
+    _ln(f"{'📊 SCANNER PERFORMANCE DASHBOARD':^{W - 4}}")
+    _sep()
+
+    since = port.get("first_call_date", "—")
+    try:    since = datetime.strptime(since, "%Y-%m-%d").strftime("%b %d %Y")
+    except: pass
+    _ln(f"Total Calls Made    : {s['total']:<8}   Since : {since}")
+    _ln(f"Win / Loss / BE     : {s['wins']} / {s['losses']} / {s['breakeven']}"
+        f"   Pending: {s['pending']}")
+    _ln(f"Overall Win Rate    : {s['win_rate']:.1f}%     "
+        f"Profit Factor : {s['profit_factor']:.1f}")
+    _ln(f"Avg Win             : +{s['avg_win']:.1f}%     "
+        f"Avg Loss      : {s['avg_loss']:.1f}%")
+    exp_str = f"{s['expectancy']:+.1f}%"
+    alp_str = f"{spy['avg_alpha']:+.1f}%" if spy.get("n") else "N/A"
+    _ln(f"Expectancy/Trade    : {exp_str:<12}  vs SPY Alpha  : {alp_str}")
+    icon = "🟢" if stk["direction"] == "WIN" else "🔴"
+    _ln(f"Current Streak      : {icon} {stk['current']} "
+        f"{'win' if stk['direction'] == 'WIN' else 'loss'}s in a row")
+
+    _sep()
+    _ln(f"💼 VIRTUAL PORTFOLIO (${_POS_SIZE:,.0f} per position)")
+    cap = port["capital"]
+    ur  = port["unrealized_pnl"]
+    rp  = port["realized_pnl"]
+    _ln(f"Open Positions      : {port['n_open']:<8}   Capital Deployed: ${cap:,.0f}")
+    if cap:
+        ur_s = "+" if ur >= 0 else ""
+        _ln(f"Unrealized P&L      : {ur_s}${abs(ur):,.0f}  ({ur / cap * 100:+.1f}%)")
+    base   = max((s["total"] + s["pending"]) * _POS_SIZE, 1)
+    rp_pct = rp / base * 100
+    rp_s   = "+" if rp >= 0 else "-"
+    _ln(f"Realized P&L (all)  : {rp_s}${abs(rp):,.0f} ({rp_pct:+.1f}% on base capital)")
+
+    _sep()
+    bp = pats[0]  if pats           else None
+    wp = pats[-1] if len(pats) > 1  else None
+    bc = cats[0]  if cats           else None
+    wc = cats[-1] if len(cats) > 1  else None
+    if bp: _ln(f"🏆 BEST PATTERN     : {bp['pattern'][:14]:<14}  "
+               f"Win Rate: {bp['win_rate']:.0f}%  ({bp['total']} calls)")
+    if bc: _ln(f"🏆 BEST CATALYST    : {bc['catalyst'][:14]:<14}  "
+               f"Win Rate: {bc['win_rate']:.0f}%  ({bc['total']} calls)")
+    if wp: _ln(f"⚠  WORST PATTERN   : {wp['pattern'][:14]:<14}  "
+               f"Win Rate: {wp['win_rate']:.0f}%  ({wp['total']} calls)")
+    if wc: _ln(f"⚠  WORST CATALYST  : {wc['catalyst'][:14]:<14}  "
+               f"Win Rate: {wc['win_rate']:.0f}%  ({wc['total']} calls)")
+
+    if dur.get("n"):
+        _sep()
+        _ln(f"📏 DURATION ACCURACY: {dur['pct_accurate']:.0f}% of moves hit within est. window")
+        _ln(f"Avg Est Duration    : {dur['avg_est']:.1f} days   "
+            f"Avg Actual: {dur['avg_actual']:.1f} days")
+
+    _bot()
+    print()
+
+
+def _print_open_positions(tracker: PortfolioTracker):
+    pos   = tracker.get_open_positions()
+    today = datetime.now().date()
+    if not pos:
+        print("  📂 No open positions.\n"); return
+    hdrs  = ["#", "Ticker", "Type", "Entry", "Date", "Current", "P&L%", "Day#", "Status"]
+    rows  = []
+    warns = []
+    for i, p in enumerate(pos, 1):
+        ep   = p.get("entry_price") or 0
+        cur  = p.get("current_price") or ep
+        pct  = p.get("current_pct") or 0
+        tgt  = p.get("target_price")
+        stp  = p.get("stop_loss")
+        try:
+            edate = datetime.strptime(p["entry_date"], "%Y-%m-%d").date()
+            day_n = (today - edate).days + 1
+        except Exception:
+            day_n = 0
+        if tgt and cur >= tgt * 0.95:
+            status = "✅ NEAR TGT"
+        elif stp and cur <= stp * 1.05:
+            status = "🔴 NEAR STP"
+            warns.append(f"  ⚠️  {p['ticker']} approaching stop loss (${stp:.2f}).")
+        elif pct > 20:
+            status = "🟢 WIN"
+            warns.append(f"  ✅ {p['ticker']} +{pct:.1f}% — consider partial profits.")
+        elif pct < -8:  status = "🔴 LOSS"
+        elif pct > 0:   status = "🟡 UP"
+        else:           status = "🔴 DOWN"
+        rows.append([i, p["ticker"], (p.get("position_type") or "VIR")[:3],
+                     f"${ep:.2f}", p["entry_date"][5:],
+                     f"${cur:.2f}", f"{pct:+.1f}%", f"D{day_n}", status])
+    print(f"\n  📂 OPEN POSITIONS ({len(pos)} active)")
+    print("  " + "═" * 72)
+    try:
+        print(tabulate(rows, headers=hdrs, tablefmt="rounded_outline"))
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        print(tabulate(rows, headers=hdrs, tablefmt="grid"))
+    for w in warns:
+        print(w)
+    print()
+
+
+def _print_recent_history(logger: CallLogger, n: int = 20):
+    rows = logger.conn.execute(f"""
+        SELECT id, ticker, entry_price, outcome_price, outcome_pct,
+               actual_duration, pattern_detected, catalyst_flag, result, entry_date
+        FROM calls WHERE result IN ('WIN','LOSS','BREAKEVEN')
+        ORDER BY scan_timestamp DESC LIMIT {int(n)}
+    """).fetchall()
+    if not rows:
+        print("  📋 No closed calls yet.\n"); return
+    hdrs = ["#", "ID", "Ticker", "Entry", "Exit", "P&L%", "Days", "Pattern", "Result"]
+    tbl  = []
+    for i, r in enumerate(rows, 1):
+        icon = "✅" if r["result"] == "WIN" else ("❌" if r["result"] == "LOSS" else "➖")
+        pct  = (r["outcome_pct"] or 0) * 100
+        pat  = (r["pattern_detected"] or "—")[:12]
+        cat  = (r["catalyst_flag"] or "")[:8]
+        tbl.append([i, r["id"], r["ticker"],
+                    f"${r['entry_price']:.2f}" if r["entry_price"] else "—",
+                    f"${r['outcome_price']:.2f}" if r["outcome_price"] else "—",
+                    f"{pct:+.1f}%", f"{r['actual_duration'] or '?'}d",
+                    f"{pat}{'+'+ cat if cat else ''}"[:18],
+                    f"{icon} {r['result']}"])
+    print(f"\n  📋 RECENT CALL HISTORY (last {n} closed)")
+    print("  " + "═" * 72)
+    try:
+        print(tabulate(tbl, headers=hdrs, tablefmt="rounded_outline"))
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        print(tabulate(tbl, headers=hdrs, tablefmt="grid"))
+    print()
+
+
+def _print_pattern_performance(analyzer: PerformanceAnalyzer):
+    pats = analyzer.pattern_ranking()
+    if not pats:
+        print("  No pattern data yet.\n"); return
+    hdrs = ["Pattern", "Calls", "Wins", "Win%", "Avg Win", "Avg Loss", "P.Factor"]
+    rows = [[p["pattern"][:22], p["total"], p["wins"],
+             f"{p['win_rate']:.0f}%", f"+{p['avg_win']:.1f}%",
+             f"{p['avg_loss']:.1f}%", f"{min(p['pf'], 99.9):.1f}"]
+            for p in pats]
+    print("\n  📊 WIN RATE BY PATTERN (resolved calls only)")
+    print("  " + "═" * 62)
+    try:
+        print(tabulate(rows, headers=hdrs, tablefmt="rounded_outline"))
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        print(tabulate(rows, headers=hdrs, tablefmt="grid"))
+    print()
+
+
+def _print_calibration(analyzer: PerformanceAnalyzer):
+    cals = analyzer.score_calibration()
+    for c in cals:
+        if abs(c["delta"]) >= 10 and c["n"] >= 5:
+            direction = "overconfident" if c["delta"] < 0 else "underconfident"
+            print(f"\n  ⚠️  CALIBRATION ALERT ({c['range']} band, n={c['n']}):")
+            print(f"     {c['range']} calls are winning {c['actual']:.0f}% "
+                  f"(expected ~{c['expected']:.0f}%) — bot is {direction}.")
+            if c["delta"] < -10:
+                print(f"     Recommend: Raise prob threshold by ~{abs(c['delta']):.0f}% "
+                      f"or reduce position size by 30% in this range.")
+    print()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ══════════════════════════════════════════════════════════════════════════════
+def main():
+    ap = argparse.ArgumentParser(
+        description="Explosive Move & Breakout Scanner — trading_scanner.py",
+        formatter_class=argparse.RawTextHelpFormatter)
+    # Universe
+    ap.add_argument("--universe",      type=str, default="all",
+                    choices=["all","canadian","us",
+                             "tsx","tsxv","cse","neo",
+                             "nasdaq","nyse","cboe","otc",
+                             "smallcap","russell2000","microcap","finviz"],
+                    help="Universe to scan:\n"
+                         "  all       — TSX + TSXV + CSE + NEO + NYSE + NASDAQ + CBOE + OTC (default)\n"
+                         "  canadian  — TSX + TSXV + CSE + NEO/CBOE Canada only\n"
+                         "  us        — NYSE + NASDAQ + CBOE BZX + OTC Select only\n"
+                         "  tsx       — Toronto Stock Exchange (.TO)\n"
+                         "  tsxv      — TSX Venture Exchange (.V)\n"
+                         "  cse       — Canadian Securities Exchange (.CN)\n"
+                         "  neo       — NEO / CBOE Canada (.NE)\n"
+                         "  nasdaq    — NASDAQ-listed only\n"
+                         "  nyse      — NYSE / NYSE Arca / NYSE American only\n"
+                         "  cboe      — CBOE BZX only\n"
+                         "  otc       — OTCQX + OTCQB (Select OTC) only\n"
+                         "  smallcap  — legacy curated small-cap list\n"
+                         "  russell2000 — Russell 2000 from Wikipedia\n"
+                         "  finviz    — Finviz screener results\n"
+                         "  microcap  — micro-cap Finviz screens only")
+    ap.add_argument("--file",          type=str, default=None, metavar="PATH",
+                    help="Load tickers from a .txt or .csv file (one per line or comma-sep)")
+    ap.add_argument("--watchlist",     type=str, default=None,
+                    help="Comma-separated tickers, e.g. AAPL,NVDA,MSFT")
+    # Filters
+    ap.add_argument("--pattern",       type=str, default=None,
+                    help="Filter by pattern name (vcp, cup, wyckoff, htf, ...)")
+    ap.add_argument("--min-prob",      type=int, default=0,
+                    help="Minimum breakout probability %% (default: 0)")
+    ap.add_argument("--min-explosive", type=int, default=0,
+                    help="Minimum explosive score (default: 0)")
+    ap.add_argument("--no-earnings",   action="store_true",
+                    help="Exclude stocks with earnings within 7 days")
+    ap.add_argument("--catalyst-only", action="store_true",
+                    help="Only show stocks with a detected news catalyst")
+    ap.add_argument("--biotech",       action="store_true",
+                    help="Only biotech/pharma stocks")
+    ap.add_argument("--squeeze",       action="store_true",
+                    help="Only short squeeze candidates (short%% > 10%%)")
+    ap.add_argument("--max-float",     type=int, default=None, metavar="M",
+                    help="Max float in millions (e.g. --max-float 50)")
+    ap.add_argument("--max-cap",       type=int, default=None, metavar="M",
+                    help="Max market cap in millions (e.g. --max-cap 500)")
+    ap.add_argument("--no-otc",        action="store_true",
+                    help="Exclude OTC stocks")
+    ap.add_argument("--min-rs",        type=int, default=0, metavar="N",
+                    help="Min RS Rating 1-99 (e.g. --min-rs 80 = top 20%%)")
+    ap.add_argument("--earnings-quality", action="store_true",
+                    help="Only show stocks with accelerating or strong EPS (EQ score >= 65)")
+    ap.add_argument("--premarket",     action="store_true",
+                    help="Only show stocks with pre-market gap > 3%%")
+    # Output
+    ap.add_argument("--top",           type=int, default=15,
+                    help="Rows per table (default: 15)")
+    ap.add_argument("--export",        action="store_true", default=True,
+                    help="Export CSV + TXT (default: True)")
+    # Backtest / learning
+    ap.add_argument("--backtest",      type=int, default=None, metavar="DAYS",
+                    help="Backtest signals from last N trading days")
+    ap.add_argument("--hold",          type=int, default=20, metavar="DAYS",
+                    help="Hold period for backtest (default: 20)")
+    ap.add_argument("--learn",         action="store_true",
+                    help="Update weights after --backtest")
+    ap.add_argument("--reset-weights", action="store_true",
+                    help="Reset learned weights to defaults and exit")
+    ap.add_argument("--weight-status", action="store_true",
+                    help="Show current weight adjustments and exit")
+    ap.add_argument("--debug",          action="store_true",
+                    help="Print detailed errors when a stock fails processing")
+    # Portfolio tracker flags
+    ap.add_argument("--dashboard",      action="store_true",
+                    help="Show performance dashboard and exit")
+    ap.add_argument("--history",        type=int, default=None, metavar="N",
+                    help="Show last N closed calls and exit")
+    ap.add_argument("--open",           action="store_true",
+                    help="Show open virtual positions and exit")
+    ap.add_argument("--add-call",       type=str, default=None, metavar="TICKER",
+                    help="Manually add a call for TICKER (interactive)")
+    ap.add_argument("--close-call",     type=int, default=None, metavar="ID",
+                    help="Manually close call by ID (interactive)")
+    ap.add_argument("--update-call",    type=int, default=None, metavar="ID",
+                    help="Force refresh outcome for a specific call ID")
+    ap.add_argument("--stats",          action="store_true",
+                    help="Show full performance stats summary and exit")
+    ap.add_argument("--stats-pattern",  action="store_true",
+                    help="Show win rate breakdown by pattern and exit")
+    ap.add_argument("--stats-catalyst", action="store_true",
+                    help="Show win rate breakdown by catalyst and exit")
+    ap.add_argument("--export-history", action="store_true",
+                    help="Export full call history to CSV and exit")
+    ap.add_argument("--reset-history",  action="store_true",
+                    help="Delete all call history (prompts for confirmation)")
+    ap.add_argument("--no-dashboard",   action="store_true",
+                    help="Skip dashboard display before scanning")
+    ap.add_argument("--paper-only",     action="store_true",
+                    help="Run scan but do NOT log results to history")
+    ap.add_argument("--calibrate",      action="store_true",
+                    help="Show probability calibration warnings and exit")
+    args = ap.parse_args()
+
+    # ── Weight management shortcuts ───────────────────────────────────────────
+    if args.reset_weights:
+        WeightOptimizer().reset()
+        return
+
+    if args.weight_status:
+        WeightOptimizer.status()
+        return
+
+    # ── Portfolio tracker setup ───────────────────────────────────────────────
+    logger   = CallLogger()
+    tracker  = PortfolioTracker(logger.conn)
+    analyzer = PerformanceAnalyzer(logger.conn)
+
+    # Standalone portfolio commands (no scan needed)
+    if args.dashboard:
+        _print_dashboard(tracker, analyzer, logger)
+        return
+
+    if args.history is not None:
+        _print_recent_history(logger, n=args.history)
+        return
+
+    if args.open:
+        _print_open_positions(tracker)
+        return
+
+    if args.stats:
+        _print_dashboard(tracker, analyzer, logger)
+        _print_pattern_performance(analyzer)
+        cats = analyzer.catalyst_ranking()
+        if cats:
+            hdrs = ["Catalyst", "Calls", "Wins", "Win%", "Avg Win", "Avg Loss"]
+            rows = [[c["catalyst"][:22], c["total"], c["wins"],
+                     f"{c['win_rate']:.0f}%", f"+{c['avg_win']:.1f}%",
+                     f"{c['avg_loss']:.1f}%"] for c in cats]
+            print("\n  📊 WIN RATE BY CATALYST (resolved calls only)")
+            print("  " + "═" * 62)
+            try:
+                print(tabulate(rows, headers=hdrs, tablefmt="rounded_outline"))
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                print(tabulate(rows, headers=hdrs, tablefmt="grid"))
+            print()
+        tips = analyzer.suggest_improvements()
+        if tips:
+            print("  💡 SELF-IMPROVEMENT SUGGESTIONS")
+            print("  " + "─" * 62)
+            for t in tips:
+                print(f"    • {t}")
+            print()
+        return
+
+    if args.stats_pattern:
+        _print_pattern_performance(analyzer)
+        return
+
+    if args.stats_catalyst:
+        cats = analyzer.catalyst_ranking()
+        if cats:
+            hdrs = ["Catalyst", "Calls", "Wins", "Win%", "Avg Win", "Avg Loss"]
+            rows = [[c["catalyst"][:22], c["total"], c["wins"],
+                     f"{c['win_rate']:.0f}%", f"+{c['avg_win']:.1f}%",
+                     f"{c['avg_loss']:.1f}%"] for c in cats]
+            print("\n  📊 WIN RATE BY CATALYST")
+            print("  " + "═" * 62)
+            try:
+                print(tabulate(rows, headers=hdrs, tablefmt="rounded_outline"))
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                print(tabulate(rows, headers=hdrs, tablefmt="grid"))
+            print()
+        return
+
+    if args.export_history:
+        logger.export_history_csv()
+        return
+
+    if args.reset_history:
+        logger.reset_history()
+        return
+
+    if args.calibrate:
+        _print_calibration(analyzer)
+        return
+
+    if args.add_call:
+        logger.add_manual_call(args.add_call)
+        return
+
+    if args.close_call is not None:
+        logger.close_call(args.close_call)
+        return
+
+    if args.update_call is not None:
+        cid = args.update_call
+        row = logger.conn.execute(
+            "SELECT result FROM calls WHERE id=?", (cid,)).fetchone()
+        if not row:
+            print(f"  Call #{cid} not found.")
+        else:
+            logger.conn.execute(
+                "UPDATE calls SET result='PENDING' WHERE id=?", (cid,))
+            logger.conn.commit()
+            n = logger.update_calls()
+            print(f"  ✅ Updated {n} call(s).")
+        return
+
+    scanner        = BreakoutScanner()
+    scanner.args   = args
+    scanner._debug = getattr(args, "debug", False)
+
+    # ── Backtest mode ─────────────────────────────────────────────────────────
+    if args.backtest:
+        if args.watchlist:
+            tickers = [t.strip().upper() for t in args.watchlist.split(",")]
+            print(f"\nCustom watchlist: {tickers}")
+        else:
+            print("\nFetching S&P 500 ticker list from Wikipedia...")
+            tickers = scanner._fetch_sp500()
+            print(f"Loaded {len(tickers)} tickers")
+
+        print("Fetching SPY market data...")
+        scanner.spy = scanner._fetch_spy()
+
+        bt = BacktestEngine(scanner, days=args.backtest, hold=args.hold)
+        bt.run(tickers)
+        bt.print_report()
+        bt.to_csv()
+
+        if args.learn:
+            print("Updating weights from backtest results...")
+            WeightOptimizer().update(bt.signals)
+        else:
+            print("  Tip: add --learn to update modifier weights from these results.\n")
+        return
+
+    # ── Normal scan mode ──────────────────────────────────────────────────────
+
+    # Pre-scan: refresh pending outcomes, then show dashboard
+    print("  [Portfolio tracker: refreshing pending outcomes...]")
+    n_updated = logger.update_calls()
+    if n_updated:
+        print(f"  [Updated {n_updated} call outcome(s)]")
+
+    if not args.no_dashboard:
+        _print_dashboard(tracker, analyzer, logger)
+        _print_open_positions(tracker)
+        _print_calibration(analyzer)
+
+    if LEARNED_WEIGHTS.get("samples", 0) > 0:
+        ts = LEARNED_WEIGHTS.get("last_updated", "unknown")
+        print(f"  [Using learned weights — {LEARNED_WEIGHTS['samples']} backtest samples, updated {ts}]")
+
+    scanner.run()
+
+    # Post-scan: log qualifying results
+    if not args.paper_only and hasattr(scanner, "results") and scanner.results:
+        import uuid as _uuid2
+        scan_id = str(_uuid2.uuid4())[:8]
+        spy_df  = getattr(scanner, "spy", None)
+        meta    = {
+            "scan_id":       scan_id,
+            "spy":           spy_df,
+            "universe_size": len(scanner.results),
+        }
+        n_logged = logger.log_scan_results(scanner.results, meta)
+        if n_logged:
+            print(f"\n  📝 Portfolio tracker: logged {n_logged} new call(s) to history.")
+    elif args.paper_only:
+        print("\n  [--paper-only: results not logged to history]")
+
+
+if __name__ == "__main__":
+    main()

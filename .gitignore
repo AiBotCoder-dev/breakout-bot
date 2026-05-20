@@ -1,0 +1,44 @@
+# Database & scan outputs
+*.db
+*.db-shm
+*.db-wal
+scan_results_*.csv
+scan_results_*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Secrets & credentials
+.env
+*.env
+secrets.toml
+.streamlit/secrets.toml
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log

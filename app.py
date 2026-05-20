@@ -126,7 +126,15 @@ class PgAdapter:
             adapted = adapted.rstrip().rstrip(";") + " RETURNING id"
 
         cur = self._conn.cursor()
-        cur.execute(adapted, params or ())
+        try:
+            cur.execute(adapted, params or ())
+        except Exception:
+            # Roll back the failed transaction so the connection stays usable
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            raise
 
         if add_returning:
             row           = cur.fetchone()

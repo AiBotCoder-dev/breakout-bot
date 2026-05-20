@@ -1379,6 +1379,7 @@ with tab_paper:
 # ──────────────────────────────────────────────────────────────────────────────
 with tab_fees:
     conn, _mode = get_db()
+    _PAPER_BUDGET = ts._PAPER_BUDGET
 
     fee_rows = conn.execute(
         "SELECT * FROM fees ORDER BY transaction_date ASC, id ASC"
@@ -1513,5 +1514,3 @@ with tab_fees:
     else:
         st.info("No fee transactions recorded yet. "
                 "Paper trades will appear here once the portfolio is active.", icon="💰")
-
-    _PAPER_BUDGET = ts._PAPER_BUDGET

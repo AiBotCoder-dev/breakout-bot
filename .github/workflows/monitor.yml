@@ -1,0 +1,38 @@
+name: Position Monitor
+
+# Runs every 5 minutes Mon-Fri during market hours.
+# Schedule is in UTC:
+#   13:30-20:00 UTC  =  9:30 AM - 4:00 PM EDT  (summer)
+#   14:30-21:00 UTC  =  9:30 AM - 4:00 PM EST  (winter)
+# We bracket 13:00-21:00 UTC to cover both seasons safely.
+# The monitor.py script uses MarketClock to skip CLOSED/AVOID windows.
+
+on:
+  schedule:
+    - cron: '*/5 13-20 * * 1-5'   # every 5 min, 13:00-20:59 UTC, Mon-Fri
+
+  workflow_dispatch:               # also allow manual trigger from GitHub UI
+
+jobs:
+  monitor:
+    name: Check open positions
+    runs-on: ubuntu-latest
+    timeout-minutes: 4             # kill the job if it hangs
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run position monitor
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python monitor.py

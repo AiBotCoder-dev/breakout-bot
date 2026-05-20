@@ -176,45 +176,88 @@ import trading_scanner as ts
 # ── Theme / CSS ───────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-  /* dark background override */
+  /* ── Base ── */
   .stApp { background-color: #0d1117; }
-  section[data-testid="stSidebar"] { background-color: #161b22; }
+  section[data-testid="stSidebar"] { background-color: #161b22; border-right: 1px solid #21262d; }
+  .stTabs [data-baseweb="tab-list"] { background: #161b22; border-radius: 8px; padding: 4px; gap: 4px; }
+  .stTabs [data-baseweb="tab"] { border-radius: 6px; color: #8b949e; font-size: 0.85rem; }
+  .stTabs [aria-selected="true"] { background: #1c2333 !important; color: #e6edf3 !important; }
 
-  /* KPI cards */
+  /* ── KPI cards ── */
   .kpi-card {
-    background: #1c2333;
-    border: 1px solid #30363d;
-    border-radius: 10px;
-    padding: 18px 20px;
-    text-align: center;
+    background: #1c2333; border: 1px solid #30363d;
+    border-radius: 10px; padding: 18px 20px; text-align: center;
   }
-  .kpi-label { font-size: 0.78rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.06em; }
+  .kpi-label { font-size: 0.72rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.07em; }
   .kpi-value { font-size: 1.9rem; font-weight: 700; margin: 4px 0 0; }
-  .kpi-green  { color: #3fb950; }
-  .kpi-red    { color: #f85149; }
-  .kpi-yellow { color: #e3b341; }
-  .kpi-blue   { color: #58a6ff; }
+  .kpi-green  { color: #3fb950; } .kpi-red { color: #f85149; }
+  .kpi-yellow { color: #e3b341; } .kpi-blue { color: #58a6ff; }
 
-  /* section headers */
+  /* ── Section headers ── */
   .section-hdr {
-    font-size: 0.75rem; font-weight: 600;
-    color: #8b949e; letter-spacing: 0.08em;
-    text-transform: uppercase;
-    border-bottom: 1px solid #21262d;
-    padding-bottom: 6px; margin-bottom: 12px;
+    font-size: 0.72rem; font-weight: 700; color: #8b949e;
+    letter-spacing: 0.09em; text-transform: uppercase;
+    border-bottom: 1px solid #21262d; padding-bottom: 6px; margin-bottom: 14px;
   }
 
-  /* status badges */
-  .badge {
-    display: inline-block; border-radius: 4px;
-    padding: 2px 8px; font-size: 0.72rem; font-weight: 600;
-  }
+  /* ── Badges ── */
+  .badge { display:inline-block; border-radius:4px; padding:2px 8px; font-size:0.72rem; font-weight:600; }
   .badge-green  { background:#1a4428; color:#3fb950; }
   .badge-red    { background:#4c1b1b; color:#f85149; }
   .badge-yellow { background:#4a3b00; color:#e3b341; }
   .badge-blue   { background:#0d2d6b; color:#58a6ff; }
 
-  /* hide streamlit chrome */
+  /* ── Stock cards ── */
+  .stock-card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+    padding: 16px 18px; margin-bottom: 4px; position: relative; overflow: hidden;
+    transition: border-color 0.15s;
+  }
+  .stock-card:hover { border-color: #58a6ff; }
+  .stock-card::before { content:''; position:absolute; top:0; left:0; right:0; height:3px; }
+  .card-high::before   { background: linear-gradient(90deg,#3fb950,#26a641); }
+  .card-medium::before { background: linear-gradient(90deg,#e3b341,#d4a017); }
+  .card-low::before    { background: linear-gradient(90deg,#f85149,#da3633); }
+
+  .card-ticker { font-size:1.35rem; font-weight:800; color:#e6edf3; letter-spacing:-0.02em; }
+  .card-price  { font-size:1.05rem; color:#8b949e; margin-left:8px; }
+  .card-pattern { font-size:0.82rem; color:#58a6ff; margin-top:5px; font-weight:600; }
+  .card-explosive { font-size:0.76rem; color:#e3b341; margin-top:3px; }
+  .card-divider { border:none; border-top:1px solid #21262d; margin:10px 0; }
+
+  .trade-grid {
+    display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:6px; margin:6px 0 8px;
+  }
+  .tg-label { font-size:0.62rem; color:#8b949e; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:2px; }
+  .tg-val   { font-size:0.92rem; font-weight:700; color:#e6edf3; }
+  .tg-green { color:#3fb950 !important; }
+  .tg-red   { color:#f85149 !important; }
+  .tg-blue  { color:#58a6ff !important; }
+
+  .card-move     { font-size:0.76rem; color:#3fb950; margin-top:4px; }
+  .card-catalyst { font-size:0.76rem; color:#e3b341; margin-top:5px; }
+  .card-risk     { font-size:0.74rem; color:#f85149; margin-top:3px; }
+
+  /* ── Market context bar ── */
+  .ctx-bar {
+    display:flex; gap:12px; background:#161b22; border:1px solid #30363d;
+    border-radius:10px; padding:12px 18px; margin-bottom:16px; flex-wrap:wrap;
+  }
+  .ctx-item { text-align:center; min-width:80px; }
+  .ctx-label { font-size:0.65rem; color:#8b949e; text-transform:uppercase; letter-spacing:0.06em; }
+  .ctx-val   { font-size:1.1rem; font-weight:700; color:#e6edf3; }
+
+  /* ── Page header ── */
+  .page-header {
+    background: linear-gradient(135deg, #161b22 0%, #1c2333 100%);
+    border: 1px solid #30363d; border-radius: 12px;
+    padding: 20px 24px; margin-bottom: 20px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .page-title { font-size:1.6rem; font-weight:800; color:#e6edf3; margin:0; }
+  .page-sub   { font-size:0.82rem; color:#8b949e; margin-top:4px; }
+
+  /* ── Hide Streamlit chrome ── */
   #MainMenu, footer { visibility: hidden; }
   [data-testid="stToolbar"] { display:none; }
 </style>
@@ -233,6 +276,95 @@ def kpi(label: str, value: str, colour: str = "blue"):
 
 def badge(text: str, colour: str = "blue"):
     return f'<span class="badge badge-{colour}">{text}</span>'
+
+def _render_stock_card(r: dict):
+    ticker   = r.get("ticker", "")
+    price    = r.get("price", 0) or 0
+    prob     = r.get("probability", 0) or 0
+    pattern  = r.get("pattern", "No Pattern") or "No Pattern"
+    score    = r.get("explosive_score", 0) or 0
+    grade    = r.get("explosive_grade", "") or ""
+    stop     = r.get("stop_price") or 0
+    target   = r.get("tgt_price") or 0
+    rr       = r.get("rr", 0) or 0
+    move_lo  = r.get("move_low", 0) or 0
+    move_hi  = r.get("move_high", 0) or 0
+    catalyst = r.get("top_flag", "") or ""
+    earn     = r.get("earnings_risk", "No") or "No"
+    flt      = r.get("expl_float", 0) or 0
+    pct52    = (r.get("pct_52w", 0) or 0) * 100
+    timing   = r.get("timing", {}) or {}
+    min_d    = timing.get("min_days", "")
+    max_d    = timing.get("max_days", "")
+    avwap    = r.get("avwap_above")
+
+    if prob >= 75:
+        card_cls, p_bg, p_col, conf = "card-high",   "#1a4428", "#3fb950", "HIGH CONF"
+    elif prob >= 60:
+        card_cls, p_bg, p_col, conf = "card-medium", "#4a3b00", "#e3b341", "MEDIUM"
+    else:
+        card_cls, p_bg, p_col, conf = "card-low",    "#4c1b1b", "#f85149", "SPECULATIVE"
+
+    expl_html = (f'<div class="card-explosive">⚡ Explosive Score {score:.0f}/100'
+                 f'{"  ·  Grade " + grade if grade else ""}</div>') if score >= 40 else ""
+
+    stop_str   = f"${stop:.2f}"   if stop   else "—"
+    tgt_str    = f"${target:.2f}" if target else "—"
+    rr_str     = f"{rr:.1f}:1"   if rr     else "—"
+
+    move_html = ""
+    if move_lo or move_hi:
+        dur = f"  ·  {min_d}–{max_d} day hold" if min_d and max_d else ""
+        move_html = f'<div class="card-move">↑ Estimated move: +{move_lo:.0f}% – {move_hi:.0f}%{dur}</div>'
+
+    cat_html = f'<div class="card-catalyst">⚡ Catalyst: {catalyst}</div>' if catalyst else ""
+
+    risks = []
+    if earn and earn != "No":
+        risks.append(f"⚠ Earnings risk: {earn}")
+    if flt and flt < 5_000_000:
+        risks.append("⚠ Very low float — high volatility possible")
+    if pct52 > 90:
+        risks.append("⚠ Extended near 52-week high — late entry risk")
+    if avwap is False:
+        risks.append("⚠ Trading below AVWAP — bearish bias")
+    risk_html = "".join(f'<div class="card-risk">{rk}</div>' for rk in risks)
+
+    st.markdown(f"""
+    <div class="stock-card {card_cls}">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">
+        <div>
+          <span class="card-ticker">{ticker}</span>
+          <span class="card-price">${price:.2f}</span>
+        </div>
+        <div style="background:{p_bg};color:{p_col};padding:4px 12px;border-radius:20px;
+                    font-size:0.72rem;font-weight:700;white-space:nowrap;flex-shrink:0;">
+          {prob}% &nbsp;{conf}
+        </div>
+      </div>
+      <div class="card-pattern">{pattern}</div>
+      {expl_html}
+      <hr class="card-divider">
+      <div class="tg-label" style="margin-bottom:6px;">Trade Plan</div>
+      <div class="trade-grid">
+        <div><div class="tg-label">Entry</div>
+             <div class="tg-val">${price:.2f}</div></div>
+        <div><div class="tg-label">Stop Loss</div>
+             <div class="tg-val tg-red">{stop_str}</div></div>
+        <div><div class="tg-label">Target</div>
+             <div class="tg-val tg-green">{tgt_str}</div></div>
+        <div><div class="tg-label">R : R</div>
+             <div class="tg-val tg-blue">{rr_str}</div></div>
+      </div>
+      {move_html}
+      {cat_html}
+      {risk_html}
+    </div>
+    """, unsafe_allow_html=True)
+
+    if st.button("📈 View Chart", key=f"card_{ticker}", use_container_width=True):
+        st.session_state.selected = ticker
+        st.rerun()
 
 def _is_streamlit_cloud() -> bool:
     return (
@@ -577,122 +709,115 @@ with tab_dash:
 # ──────────────────────────────────────────────────────────────────────────────
 with tab_results:
     if not st.session_state.scan_ran:
-        st.info("Configure your scan in the sidebar and click **🚀 Run Scan**.",
-                icon="🔍")
+        st.markdown("""
+        <div style="text-align:center; padding:60px 20px;">
+          <div style="font-size:3rem; margin-bottom:16px;">🔍</div>
+          <div style="font-size:1.2rem; font-weight:700; color:#e6edf3; margin-bottom:8px;">
+            No scan results yet
+          </div>
+          <div style="font-size:0.9rem; color:#8b949e;">
+            Configure your universe and filters in the sidebar, then click
+            <strong style="color:#58a6ff;">🚀 Run Scan</strong> to find opportunities.
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
     else:
         results = st.session_state.results
         ctx     = st.session_state.market_ctx
 
-        # Market context bar
-        c1, c2, c3, c4 = st.columns(4)
-        with c1: st.metric("Universe (raw)", f"{ctx.get('spy_raw',0):,}")
-        with c2: st.metric("Passed filter",  f"{ctx.get('filtered',0):,}")
-        with c3: st.metric("Fully analyzed", f"{ctx.get('advanced',0):,}")
-        with c4: st.metric("Qualified",      str(len(results)))
+        # ── Market context bar ────────────────────────────────────────────────
+        raw      = ctx.get("spy_raw", 0)
+        filtered = ctx.get("filtered", 0)
+        advanced = ctx.get("advanced", 0)
+        n_qual   = len(results)
+        n_expl   = sum(1 for r in results if (r.get("explosive_score") or 0) >= 40)
+        n_high   = sum(1 for r in results if (r.get("probability") or 0) >= 75)
 
-        st.divider()
+        st.markdown(f"""
+        <div class="ctx-bar">
+          <div class="ctx-item">
+            <div class="ctx-label">Universe</div>
+            <div class="ctx-val">{raw:,}</div>
+          </div>
+          <div style="color:#30363d; font-size:1.2rem; align-self:center;">→</div>
+          <div class="ctx-item">
+            <div class="ctx-label">Quick filter</div>
+            <div class="ctx-val">{filtered:,}</div>
+          </div>
+          <div style="color:#30363d; font-size:1.2rem; align-self:center;">→</div>
+          <div class="ctx-item">
+            <div class="ctx-label">Deep analyzed</div>
+            <div class="ctx-val">{advanced:,}</div>
+          </div>
+          <div style="color:#30363d; font-size:1.2rem; align-self:center;">→</div>
+          <div class="ctx-item">
+            <div class="ctx-label">Qualified</div>
+            <div class="ctx-val" style="color:#58a6ff;">{n_qual}</div>
+          </div>
+          <div style="margin-left:auto; display:flex; gap:16px; align-items:center;">
+            <div class="ctx-item">
+              <div class="ctx-label">⚡ Explosive</div>
+              <div class="ctx-val" style="color:#e3b341;">{n_expl}</div>
+            </div>
+            <div class="ctx-item">
+              <div class="ctx-label">🟢 High conf</div>
+              <div class="ctx-val" style="color:#3fb950;">{n_high}</div>
+            </div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
 
         if not results:
-            st.warning("No stocks qualified with current filters.", icon="🚫")
+            st.warning("No stocks qualified with the current filters.", icon="🚫")
         else:
-            # ── Explosive candidates ──────────────────────────────────────────
-            expl = [r for r in results if r.get("explosive_score", 0) >= 40]
-            expl.sort(key=lambda x: x.get("explosive_score", 0), reverse=True)
+            # ── Sort & filter controls ────────────────────────────────────────
+            fc1, fc2, fc3 = st.columns([3, 1.4, 1.4])
+            with fc1:
+                search = st.text_input("🔎 Filter by ticker or pattern", "",
+                                       placeholder="e.g.  AAPL  or  Cup")
+            with fc2:
+                sort_by = st.selectbox("Sort by",
+                    ["Probability", "Explosive Score", "R:R Ratio"])
+            with fc3:
+                show_only = st.selectbox("Show",
+                    ["All results", "High conf only (≥75%)", "Explosive only"])
 
-            st.markdown('<div class="section-hdr">⚡ Explosive Move Candidates</div>',
-                        unsafe_allow_html=True)
-            if not expl:
-                st.caption("No explosive candidates (score ≥ 40) in this scan.")
+            # Apply search
+            view = results
+            if search.strip():
+                s = search.strip().upper()
+                view = [r for r in view if
+                        s in (r.get("ticker") or "").upper() or
+                        s in (r.get("pattern") or "").upper()]
+
+            # Apply show filter
+            if show_only == "High conf only (≥75%)":
+                view = [r for r in view if (r.get("probability") or 0) >= 75]
+            elif show_only == "Explosive only":
+                view = [r for r in view if (r.get("explosive_score") or 0) >= 40]
+
+            # Apply sort
+            if sort_by == "Explosive Score":
+                view = sorted(view, key=lambda x: x.get("explosive_score") or 0, reverse=True)
+            elif sort_by == "R:R Ratio":
+                view = sorted(view, key=lambda x: x.get("rr") or 0, reverse=True)
             else:
-                expl_rows = []
-                for r in expl:
-                    mc  = r.get("market_cap", 0)
-                    fs  = r.get("expl_float", 0)
-                    expl_rows.append({
-                        "Ticker":    r["ticker"],
-                        "Price":     f"${r['price']:.2f}",
-                        "Mkt Cap":   (f"${mc/1e9:.1f}B" if mc >= 1e9
-                                      else f"${mc/1e6:.0f}M" if mc >= 1e6 else "—"),
-                        "Float":     (f"{fs/1e6:.1f}M" if fs >= 1e6
-                                      else f"{fs/1e3:.0f}K" if fs > 0 else "—"),
-                        "Short %":   (f"{r.get('expl_short_pct') or 0:.0%}"
-                                      if r.get("expl_short_pct") else "—"),
-                        "Score":     f"{r.get('explosive_score') or 0:.0f}/100",
-                        "Grade":     r.get("explosive_grade") or "",
-                        "Est Move":  f"+{r.get('move_low') or 0:.0f}%–{r.get('move_high') or 0:.0f}%",
-                        "Pattern":   (r.get("pattern") or "—")[:16],
-                        "Prob %":    f"{r.get('probability') or 0}%",
-                        "Catalyst":  (r.get("top_flag","")[:20] if r.get("top_flag") else "—"),
-                    })
-                df_expl = pd.DataFrame(expl_rows)
-                sel_expl = st.dataframe(
-                    df_expl, use_container_width=True, hide_index=True,
-                    on_select="rerun", selection_mode="single-row")
-                if sel_expl.selection.rows:
-                    ticker = expl_rows[sel_expl.selection.rows[0]]["Ticker"]
-                    st.session_state.selected = ticker
-                    st.success(f"Selected **{ticker}** — switch to the 📈 Stock Chart tab to view.", icon="✅")
+                view = sorted(view, key=lambda x: x.get("probability") or 0, reverse=True)
 
-            # ── Breakout probability table ─────────────────────────────────────
-            st.markdown("<br>", unsafe_allow_html=True)
-            st.markdown('<div class="section-hdr">📊 Breakout Probability Rankings</div>',
-                        unsafe_allow_html=True)
-
-            prob_rows = []
-            for r in results:
-                pm  = r.get("pm_gap", 0) or 0
-                prob_rows.append({
-                    "Ticker":   r["ticker"],
-                    "Price":    f"${r['price']:.2f}",
-                    "RS":       r.get("rs_rating", "—"),
-                    "EQ":       r.get("eq_grade", "—"),
-                    "Flow":     r.get("options_score", "—"),
-                    "Prob %":   r.get("probability", 0),
-                    "Band":     r.get("conf_label", ""),
-                    "Pattern":  (r.get("pattern") or "No Pattern")[:18],
-                    "AVWAP":    ("▲ Above" if r.get("avwap_above") else "▼ Below"),
-                    "PM Gap":   f"+{pm:.1%}" if pm > 0.005 else ("—" if pm == 0 else f"{pm:.1%}"),
-                    "% < 52W":  f"{(r.get('pct_52w') or 0)*100:.1f}%",
-                    "R:R":      f"{r.get('rr') or 0:.1f}:1",
-                    "Earnings": r.get("earnings_risk") or "No",
-                })
-            df_prob = pd.DataFrame(prob_rows)
-
-            # colour prob column
-            def _prob_colour(val):
-                if val >= 75: return "background-color:#1a4428; color:#3fb950"
-                if val >= 60: return "background-color:#2d3a1a; color:#e3b341"
-                return "background-color:#3a1a1a; color:#f85149"
-
-            sel_prob = st.dataframe(
-                df_prob.style.map(_prob_colour, subset=["Prob %"]),
-                use_container_width=True, hide_index=True,
-                on_select="rerun", selection_mode="single-row")
-
-            if sel_prob.selection.rows:
-                ticker = prob_rows[sel_prob.selection.rows[0]]["Ticker"]
-                st.session_state.selected = ticker
-                st.success(f"Selected **{ticker}** — switch to the 📈 Stock Chart tab to view.", icon="✅")
-
-            # ── Urgency summary (timing) ───────────────────────────────────────
-            timed = [r for r in results if r.get("timing")]
-            if timed:
+            if not view:
+                st.info("No results match your filter.", icon="🔍")
+            else:
+                st.caption(f"Showing {len(view)} stock{'s' if len(view) != 1 else ''}")
                 st.markdown("<br>", unsafe_allow_html=True)
-                st.markdown('<div class="section-hdr">⏱ Trade Timing Summary</div>',
-                            unsafe_allow_html=True)
-                t_rows = []
-                for r in timed:
-                    t = r["timing"]
-                    t_rows.append({
-                        "Ticker":   r["ticker"],
-                        "Urgency":  t.get("urgency_display", "—"),
-                        "Duration": (f"{t.get('min_days','?')}–{t.get('max_days','?')}d"
-                                     if t.get("min_days") else "—"),
-                        "Peak Day": (f"D{t.get('peak_day')}" if t.get("peak_day") else "—"),
-                        "Type":     t.get("trade_type", "—"),
-                    })
-                st.dataframe(pd.DataFrame(t_rows),
-                             use_container_width=True, hide_index=True)
+
+                # ── Card grid (3 columns) ─────────────────────────────────────
+                cols_per_row = 3
+                for i in range(0, len(view), cols_per_row):
+                    batch = view[i : i + cols_per_row]
+                    cols  = st.columns(cols_per_row)
+                    for col, r in zip(cols, batch):
+                        with col:
+                            _render_stock_card(r)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

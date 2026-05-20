@@ -567,6 +567,36 @@ if run_btn:
         if n:
             st.sidebar.success(f"Logged {n} new call(s) to tracker.")
 
+    # Post-scan: auto-trade paper portfolio
+    all_results = scanner.results + getattr(scanner, "rejected_results", [])
+    paper = ts.PaperTradingEngine(conn)
+    opened = paper.auto_trade(all_results)
+    closed = getattr(paper, "_last_closed", [])
+    if opened:
+        st.sidebar.success(
+            f"💼 Paper portfolio: opened {len(opened)} new position(s) — "
+            + ", ".join(o["ticker"] for o in opened)
+        )
+    elif not paper_only:
+        # explain why no trades were opened
+        n_pass  = sum(1 for r in all_results if r.get("trade_filter_pass"))
+        n_qual  = sum(1 for r in all_results
+                      if r.get("trade_filter_pass")
+                      and (r.get("explosive_score", 0) >= 70
+                           or r.get("probability", 0) >= 65))
+        port    = paper.get_summary()
+        if port["open_positions"] >= ts._PAPER_MAX_POSITIONS:
+            st.sidebar.info("💼 Paper portfolio full (5/5 positions).")
+        elif port["available_cash"] < ts._PAPER_MIN_CASH:
+            st.sidebar.info(f"💼 Not enough cash (${port['available_cash']:.2f}).")
+        elif n_pass == 0:
+            st.sidebar.info("💼 No trades passed R/R ≥ 2.0 + reward ≥ 20% filter.")
+        elif n_qual == 0:
+            st.sidebar.info(
+                f"💼 {n_pass} trade(s) passed R/R filter but none had "
+                f"explosive score ≥ 70 or probability ≥ 65%."
+            )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS

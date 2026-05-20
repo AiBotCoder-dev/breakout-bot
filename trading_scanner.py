@@ -4160,11 +4160,11 @@ class PaperTradingEngine:
         row = self.conn.execute(
             "SELECT * FROM paper_state WHERE id=1").fetchone()
         if row:
-            self._cash          = row["available_cash"]
-            self._fees_paid     = row["total_fees_paid"]
-            self._realized_pnl  = row["realized_pnl"]
-            self._trades        = row["trades_made"]
-            self._starting      = row["starting_capital"]
+            self._cash          = float(row["available_cash"]   or 0)
+            self._fees_paid     = float(row["total_fees_paid"]  or 0)
+            self._realized_pnl  = float(row["realized_pnl"]     or 0)
+            self._trades        = int(  row["trades_made"]       or 0)
+            self._starting      = float(row["starting_capital"] or _PAPER_BUDGET)
         else:
             self._cash         = _PAPER_BUDGET
             self._fees_paid    = 0.0
@@ -4172,6 +4172,46 @@ class PaperTradingEngine:
             self._trades       = 0
             self._starting     = _PAPER_BUDGET
             self._save_state()
+
+        # ── Self-healing: fix stale state left by the old ON CONFLICT DO NOTHING bug ──
+        # If cash looks untouched (≈ starting capital) but open positions exist,
+        # the paper_state row was never properly updated. Recalculate from the
+        # actual paper_portfolio records and overwrite the stale row.
+        try:
+            positions = self.open_positions
+            invested  = sum((p.get("gross_invested") or 0) for p in positions)
+            if invested > 10 and self._cash >= self._starting * 0.98:
+                self._recalculate_from_portfolio()
+        except Exception:
+            pass
+
+    def _recalculate_from_portfolio(self):
+        """Derive accurate cash / fees / realized P&L from actual DB records."""
+        try:
+            # Open positions
+            positions = self.open_positions
+            invested  = sum((p.get("gross_invested") or 0) for p in positions)
+            open_fees = sum((p.get("buy_fee")         or 0) for p in positions)
+
+            # Closed positions
+            cr = self.conn.execute("""
+                SELECT COUNT(*),
+                       SUM(COALESCE(net_pnl,0)),
+                       SUM(COALESCE(buy_fee,0) + COALESCE(sell_fee,0))
+                FROM paper_portfolio WHERE status='CLOSED'
+            """).fetchone()
+            n_closed    = int(  cr[0] or 0) if cr else 0
+            closed_pnl  = float(cr[1] or 0) if cr else 0.0
+            closed_fees = float(cr[2] or 0) if cr else 0.0
+
+            self._realized_pnl = closed_pnl
+            self._fees_paid    = open_fees + closed_fees
+            self._trades       = len(positions) + n_closed
+            # cash = what's left after all open investment, plus any realised gains
+            self._cash         = max(0.0, self._starting + closed_pnl - invested)
+            self._save_state()
+        except Exception:
+            pass
 
     def _save_state(self):
         # DELETE + INSERT avoids the PostgreSQL "ON CONFLICT DO NOTHING" translation

@@ -4332,6 +4332,8 @@ _PAPER_MIN_CASH      = 100.0
 class PaperTradingEngine:
     """$1,000 paper portfolio that auto-trades top signals with fee simulation."""
 
+    _migrated_conns: set = set()   # tracks which connections have been migrated
+
     def __init__(self, conn):
         self.conn = conn
         self.fee  = _FEE_ENGINE
@@ -4406,19 +4408,26 @@ class PaperTradingEngine:
             );
         """)
         # ── Schema migration: add new columns to existing databases ───────────
-        _new_cols = [
-            ("paper_portfolio", "t1_price",         "REAL"),
-            ("paper_portfolio", "t1_hit",            "INTEGER DEFAULT 0"),
-            ("paper_portfolio", "trailing_stop",     "REAL"),
-            ("paper_portfolio", "highest_since_t1",  "REAL"),
-            ("paper_portfolio", "atr_value",         "REAL"),
-            ("paper_portfolio", "sector",            "TEXT"),
-        ]
-        for _tbl, _col, _typ in _new_cols:
-            try:
-                self.conn.execute(f"ALTER TABLE {_tbl} ADD COLUMN {_col} {_typ}")
-            except Exception:
-                pass   # column already exists — safe to ignore
+        # Use the connection id as key so migrations only run once per
+        # connection object — avoids repeated ALTER TABLE failures on every
+        # PaperTradingEngine instantiation when using a cached connection.
+        _conn_key = id(self.conn)
+        if _conn_key not in PaperTradingEngine._migrated_conns:
+            PaperTradingEngine._migrated_conns.add(_conn_key)
+            _new_cols = [
+                ("paper_portfolio", "t1_price",         "REAL"),
+                ("paper_portfolio", "t1_hit",            "INTEGER DEFAULT 0"),
+                ("paper_portfolio", "trailing_stop",     "REAL"),
+                ("paper_portfolio", "highest_since_t1",  "REAL"),
+                ("paper_portfolio", "atr_value",         "REAL"),
+                ("paper_portfolio", "sector",            "TEXT"),
+            ]
+            for _tbl, _col, _typ in _new_cols:
+                try:
+                    self.conn.execute(
+                        f"ALTER TABLE {_tbl} ADD COLUMN {_col} {_typ}")
+                except Exception:
+                    pass   # column already exists — safe to ignore
 
     def _load_state(self):
         row = self.conn.execute(

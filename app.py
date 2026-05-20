@@ -154,12 +154,17 @@ class PgAdapter:
 
     def executescript(self, sql: str):
         adapted = self._adapt(sql)
-        cur     = self._conn.cursor()
         for stmt in _re.split(r";[ \t]*\n?", adapted):
             stmt = stmt.strip()
             if not stmt or stmt.startswith("--"):
                 continue
+            # Rollback any prior failed state, then get a fresh cursor per statement
             try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            try:
+                cur = self._conn.cursor()
                 cur.execute(stmt)
                 self._conn.commit()
             except Exception:

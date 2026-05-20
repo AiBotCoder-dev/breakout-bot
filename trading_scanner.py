@@ -4174,12 +4174,19 @@ class PaperTradingEngine:
             self._save_state()
 
     def _save_state(self):
+        # DELETE + INSERT avoids the PostgreSQL "ON CONFLICT DO NOTHING" translation
+        # that PgAdapter applies to INSERT OR REPLACE — which silently ignores updates
+        # once row id=1 already exists.  This pattern works for both SQLite and PG.
+        try:
+            self.conn.execute("DELETE FROM paper_state WHERE id=1")
+        except Exception:
+            pass
         self.conn.execute("""
-            INSERT OR REPLACE INTO paper_state
+            INSERT INTO paper_state
             (id, total_capital, available_cash, total_fees_paid,
              realized_pnl, trades_made, starting_capital)
-            VALUES (1,?,?,?,?,?,?)
-        """, (self.total_capital, self._cash, self._fees_paid,
+            VALUES (?,?,?,?,?,?,?)
+        """, (1, self.total_capital, self._cash, self._fees_paid,
               self._realized_pnl, self._trades, self._starting))
         self.conn.commit()
 

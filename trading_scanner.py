@@ -43,7 +43,7 @@ def _ensure(pkg, import_name=None):
 
 import time
 
-for _pkg, _mod in [("yfinance", "yfinance"), ("pandas_ta", "pandas_ta"),
+for _pkg, _mod in [("yfinance", "yfinance"),
                    ("tqdm", "tqdm"), ("tabulate", "tabulate"),
                    ("scipy", "scipy"), ("numpy", "numpy"),
                    ("requests", "requests"), ("beautifulsoup4", "bs4"),
@@ -51,7 +51,10 @@ for _pkg, _mod in [("yfinance", "yfinance"), ("pandas_ta", "pandas_ta"),
     _ensure(_pkg, _mod)
 
 import yfinance as yf
-import pandas_ta as ta
+try:
+    import pandas_ta as ta
+except Exception:
+    ta = None
 from scipy.signal import argrelextrema
 from tabulate import tabulate
 from tqdm import tqdm

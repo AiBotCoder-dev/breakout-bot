@@ -448,13 +448,13 @@ with tab_results:
                                       else f"${mc/1e6:.0f}M" if mc >= 1e6 else "—"),
                         "Float":     (f"{fs/1e6:.1f}M" if fs >= 1e6
                                       else f"{fs/1e3:.0f}K" if fs > 0 else "—"),
-                        "Short %":   (f"{r.get('expl_short_pct',0):.0%}"
+                        "Short %":   (f"{r.get('expl_short_pct') or 0:.0%}"
                                       if r.get("expl_short_pct") else "—"),
-                        "Score":     f"{r.get('explosive_score',0):.0f}/100",
-                        "Grade":     r.get("explosive_grade", ""),
-                        "Est Move":  f"+{r.get('move_low',0):.0f}%–{r.get('move_high',0):.0f}%",
-                        "Pattern":   r.get("pattern", "—")[:16],
-                        "Prob %":    f"{r.get('probability',0)}%",
+                        "Score":     f"{r.get('explosive_score') or 0:.0f}/100",
+                        "Grade":     r.get("explosive_grade") or "",
+                        "Est Move":  f"+{r.get('move_low') or 0:.0f}%–{r.get('move_high') or 0:.0f}%",
+                        "Pattern":   (r.get("pattern") or "—")[:16],
+                        "Prob %":    f"{r.get('probability') or 0}%",
                         "Catalyst":  (r.get("top_flag","")[:20] if r.get("top_flag") else "—"),
                     })
                 df_expl = pd.DataFrame(expl_rows)
@@ -482,12 +482,12 @@ with tab_results:
                     "Flow":     r.get("options_score", "—"),
                     "Prob %":   r.get("probability", 0),
                     "Band":     r.get("conf_label", ""),
-                    "Pattern":  r.get("pattern", "No Pattern")[:18],
+                    "Pattern":  (r.get("pattern") or "No Pattern")[:18],
                     "AVWAP":    ("▲ Above" if r.get("avwap_above") else "▼ Below"),
                     "PM Gap":   f"+{pm:.1%}" if pm > 0.005 else ("—" if pm == 0 else f"{pm:.1%}"),
-                    "% < 52W":  f"{r.get('pct_52w',0)*100:.1f}%",
-                    "R:R":      f"{r.get('rr',0):.1f}:1",
-                    "Earnings": r.get("earnings_risk", "No"),
+                    "% < 52W":  f"{(r.get('pct_52w') or 0)*100:.1f}%",
+                    "R:R":      f"{r.get('rr') or 0:.1f}:1",
+                    "Earnings": r.get("earnings_risk") or "No",
                 })
             df_prob = pd.DataFrame(prob_rows)
 
@@ -681,11 +681,11 @@ with tab_chart:
                 st.markdown(f'<div class="section-hdr">{tk} — Signal Breakdown</div>',
                             unsafe_allow_html=True)
                 c1, c2, c3, c4, c5 = st.columns(5)
-                with c1: st.metric("Breakout Prob", f"{result.get('probability',0)}%")
-                with c2: st.metric("Pattern",       result.get("pattern","—")[:18])
-                with c3: st.metric("RSI",           f"{result.get('rsi',0):.1f}")
-                with c4: st.metric("R:R",           f"{result.get('rr',0):.1f}:1")
-                with c5: st.metric("Earnings Risk", result.get("earnings_risk","No"))
+                with c1: st.metric("Breakout Prob", f"{result.get('probability') or 0}%")
+                with c2: st.metric("Pattern",       (result.get("pattern") or "—")[:18])
+                with c3: st.metric("RSI",           f"{result.get('rsi') or 0:.1f}")
+                with c4: st.metric("R:R",           f"{result.get('rr') or 0:.1f}:1")
+                with c5: st.metric("Earnings Risk", result.get("earnings_risk") or "No")
 
                 # Probability modifier breakdown
                 pos = result.get("pos_mods", [])

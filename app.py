@@ -97,6 +97,12 @@ class PgAdapter:
     def __init__(self, pg_conn):
         self._conn    = pg_conn
         self._last_id = None
+        # autocommit=True — each statement is its own transaction; a failed
+        # statement never poisons the connection for subsequent ones.
+        try:
+            self._conn.autocommit = True
+        except Exception:
+            pass
 
     def _adapt(self, sql: str) -> str:
         sql = sql.replace("?", "%s")
@@ -149,7 +155,7 @@ class PgAdapter:
             row           = cur.fetchone()
             self._last_id = row[0] if row else None
 
-        self._conn.commit()
+        self.commit()
         return _PgCursor(cur)
 
     def executescript(self, sql: str):
@@ -175,7 +181,8 @@ class PgAdapter:
 
     def commit(self):
         try:
-            self._conn.commit()
+            if not getattr(self._conn, "autocommit", False):
+                self._conn.commit()
         except Exception:
             pass
 
@@ -533,7 +540,7 @@ def _render_market_clock():
 }})();
 </script></body></html>"""
 
-    components.html(html, height=218, scrolling=False)
+    st.html(html)
 
 
 def _render_regime_banner(regime: dict):

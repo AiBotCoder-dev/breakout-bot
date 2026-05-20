@@ -108,6 +108,12 @@ class PgAdapter:
     def __init__(self, pg_conn):
         self._conn    = pg_conn
         self._last_id = None
+        # autocommit=True — each statement is its own transaction; a failed
+        # statement never poisons the connection for subsequent ones.
+        try:
+            self._conn.autocommit = True
+        except Exception:
+            pass
 
     def _adapt(self, sql: str) -> str:
         sql = sql.replace("?", "%s")
@@ -160,7 +166,7 @@ class PgAdapter:
             row           = cur.fetchone()
             self._last_id = row[0] if row else None
 
-        self._conn.commit()
+        self.commit()
         return _PgCursor(cur)
 
     def executescript(self, sql: str):
@@ -185,7 +191,8 @@ class PgAdapter:
 
     def commit(self):
         try:
-            self._conn.commit()
+            if not getattr(self._conn, "autocommit", False):
+                self._conn.commit()
         except Exception:
             pass
 
@@ -234,8 +241,7 @@ def get_connection() -> PgAdapter:
     if not _PG_AVAILABLE:
         raise ImportError("psycopg2-binary is not installed.")
     raw = psycopg2.connect(url, sslmode="require")
-    raw.autocommit = False
-    return PgAdapter(raw)
+    return PgAdapter(raw)  # PgAdapter.__init__ sets autocommit=True
 
 
 # ── main logic ────────────────────────────────────────────────────────────────

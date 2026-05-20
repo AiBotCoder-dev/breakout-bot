@@ -282,6 +282,121 @@ class MarketRegimeDetector:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SECTOR ROTATION DETECTOR
+# ══════════════════════════════════════════════════════════════════════════════
+class SectorRotationDetector:
+    """
+    Ranks all 11 S&P 500 sectors by 1-month momentum using SPDR ETFs.
+    Results are cached for 30 minutes so a full scan only downloads once.
+
+    Usage:
+        tier = SectorRotationDetector.classify("Technology")
+        # → "LEADING" | "NEUTRAL" | "LAGGING"
+
+        rankings = SectorRotationDetector.get()
+        # → {"Technology": {"rank":1, "momentum":+3.2, "tier":"LEADING"}, ...}
+    """
+
+    SECTOR_ETFS: dict = {
+        "Technology":             "XLK",
+        "Consumer Discretionary": "XLY",
+        "Energy":                 "XLE",
+        "Financials":             "XLF",
+        "Health Care":            "XLV",
+        "Industrials":            "XLI",
+        "Materials":              "XLB",
+        "Real Estate":            "XLRE",
+        "Consumer Staples":       "XLP",
+        "Utilities":              "XLU",
+        "Communication Services": "XLC",
+    }
+
+    _cache:    dict  = {}
+    _cache_ts: float = 0.0
+    _TTL:      int   = 1800   # 30-minute cache
+
+    @classmethod
+    def get(cls) -> dict:
+        """Return sector rankings, refreshing the cache if stale."""
+        if time.time() - cls._cache_ts < cls._TTL and cls._cache:
+            return cls._cache
+
+        etf_list = list(cls.SECTOR_ETFS.values())
+        rankings: dict = {}
+        try:
+            df = yf.download(etf_list, period="3mo", interval="1d",
+                             progress=False, auto_adjust=True)
+            if df is None or df.empty:
+                return cls._cache
+
+            close = df["Close"] if "Close" in df.columns else df.xs("Close", axis=1, level=0)
+            if not isinstance(close, pd.DataFrame):
+                return cls._cache
+
+            moms: dict = {}
+            for sector, etf in cls.SECTOR_ETFS.items():
+                if etf in close.columns:
+                    prices = close[etf].dropna()
+                    if len(prices) >= 20:
+                        # 1-month (≈21 trading days) momentum
+                        moms[sector] = float(prices.iloc[-1] / prices.iloc[-21] - 1)
+
+            if not moms:
+                return cls._cache
+
+            sorted_sectors = sorted(moms, key=lambda s: moms[s], reverse=True)
+            n = len(sorted_sectors)
+            top_cut    = max(1, n // 3)       # top third  = LEADING
+            bottom_cut = n - max(1, n // 3)  # bottom third = LAGGING
+
+            for rank, sector in enumerate(sorted_sectors, 1):
+                tier = ("LEADING" if rank <= top_cut else
+                        "LAGGING" if rank > bottom_cut else
+                        "NEUTRAL")
+                rankings[sector] = {
+                    "rank":     rank,
+                    "of":       n,
+                    "momentum": round(moms[sector] * 100, 2),
+                    "tier":     tier,
+                    "etf":      cls.SECTOR_ETFS[sector],
+                }
+
+            cls._cache    = rankings
+            cls._cache_ts = time.time()
+        except Exception:
+            pass
+
+        return cls._cache or {}
+
+    @classmethod
+    def classify(cls, sector: str) -> str:
+        """Return 'LEADING', 'NEUTRAL', or 'LAGGING' for the given sector name."""
+        if not sector:
+            return "NEUTRAL"
+        rankings = cls.get()
+        if not rankings:
+            return "NEUTRAL"
+        # Exact match first, then partial
+        data = rankings.get(sector)
+        if not data:
+            sl = sector.lower()
+            for k, v in rankings.items():
+                if sl in k.lower() or k.lower() in sl:
+                    data = v
+                    break
+        return (data or {}).get("tier", "NEUTRAL")
+
+    @classmethod
+    def top_sectors(cls, n: int = 4) -> list:
+        """Return the names of the top-N LEADING sectors by momentum."""
+        rankings = cls.get()
+        if not rankings:
+            return []
+        return [s for s, d in sorted(rankings.items(),
+                                     key=lambda x: x[1]["rank"])[:n]]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # FEE ENGINE — 1.5% per transaction (broker + spread + slippage)
 # ══════════════════════════════════════════════════════════════════════════════
 class FeeEngine:
@@ -1289,11 +1404,13 @@ class BreakoutProbabilityEngine:
     """
 
     def __init__(self, pattern_results: dict, df: pd.DataFrame,
-                 spy_df: pd.DataFrame = None, cfg: dict = None):
-        self.pr  = pattern_results
-        self.df  = df
-        self.spy = spy_df
-        self.cfg = cfg or CONFIG
+                 spy_df: pd.DataFrame = None, cfg: dict = None,
+                 pm_gap: float = 0.0):
+        self.pr     = pattern_results
+        self.df     = df
+        self.spy    = spy_df
+        self.cfg    = cfg or CONFIG
+        self._pm_gap = float(pm_gap or 0.0)
         self._mods: list = []
         self._n:    int  = 0
 
@@ -1576,6 +1693,43 @@ class BreakoutProbabilityEngine:
                             add("Weekly chart bullish — above W-SMA10",                            +3)
                     elif wv10 > 0:
                         add("Weekly chart bearish — below W-SMA10 (weekly downtrend)",             -5)
+        except Exception:
+            pass
+
+        # ── RS Rating — 12-month relative strength vs SPY ────────────────────
+        try:
+            if self.spy is not None:
+                sp_v = self.spy["Close"].values
+                if len(C) >= 252 and len(sp_v) >= 252:
+                    rs_12m  = float(C[-1]    / C[-252]    - 1)
+                    spy_12m = float(sp_v[-1] / sp_v[-252] - 1)
+                    diff    = rs_12m - spy_12m
+                    if diff > 0.30:
+                        add(f"RS elite: +{diff:.0%} vs SPY (12m)",      +8)
+                    elif diff > 0.15:
+                        add(f"RS strong: +{diff:.0%} vs SPY (12m)",     +5)
+                    elif diff > 0.02:
+                        add(f"RS outperforming SPY +{diff:.0%} (12m)",  +3)
+                    elif diff < -0.25:
+                        add(f"RS laggard: {diff:.0%} vs SPY (12m)",     -7)
+                    elif diff < -0.10:
+                        add(f"RS lagging SPY {diff:.0%} (12m)",         -4)
+        except Exception:
+            pass
+
+        # ── Pre-market gap ────────────────────────────────────────────────────
+        try:
+            pg = self._pm_gap
+            if pg >= 0.05:
+                add(f"Pre-market gap up {pg:.1%} — strong catalyst",    +8)
+            elif pg >= 0.03:
+                add(f"Pre-market gap up {pg:.1%}",                      +5)
+            elif pg >= 0.01:
+                add(f"Pre-market gap up {pg:.1%} (mild)",               +2)
+            elif pg <= -0.05:
+                add(f"Pre-market gap DOWN {pg:.1%} — red flag",         -9)
+            elif pg <= -0.02:
+                add(f"Pre-market gap down {pg:.1%}",                    -5)
         except Exception:
             pass
 
@@ -1925,6 +2079,19 @@ class BreakoutScanner:
             return None
         return self._build_result(ticker, df, pats, prob, sc, ed, expl,
                                   catalyst, info, eq, flow, pm_gap, rs_12m)
+
+    def _init_sector_rotation(self):
+        """Warm up the sector rotation cache before the parallel scan starts."""
+        try:
+            print("  Fetching sector rotation data (SPDR ETFs)...")
+            rankings = SectorRotationDetector.get()
+            if rankings:
+                top = SectorRotationDetector.top_sectors(4)
+                print(f"  Leading sectors: {', '.join(top)}")
+            else:
+                print("  Sector data unavailable — rotation filter disabled.")
+        except Exception:
+            pass
 
     def _process(self, ticker: str):
         raw, ed = self._fetch_ticker(ticker)
@@ -2424,6 +2591,7 @@ class BreakoutScanner:
         self.spy    = self._fetch_spy()
         self.regime = MarketRegimeDetector.detect(self.spy)
         print(f"  Market regime: {self.regime['regime']}  |  {self.regime['advice']}")
+        self._init_sector_rotation()
 
         with ThreadPoolExecutor(max_workers=self.cfg["max_workers"]) as ex:
             futs = {ex.submit(self._process_with_info, item,
@@ -4079,6 +4247,82 @@ _DB_FILE  = "trading_scanner_history.db"
 _POS_SIZE = 10_000.0   # virtual $ per tracked position
 
 
+# ── Intraday volume pace ───────────────────────────────────────────────────────
+def _intraday_volume_pace(ticker: str) -> float:
+    """Compare today's accumulated volume to what's historically normal at this
+    time of day.
+
+    Returns a ratio:
+        1.0 = exactly on pace
+        2.0 = running at double the expected pace  (strong confirmation)
+        0.5 = running at half the expected pace    (weak, skip entry)
+
+    Returns 1.0 (neutral) if data is unavailable so we never falsely block trades.
+
+    Volume schedule model (approximates typical intraday distribution):
+        First 30 min  (9:30–10:00): ~20% of daily volume  (opening rush)
+        Remaining 360 min (10:00–16:00): ~80% spread roughly uniformly
+    """
+    try:
+        # 5 days of 1-min bars gives today + up to 4 prior complete days
+        df5 = yf.download(ticker, period="5d", interval="1m",
+                          progress=False, auto_adjust=True)
+        if df5 is None or df5.empty:
+            return 1.0
+        if isinstance(df5.columns, pd.MultiIndex):
+            df5.columns = df5.columns.get_level_values(0)
+
+        # Normalise the index to ET dates (handles DST automatically)
+        idx = df5.index
+        try:
+            if hasattr(idx, "tz") and idx.tz is not None:
+                idx_et = idx.tz_convert("America/New_York")
+            else:
+                idx_et = idx.tz_localize("America/New_York", ambiguous="infer",
+                                         nonexistent="shift_forward")
+            dates = pd.DatetimeIndex([t.date() for t in idx_et])
+        except Exception:
+            # Fallback: assume index dates are already local
+            dates = pd.DatetimeIndex([t.date() for t in idx])
+
+        now_et   = MarketClock.now_et()
+        today    = now_et.date()
+
+        today_mask = (dates == today)
+        today_vol  = float(df5["Volume"].values[today_mask].sum())
+        if today_vol <= 0:
+            return 1.0
+
+        # Average daily volume from the prior days in the window
+        prev_mask  = (dates < today)
+        prev_dates = sorted(set(dates[prev_mask]))
+        if not prev_dates:
+            return 1.0
+        day_vols = [float(df5["Volume"].values[dates == d].sum())
+                    for d in prev_dates if (dates == d).any()]
+        adv = float(np.mean(day_vols)) if day_vols else 0.0
+        if adv <= 0:
+            return 1.0
+
+        # Minutes elapsed since 9:30 ET
+        elapsed = (now_et.hour * 60 + now_et.minute) - (9 * 60 + 30)
+        elapsed = max(0, min(int(elapsed), 390))          # clamp to [0, 390]
+        if elapsed <= 0:
+            return 1.0
+
+        # Piecewise expected-fraction model
+        if elapsed <= 30:
+            expected_frac = 0.20 * (elapsed / 30.0)
+        else:
+            expected_frac = 0.20 + 0.80 * ((elapsed - 30.0) / 360.0)
+
+        expected_vol = adv * expected_frac
+        return (today_vol / expected_vol) if expected_vol > 0 else 1.0
+
+    except Exception:
+        return 1.0
+
+
 _PAPER_BUDGET        = 1_000.0
 _PAPER_MAX_POSITIONS = 5
 _PAPER_MAX_PCT       = 0.20
@@ -4097,27 +4341,33 @@ class PaperTradingEngine:
     def _init_schema(self):
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS paper_portfolio (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker          TEXT,
-                entry_price     REAL,
-                entry_date      DATE,
-                shares          REAL,
-                gross_invested  REAL,
-                buy_fee         REAL,
-                stop_loss       REAL,
-                target_price    REAL,
-                fee_adj_rr      REAL,
-                pattern         TEXT,
-                explosive_score REAL,
-                breakout_prob   REAL,
-                status          TEXT DEFAULT 'OPEN',
-                exit_price      REAL,
-                exit_date       DATE,
-                exit_reason     TEXT,
-                sell_fee        REAL,
-                gross_pnl       REAL,
-                net_pnl         REAL,
-                net_pnl_pct     REAL
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker            TEXT,
+                entry_price       REAL,
+                entry_date        DATE,
+                shares            REAL,
+                gross_invested    REAL,
+                buy_fee           REAL,
+                stop_loss         REAL,
+                target_price      REAL,
+                fee_adj_rr        REAL,
+                pattern           TEXT,
+                explosive_score   REAL,
+                breakout_prob     REAL,
+                status            TEXT DEFAULT 'OPEN',
+                exit_price        REAL,
+                exit_date         DATE,
+                exit_reason       TEXT,
+                sell_fee          REAL,
+                gross_pnl         REAL,
+                net_pnl           REAL,
+                net_pnl_pct       REAL,
+                t1_price          REAL,
+                t1_hit            INTEGER DEFAULT 0,
+                trailing_stop     REAL,
+                highest_since_t1  REAL,
+                atr_value         REAL,
+                sector            TEXT
             );
             CREATE TABLE IF NOT EXISTS paper_state (
                 id               INTEGER PRIMARY KEY,
@@ -4155,6 +4405,20 @@ class PaperTradingEngine:
                 alpha                REAL
             );
         """)
+        # ── Schema migration: add new columns to existing databases ───────────
+        _new_cols = [
+            ("paper_portfolio", "t1_price",         "REAL"),
+            ("paper_portfolio", "t1_hit",            "INTEGER DEFAULT 0"),
+            ("paper_portfolio", "trailing_stop",     "REAL"),
+            ("paper_portfolio", "highest_since_t1",  "REAL"),
+            ("paper_portfolio", "atr_value",         "REAL"),
+            ("paper_portfolio", "sector",            "TEXT"),
+        ]
+        for _tbl, _col, _typ in _new_cols:
+            try:
+                self.conn.execute(f"ALTER TABLE {_tbl} ADD COLUMN {_col} {_typ}")
+            except Exception:
+                pass   # column already exists — safe to ignore
 
     def _load_state(self):
         row = self.conn.execute(
@@ -4280,15 +4544,24 @@ class PaperTradingEngine:
         self._trades    += 1
         today = datetime.now().strftime("%Y-%m-%d")
 
+        # Derive T1 price and ATR value from signal or compute fallback
+        _stop   = signal.get("stop_price") or (price * 0.95)
+        _risk   = abs(price - _stop)
+        _t1     = signal.get("t1_price") or (price + _risk * 1.5)
+        _atr    = signal.get("atr_value") or _risk / 2.0
+        _sector = signal.get("sector", "") or ""
+
         self.conn.execute("""
             INSERT INTO paper_portfolio
             (ticker, entry_price, entry_date, shares, gross_invested, buy_fee,
-             stop_loss, target_price, fee_adj_rr, pattern, explosive_score, breakout_prob)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+             stop_loss, target_price, fee_adj_rr, pattern, explosive_score,
+             breakout_prob, t1_price, trailing_stop, atr_value, sector)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (ticker, price, today, buy_calc["shares"], gross, buy_calc["fee"],
-              signal.get("stop_price", 0), signal.get("tgt_price", 0),
+              _stop, signal.get("tgt_price", 0),
               signal.get("fee_adj_rr", 0), signal.get("pattern", ""),
-              signal.get("explosive_score", 0), signal.get("probability", 0)))
+              signal.get("explosive_score", 0), signal.get("probability", 0),
+              _t1, _stop, _atr, _sector))
 
         self.conn.execute("""
             INSERT INTO fees
@@ -4344,50 +4617,47 @@ class PaperTradingEngine:
     def check_stops_and_targets(self) -> list:
         """Check all open positions against live intraday prices.
 
-        Uses 1-minute candles and checks the High/Low of each candle so that
-        stops and targets are triggered at the EXACT price, not just at end-of-day
-        close.  Falls back to 5-minute candles if 1-minute data is unavailable
-        (e.g., after hours), and then to last daily close as a final backstop.
+        Uses 1-minute candles and checks High/Low of each candle for precise
+        stop/target execution.  Also:
+          • T1 hit → moves stop to break-even (entry price)
+          • Trailing stop → trails at (highest_since_t1 × 0.92) after T1
+          • Time-based exit → closes stagnant positions after 10 trading days
+            if they haven't reached T1 yet
 
         Returns a list of close-result dicts for every position that was exited.
         """
         closed = []
         for pos in self.open_positions:
             try:
+                ticker = pos["ticker"]
                 stop   = float(pos.get("stop_loss")   or 0)
                 target = float(pos.get("target_price") or 0)
                 t1     = float(pos.get("t1_price")     or 0)
-                if not stop and not target:
-                    continue
+                entry  = float(pos.get("entry_price")  or 0)
+                atr_v  = float(pos.get("atr_value")    or (entry * 0.02))
 
-                # --- Try 1-minute intraday data first -------------------------
-                raw = yf.download(pos["ticker"], period="2d", interval="1m",
+                # ── 1-min data (fallback chain: 1m → 5m → 1d) ─────────────
+                raw = yf.download(ticker, period="2d", interval="1m",
                                   progress=False, auto_adjust=True)
-
-                # Fallback: 5-minute if 1m returned nothing
                 if raw is None or raw.empty:
-                    raw = yf.download(pos["ticker"], period="5d", interval="5m",
+                    raw = yf.download(ticker, period="5d", interval="5m",
                                       progress=False, auto_adjust=True)
-
-                # Final fallback: daily
                 if raw is None or raw.empty:
-                    raw = yf.download(pos["ticker"], period="5d", interval="1d",
+                    raw = yf.download(ticker, period="5d", interval="1d",
                                       progress=False, auto_adjust=True)
-
                 if raw is None or raw.empty:
                     continue
 
-                # Flatten MultiIndex if present
                 if isinstance(raw.columns, pd.MultiIndex):
                     raw.columns = raw.columns.get_level_values(0)
 
-                # Only consider candles on or after entry date
+                # Filter to candles on or after entry date
                 entry_date = pos.get("entry_date")
                 if entry_date:
                     try:
-                        ed = pd.Timestamp(entry_date).tz_localize(None)
-                        raw.index = raw.index.tz_localize(None) if raw.index.tzinfo else raw.index
-                        raw = raw[raw.index >= ed]
+                        ed   = pd.Timestamp(entry_date).tz_localize(None)
+                        ridx = raw.index.tz_localize(None) if raw.index.tzinfo else raw.index
+                        raw  = raw[ridx >= ed]
                     except Exception:
                         pass
 
@@ -4396,42 +4666,81 @@ class PaperTradingEngine:
 
                 reason     = None
                 exit_price = None
+                last_close = float(raw["Close"].iloc[-1])
 
-                # Scan candles chronologically; first hit wins
+                # ── T1 / trailing stop updates (before exit check) ─────────
+                t1_hit     = bool(pos.get("t1_hit"))
+                highest    = float(pos.get("highest_since_t1") or 0)
+
+                if t1 and not t1_hit:
+                    # Check if any candle's High has reached T1
+                    if float(raw["High"].max()) >= t1:
+                        # T1 hit → move stop to break-even
+                        new_stop = max(entry, stop)   # never lower the stop
+                        self.conn.execute("""
+                            UPDATE paper_portfolio
+                            SET t1_hit=1, stop_loss=?, trailing_stop=?,
+                                highest_since_t1=?
+                            WHERE ticker=? AND status='OPEN'
+                        """, (new_stop, new_stop, last_close, ticker))
+                        self.conn.commit()
+                        stop    = new_stop
+                        t1_hit  = True
+                        highest = last_close
+
+                if t1_hit:
+                    # Trailing stop: trail at 8% below the highest close since T1
+                    if last_close > highest:
+                        highest = last_close
+                        self.conn.execute("""
+                            UPDATE paper_portfolio SET highest_since_t1=?
+                            WHERE ticker=? AND status='OPEN'
+                        """, (highest, ticker))
+                        self.conn.commit()
+                    trail = highest * 0.92          # 8% trailing cushion
+                    if trail > stop:
+                        self.conn.execute("""
+                            UPDATE paper_portfolio SET stop_loss=?, trailing_stop=?
+                            WHERE ticker=? AND status='OPEN'
+                        """, (trail, trail, ticker))
+                        self.conn.commit()
+                        stop = trail
+
+                # ── Scan candles for exact stop / target hits ──────────────
                 for _, row in raw.iterrows():
                     low   = float(row.get("Low",   row.get("Close", 0)))
                     high  = float(row.get("High",  row.get("Close", 0)))
-                    close = float(row.get("Close", 0))
 
-                    # T1 partial-exit check (hits first because it's inside full target)
-                    if t1 and high >= t1 and target and high < target:
-                        reason     = "T1_HIT"
-                        exit_price = t1
-                        break
-
-                    # Full target
                     if target and high >= target:
                         reason     = "TARGET_HIT"
-                        exit_price = target   # exit exactly at target price
+                        exit_price = target
                         break
-
-                    # Stop-loss: triggered when any candle's low touches or crosses stop
                     if stop and low <= stop:
                         reason     = "STOP_HIT"
-                        exit_price = stop     # exit exactly at stop price
+                        exit_price = stop
                         break
 
-                # Overnight gap-down backstop (close below stop but no low scan above)
+                # Gap / EOD backstop
                 if not reason:
-                    last_close = float(raw["Close"].iloc[-1])
                     if stop   and last_close <= stop:
                         reason = "STOP_HIT";   exit_price = last_close
                     elif target and last_close >= target:
                         reason = "TARGET_HIT"; exit_price = last_close
 
+                # ── Time-based exit (10 trading days without T1) ───────────
+                if not reason and entry_date and not t1_hit:
+                    try:
+                        bdays = len(pd.bdate_range(str(entry_date),
+                                                   str(datetime.now().date()))) - 1
+                        if bdays >= 10:
+                            reason     = "TIME_STOP"
+                            exit_price = last_close
+                    except Exception:
+                        pass
+
                 if reason:
-                    res = self.close_position(pos["ticker"], exit_price, reason)
-                    res["ticker"] = pos["ticker"]
+                    res = self.close_position(ticker, exit_price, reason)
+                    res["ticker"] = ticker
                     closed.append(res)
 
             except Exception:
@@ -4470,11 +4779,36 @@ class PaperTradingEngine:
         )
         opened = []
         for sig in candidates:
+            # ── Sector rotation gate ───────────────────────────────────────────
+            # Skip entries in lagging sectors — even great setups fail when
+            # institutional money is rotating OUT of that sector.
+            sector = sig.get("sector", "") or ""
+            if sector:
+                sector_tier = SectorRotationDetector.classify(sector)
+                if sector_tier == "LAGGING":
+                    sig["_sector_skip"] = True
+                    sig["_sector_tier"] = sector_tier
+                    continue
+                sig["_sector_tier"] = sector_tier
+
+            # ── Volume-at-time-of-day gate ─────────────────────────────────────
+            # Skip entry if volume is tracking below 50% of expected pace —
+            # a breakout on anemic volume rarely follows through.
+            if session.get("is_open"):
+                pace = _intraday_volume_pace(sig["ticker"])
+                if pace < 0.50:
+                    sig["_vol_pace_skip"] = True
+                    sig["_vol_pace"]      = round(pace, 2)
+                    continue
+                sig["_vol_pace"] = round(pace, 2)
+
             res = self.open_position(sig["ticker"], sig)
             if res.get("success"):
                 opened.append({
-                    "ticker":  sig["ticker"],
-                    "session": session["quality"],
+                    "ticker":      sig["ticker"],
+                    "session":     session["quality"],
+                    "vol_pace":    sig.get("_vol_pace", None),
+                    "sector_tier": sig.get("_sector_tier", "NEUTRAL"),
                     **res,
                 })
         self._save_snapshot()

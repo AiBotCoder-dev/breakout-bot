@@ -172,6 +172,34 @@ class PgAdapter:
         self._conn.close()
 
 
+# ── Telegram helper ───────────────────────────────────────────────────────────
+
+def send_telegram(message: str) -> bool:
+    """Send a Telegram message if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set.
+
+    Returns True on success, False if credentials are missing or the call fails.
+    Never raises — Telegram failure must never crash the monitor.
+    """
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID",   "").strip()
+    if not token or not chat_id:
+        return False
+    try:
+        import requests as _req
+        resp = _req.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+            timeout=10,
+        )
+        ok = resp.status_code == 200
+        if not ok:
+            print(f"  [Telegram] send failed {resp.status_code}: {resp.text[:120]}")
+        return ok
+    except Exception as e:
+        print(f"  [Telegram] error: {e}")
+        return False
+
+
 # ── connection helper ─────────────────────────────────────────────────────────
 
 def get_connection() -> PgAdapter:
@@ -213,6 +241,7 @@ def main():
         conn = get_connection()
     except Exception as exc:
         print(f"  ERROR: Could not connect to database: {exc}")
+        send_telegram(f"⚠️ <b>Monitor DB Error</b>\n{exc}")
         sys.exit(1)
 
     # ── Load paper engine ─────────────────────────────────────────────────────
@@ -231,9 +260,10 @@ def main():
     else:
         print(f"\n  Checking {len(positions)} position(s) against live prices...")
         for p in positions:
+            t1_flag = " [T1✓]" if p.get("t1_hit") else ""
             print(f"    {p['ticker']:8s}  entry=${p.get('entry_price',0):.2f}"
                   f"  stop=${p.get('stop_loss',0):.2f}"
-                  f"  target=${p.get('target_price',0):.2f}")
+                  f"  target=${p.get('target_price',0):.2f}{t1_flag}")
 
         # ── Check stops and targets ───────────────────────────────────────────
         try:
@@ -241,21 +271,58 @@ def main():
         except Exception as exc:
             print(f"\n  ERROR in check_stops_and_targets: {exc}")
             traceback.print_exc()
+            send_telegram(f"⚠️ <b>Monitor Error</b>\n{exc}")
             closed = []
 
         if closed:
             print(f"\n  {'─'*50}")
             print(f"  POSITIONS CLOSED ({len(closed)}):")
+
+            # ── Telegram notification for each closed position ────────────────
+            summary_after = paper.get_summary()
             for c in closed:
                 reason = c.get("exit_reason", "UNKNOWN")
-                price  = c.get("exit_price",  0)
-                pnl    = c.get("net_pnl",     0)
-                emoji  = "TARGET" if "TARGET" in reason else "STOP"
-                print(f"    [{emoji}] {c['ticker']:8s}  exit=${price:.2f}"
-                      f"  net_pnl=${pnl:+.2f}  reason={reason}")
+                price  = c.get("exit_price",  0) or 0
+                pnl    = c.get("net_pnl",     0) or 0
+                sign   = "+" if pnl >= 0 else ""
+
+                if "TARGET" in reason:
+                    emoji = "🎯"
+                elif "TIME" in reason:
+                    emoji = "⏱"
+                elif "T1" in reason:
+                    emoji = "📍"
+                else:
+                    emoji = "🛑"
+
+                log_line = (f"    [{reason}] {c['ticker']:8s}"
+                            f"  exit=${price:.2f}"
+                            f"  net_pnl={sign}${pnl:.2f}")
+                print(log_line)
+
+                tg_msg = (
+                    f"{emoji} <b>{c['ticker']}</b> closed\n"
+                    f"Reason : {reason}\n"
+                    f"Exit   : ${price:.2f}\n"
+                    f"Net P&L: {sign}${pnl:.2f}\n"
+                    f"Cash   : ${summary_after['available_cash']:,.2f}"
+                    f" | Realized: ${summary_after['realized_pnl']:+,.2f}\n"
+                    f"Session: {quality}  ({session.get('name','')})"
+                )
+                sent = send_telegram(tg_msg)
+                print(f"    [Telegram] {'✓ sent' if sent else '✗ not configured'}")
+
             print(f"  {'─'*50}")
         else:
             print(f"\n  All positions within bounds — no exits triggered.")
+
+        # ── Trailing stop update notification ─────────────────────────────────
+        # Re-read positions after any stop updates to show new stop levels
+        updated = paper.open_positions
+        for p in updated:
+            if p.get("t1_hit") and p.get("trailing_stop"):
+                print(f"    {p['ticker']:8s}  trailing stop now: ${p['trailing_stop']:.2f}"
+                      f"  (T1 hit ✓, highest: ${p.get('highest_since_t1',0):.2f})")
 
     # ── Skip new entries during AVOID window ──────────────────────────────────
     if quality == "AVOID":
@@ -274,4 +341,5 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"\nFATAL ERROR: {exc}")
         traceback.print_exc()
+        send_telegram(f"💥 <b>Monitor Fatal Error</b>\n{str(exc)[:400]}")
         sys.exit(1)

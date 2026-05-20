@@ -108,6 +108,15 @@ class PgAdapter:
         if self._LAST_ROWID.search(sql.strip()):
             return _FakeCursor(self._last_id)
 
+        # psycopg2 blocks EVERY command — including cursor() — when the
+        # connection is in a failed-transaction state.  Since we commit()
+        # after every successful execute(), rolling back here only ever
+        # clears a previously failed statement, never valid in-progress work.
+        try:
+            self._conn.rollback()
+        except Exception:
+            pass
+
         is_replace = bool(self._INSERT_OR_REPLACE.search(sql))
         adapted    = self._adapt(sql)
 

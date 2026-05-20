@@ -1385,11 +1385,81 @@ with tab_analytics:
 # ──────────────────────────────────────────────────────────────────────────────
 # TAB 5 — PAPER PORTFOLIO
 # ──────────────────────────────────────────────────────────────────────────────
+# ── Live position monitor (runs every 60 s, independent of scan) ─────────────
+# Defined outside `with tab_paper` so @st.fragment can decorate it at module level.
+try:
+    @st.fragment(run_every=60)
+    def _live_position_monitor():
+        """Auto-runs every 60 s. Checks open positions against 1-min intraday
+        prices and closes any that have hit their stop or target."""
+        _conn, _ = get_db()
+        _paper   = ts.PaperTradingEngine(_conn)
+        _pos     = _paper.open_positions
+
+        session  = ts.MarketClock.get_session()
+        is_open  = session.get("is_open", False)
+
+        col_l, col_r = st.columns([3, 1])
+        with col_r:
+            if st.button("🔄 Check Now", key="check_now_btn", use_container_width=True):
+                _closed = _paper.check_stops_and_targets()
+                if _closed:
+                    for c in _closed:
+                        em = "🎯" if "TARGET" in (c.get("exit_reason") or "") else "🛑"
+                        st.success(f"{em} **{c['ticker']}** closed — "
+                                   f"{c.get('exit_reason','')} @ ${c.get('exit_price',0):.2f}")
+                    st.rerun()
+                else:
+                    st.info("No stops or targets hit.", icon="✅")
+
+        with col_l:
+            now_str = datetime.now().strftime("%H:%M:%S")
+            if not _pos:
+                st.caption(f"⬜ Live monitor — no open positions  ({now_str})")
+                return
+
+            if is_open:
+                # Market is open → check stops/targets
+                _closed = _paper.check_stops_and_targets()
+                if _closed:
+                    for c in _closed:
+                        em = "🎯" if "TARGET" in (c.get("exit_reason") or "") else "🛑"
+                        st.success(f"{em} **{c['ticker']}** auto-closed — "
+                                   f"{c.get('exit_reason','')} @ ${c.get('exit_price',0):.2f}  "
+                                   f"| Net P&L: {'+'if (c.get('net_pnl') or 0)>=0 else ''}"
+                                   f"${c.get('net_pnl',0):.2f}")
+                    st.rerun()
+                else:
+                    tickers_str = ", ".join(p["ticker"] for p in _pos)
+                    st.caption(
+                        f"🟢 Live monitor **active** — watching {len(_pos)} position(s): "
+                        f"{tickers_str}  |  last checked {now_str}  "
+                        f"(refreshes every 60 s)"
+                    )
+            else:
+                win = session.get("name", "Closed")
+                st.caption(
+                    f"🌙 Live monitor **paused** — market is {win}  "
+                    f"({now_str})  |  {len(_pos)} position(s) held overnight"
+                )
+
+except AttributeError:
+    # Streamlit < 1.37 — define a no-op; manual Check Now button still works via fallback below
+    def _live_position_monitor():
+        pass
+
+
 with tab_paper:
     conn, _mode = get_db()
     paper = ts.PaperTradingEngine(conn)
     s     = paper.get_summary()
     positions = paper.open_positions
+
+    # ── Live monitor bar ──────────────────────────────────────────────────────
+    _live_position_monitor()
+
+    st.markdown("<hr style='border-color:#21262d;margin:4px 0 12px 0'>",
+                unsafe_allow_html=True)
 
     # ── Fetch live prices (cached 5 min) ─────────────────────────────────────
     live_prices: dict = {}

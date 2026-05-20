@@ -4342,25 +4342,98 @@ class PaperTradingEngine:
                 "net_pnl": round(net_pnl, 2), "net_pnl_pct": round(net_pct, 1)}
 
     def check_stops_and_targets(self) -> list:
+        """Check all open positions against live intraday prices.
+
+        Uses 1-minute candles and checks the High/Low of each candle so that
+        stops and targets are triggered at the EXACT price, not just at end-of-day
+        close.  Falls back to 5-minute candles if 1-minute data is unavailable
+        (e.g., after hours), and then to last daily close as a final backstop.
+
+        Returns a list of close-result dicts for every position that was exited.
+        """
         closed = []
         for pos in self.open_positions:
             try:
-                raw = yf.download(pos["ticker"], period="2d", interval="1d",
-                                  progress=False, auto_adjust=True)
-                if raw.empty:
+                stop   = float(pos.get("stop_loss")   or 0)
+                target = float(pos.get("target_price") or 0)
+                t1     = float(pos.get("t1_price")     or 0)
+                if not stop and not target:
                     continue
+
+                # --- Try 1-minute intraday data first -------------------------
+                raw = yf.download(pos["ticker"], period="2d", interval="1m",
+                                  progress=False, auto_adjust=True)
+
+                # Fallback: 5-minute if 1m returned nothing
+                if raw is None or raw.empty:
+                    raw = yf.download(pos["ticker"], period="5d", interval="5m",
+                                      progress=False, auto_adjust=True)
+
+                # Final fallback: daily
+                if raw is None or raw.empty:
+                    raw = yf.download(pos["ticker"], period="5d", interval="1d",
+                                      progress=False, auto_adjust=True)
+
+                if raw is None or raw.empty:
+                    continue
+
+                # Flatten MultiIndex if present
                 if isinstance(raw.columns, pd.MultiIndex):
                     raw.columns = raw.columns.get_level_values(0)
-                price  = float(raw["Close"].iloc[-1])
-                stop   = pos.get("stop_loss")  or 0
-                target = pos.get("target_price") or 0
-                reason = None
-                if stop   and price <= stop:   reason = "STOP_HIT"
-                elif target and price >= target: reason = "TARGET_HIT"
+
+                # Only consider candles on or after entry date
+                entry_date = pos.get("entry_date")
+                if entry_date:
+                    try:
+                        ed = pd.Timestamp(entry_date).tz_localize(None)
+                        raw.index = raw.index.tz_localize(None) if raw.index.tzinfo else raw.index
+                        raw = raw[raw.index >= ed]
+                    except Exception:
+                        pass
+
+                if raw.empty:
+                    continue
+
+                reason     = None
+                exit_price = None
+
+                # Scan candles chronologically; first hit wins
+                for _, row in raw.iterrows():
+                    low   = float(row.get("Low",   row.get("Close", 0)))
+                    high  = float(row.get("High",  row.get("Close", 0)))
+                    close = float(row.get("Close", 0))
+
+                    # T1 partial-exit check (hits first because it's inside full target)
+                    if t1 and high >= t1 and target and high < target:
+                        reason     = "T1_HIT"
+                        exit_price = t1
+                        break
+
+                    # Full target
+                    if target and high >= target:
+                        reason     = "TARGET_HIT"
+                        exit_price = target   # exit exactly at target price
+                        break
+
+                    # Stop-loss: triggered when any candle's low touches or crosses stop
+                    if stop and low <= stop:
+                        reason     = "STOP_HIT"
+                        exit_price = stop     # exit exactly at stop price
+                        break
+
+                # Overnight gap-down backstop (close below stop but no low scan above)
+                if not reason:
+                    last_close = float(raw["Close"].iloc[-1])
+                    if stop   and last_close <= stop:
+                        reason = "STOP_HIT";   exit_price = last_close
+                    elif target and last_close >= target:
+                        reason = "TARGET_HIT"; exit_price = last_close
+
                 if reason:
-                    res = self.close_position(pos["ticker"], price, reason)
+                    res = self.close_position(pos["ticker"], exit_price, reason)
                     res["ticker"] = pos["ticker"]
                     closed.append(res)
+
             except Exception:
                 pass
         return closed

@@ -50,7 +50,10 @@ class _PgRow:
     def __getitem__(self, k):
         if isinstance(k, int):
             return self._vals[k]
-        return self._vals[self._cols.index(k)]
+        try:
+            return self._vals[self._cols.index(k)]
+        except ValueError:
+            raise KeyError(k)
 
     def keys(self):
         return self._cols
@@ -182,7 +185,7 @@ class PgAdapter:
             try:
                 cur = self._conn.cursor()
                 cur.execute(stmt)
-                self._conn.commit()
+                self.commit()
             except Exception:
                 try:
                     self._conn.rollback()

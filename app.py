@@ -4,7 +4,6 @@ Run with:  streamlit run app.py
 """
 
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
@@ -28,7 +27,10 @@ class _PgRow:
     def __getitem__(self, k):
         if isinstance(k, int):
             return self._vals[k]
-        return self._vals[self._cols.index(k)]
+        try:
+            return self._vals[self._cols.index(k)]
+        except ValueError:
+            raise KeyError(k)
 
     def keys(self):
         return self._cols
@@ -172,7 +174,7 @@ class PgAdapter:
             try:
                 cur = self._conn.cursor()
                 cur.execute(stmt)
-                self._conn.commit()
+                self.commit()
             except Exception:
                 try:
                     self._conn.rollback()
@@ -315,26 +317,39 @@ def _fetch_live_prices(tickers: tuple) -> dict:
         return {}
     prices = {}
     try:
-        if len(tickers) == 1:
-            df = yf.download(tickers[0], period="2d", interval="5m",
-                             progress=False, auto_adjust=True)
-            if not df.empty:
-                prices[tickers[0]] = float(df["Close"].dropna().iloc[-1])
-        else:
-            df = yf.download(list(tickers), period="2d", interval="5m",
-                             progress=False, auto_adjust=True)
-            if not df.empty:
-                close_data = df.get("Close", df)
-                if isinstance(close_data, pd.DataFrame):
-                    for tk in tickers:
-                        if tk in close_data.columns:
-                            s = close_data[tk].dropna()
-                            if not s.empty:
-                                prices[tk] = float(s.iloc[-1])
-                elif isinstance(close_data, pd.Series):
-                    s = close_data.dropna()
-                    if not s.empty and tickers:
-                        prices[tickers[0]] = float(s.iloc[-1])
+        raw = yf.download(list(tickers), period="2d", interval="5m",
+                          progress=False, auto_adjust=True)
+        if raw is None or raw.empty:
+            return prices
+
+        # Flatten MultiIndex → single level (yfinance ≥ 0.2.x returns MultiIndex)
+        if isinstance(raw.columns, pd.MultiIndex):
+            # Detect which level holds price-type labels (Open/High/Low/Close/Volume)
+            _price_labels = {"Open", "High", "Low", "Close", "Volume"}
+            lvl = 0 if _price_labels & set(raw.columns.get_level_values(0)) else 1
+            raw.columns = raw.columns.get_level_values(lvl)
+            # If still MultiIndex (level flip didn't help), try xs
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw = raw.xs("Close", axis=1, level=0)
+
+        # Now raw is a DataFrame or Series
+        if isinstance(raw, pd.DataFrame):
+            # Multi-ticker download → each column is a ticker
+            if "Close" in raw.columns:
+                # Single level with Close column (single ticker case)
+                s = raw["Close"].dropna()
+                if not s.empty and len(tickers) == 1:
+                    prices[tickers[0]] = float(s.iloc[-1])
+            else:
+                for tk in tickers:
+                    if tk in raw.columns:
+                        s = raw[tk].dropna()
+                        if not s.empty:
+                            prices[tk] = float(s.iloc[-1])
+        elif isinstance(raw, pd.Series):
+            s = raw.dropna()
+            if not s.empty and tickers:
+                prices[tickers[0]] = float(s.iloc[-1])
     except Exception:
         pass
     return prices
@@ -359,7 +374,7 @@ def _render_stock_card(r: dict):
     timing   = r.get("timing", {}) or {}
     min_d    = timing.get("min_days", "")
     max_d    = timing.get("max_days", "")
-    avwap    = r.get("avwap_above")
+    avwap    = r.get("above_avwap")
 
     if prob >= 75:
         card_cls, p_bg, p_col, conf = "card-high",   "#1a4428", "#3fb950", "HIGH CONF"
@@ -609,10 +624,13 @@ def get_db():
     return conn, mode
 
 def _df(query: str, conn, params=()):
-    rows = conn.execute(query, params).fetchall()
-    if not rows:
+    try:
+        rows = conn.execute(query, params).fetchall()
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame([dict(r) for r in rows])
+    except Exception:
         return pd.DataFrame()
-    return pd.DataFrame([dict(r) for r in rows])
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -1785,10 +1803,13 @@ with tab_fees:
     conn, _mode = get_db()
     _PAPER_BUDGET = ts._PAPER_BUDGET
 
-    fee_rows = conn.execute(
-        "SELECT * FROM fees ORDER BY transaction_date ASC, id ASC"
-    ).fetchall()
-    fee_data = [dict(r) for r in fee_rows]
+    try:
+        fee_rows = conn.execute(
+            "SELECT * FROM fees ORDER BY transaction_date ASC, id ASC"
+        ).fetchall()
+        fee_data = [dict(r) for r in fee_rows]
+    except Exception:
+        fee_data = []
 
     total_fees  = sum(r.get("fee_amount") or 0 for r in fee_data)
     buy_fees    = sum(r.get("fee_amount") or 0 for r in fee_data
@@ -1799,10 +1820,13 @@ with tab_fees:
     n_sell      = sum(1 for r in fee_data if r.get("transaction_type") == "SELL")
 
     paper_s = ts.PaperTradingEngine(conn).get_summary()
-    gross_pnl_total = conn.execute(
-        "SELECT SUM(gross_pnl) FROM paper_portfolio WHERE status='CLOSED'"
-    ).fetchone()
-    gross_pnl_total = float(gross_pnl_total[0] or 0) if gross_pnl_total else 0.0
+    try:
+        gross_pnl_row = conn.execute(
+            "SELECT SUM(gross_pnl) FROM paper_portfolio WHERE status='CLOSED'"
+        ).fetchone()
+        gross_pnl_total = float(gross_pnl_row[0] or 0) if gross_pnl_row else 0.0
+    except Exception:
+        gross_pnl_total = 0.0
 
     # ── Summary KPIs ─────────────────────────────────────────────────────────
     st.markdown('<div class="section-hdr">Fee Summary</div>',
@@ -1850,10 +1874,13 @@ with tab_fees:
         ))
 
         # Equity snapshots
-        snap_rows = conn.execute(
-            "SELECT snapshot_date, realized_pnl, portfolio_return_pct "
-            "FROM paper_trading ORDER BY snapshot_date ASC"
-        ).fetchall()
+        try:
+            snap_rows = conn.execute(
+                "SELECT snapshot_date, realized_pnl, portfolio_return_pct "
+                "FROM paper_trading ORDER BY snapshot_date ASC"
+            ).fetchall()
+        except Exception:
+            snap_rows = []
         if snap_rows:
             snap_dates = [r["snapshot_date"] for r in snap_rows]
             snap_pnl   = [r["realized_pnl"]  for r in snap_rows]

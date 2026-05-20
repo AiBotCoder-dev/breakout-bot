@@ -4430,15 +4430,21 @@ class PaperTradingEngine:
                     pass   # column already exists — safe to ignore
 
     def _load_state(self):
-        row = self.conn.execute(
-            "SELECT * FROM paper_state WHERE id=1").fetchone()
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM paper_state WHERE id=1").fetchone()
+        except Exception:
+            row = None
         if row:
-            self._cash          = float(row["available_cash"]   or 0)
-            self._fees_paid     = float(row["total_fees_paid"]  or 0)
-            self._realized_pnl  = float(row["realized_pnl"]     or 0)
-            self._trades        = int(  row["trades_made"]       or 0)
-            self._starting      = float(row["starting_capital"] or _PAPER_BUDGET)
-        else:
+            try:
+                self._cash         = float(row.get("available_cash",  0) or 0)
+                self._fees_paid    = float(row.get("total_fees_paid",  0) or 0)
+                self._realized_pnl = float(row.get("realized_pnl",    0) or 0)
+                self._trades       = int(  row.get("trades_made",      0) or 0)
+                self._starting     = float(row.get("starting_capital", _PAPER_BUDGET) or _PAPER_BUDGET)
+            except Exception:
+                row = None   # fall through to default init below
+        if not row:
             self._cash         = _PAPER_BUDGET
             self._fees_paid    = 0.0
             self._realized_pnl = 0.0
@@ -4657,8 +4663,15 @@ class PaperTradingEngine:
                 if raw is None or raw.empty:
                     continue
 
+                # Flatten MultiIndex columns (yfinance ≥ 0.2.x)
                 if isinstance(raw.columns, pd.MultiIndex):
-                    raw.columns = raw.columns.get_level_values(0)
+                    _price_labels = {"Open", "High", "Low", "Close", "Volume"}
+                    _lvl = 0 if _price_labels & set(raw.columns.get_level_values(0)) else 1
+                    raw.columns = raw.columns.get_level_values(_lvl)
+                # Drop rows where OHLC data is completely missing
+                raw = raw.dropna(subset=["Close"])
+                if raw.empty:
+                    continue
 
                 # Filter to candles on or after entry date
                 entry_date = pos.get("entry_date")
@@ -4675,7 +4688,7 @@ class PaperTradingEngine:
 
                 reason     = None
                 exit_price = None
-                last_close = float(raw["Close"].iloc[-1])
+                last_close = float(raw["Close"].dropna().iloc[-1])
 
                 # ── T1 / trailing stop updates (before exit check) ─────────
                 t1_hit     = bool(pos.get("t1_hit"))
@@ -4861,9 +4874,13 @@ class PaperTradingEngine:
         total      = self._cash + invested
         total_ret  = total - self._starting
         ret_pct    = total_ret / self._starting * 100 if self._starting else 0
-        row = self.conn.execute(
-            "SELECT COUNT(*), SUM(net_pnl) FROM paper_portfolio WHERE status='CLOSED'"
-        ).fetchone()
+        try:
+            row = self.conn.execute(
+                "SELECT COUNT(*), SUM(net_pnl) FROM paper_portfolio WHERE status='CLOSED'"
+            ).fetchone()
+            n_closed = int(row[0] or 0) if row else 0
+        except Exception:
+            n_closed = 0
         return {
             "starting_capital": self._starting,
             "total_capital":    total,
@@ -4880,7 +4897,7 @@ class PaperTradingEngine:
             "open_positions":   len(positions),
             "max_positions":    _PAPER_MAX_POSITIONS,
             "trades_made":      self._trades,
-            "n_closed":         row[0] if row and row[0] else 0,
+            "n_closed":         n_closed,
             "break_even_pct":   _FEE_ENGINE.break_even_move(1.0)["break_even_pct"],
         }
 

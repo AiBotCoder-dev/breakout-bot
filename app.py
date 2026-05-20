@@ -278,6 +278,38 @@ def kpi(label: str, value: str, colour: str = "blue"):
 def badge(text: str, colour: str = "blue"):
     return f'<span class="badge badge-{colour}">{text}</span>'
 
+
+@st.cache_data(ttl=300)  # cache live prices for 5 minutes
+def _fetch_live_prices(tickers: tuple) -> dict:
+    """Return {ticker: last_price} for all tickers. Cached 5 min to avoid hammering yfinance."""
+    if not tickers:
+        return {}
+    prices = {}
+    try:
+        if len(tickers) == 1:
+            df = yf.download(tickers[0], period="2d", interval="5m",
+                             progress=False, auto_adjust=True)
+            if not df.empty:
+                prices[tickers[0]] = float(df["Close"].dropna().iloc[-1])
+        else:
+            df = yf.download(list(tickers), period="2d", interval="5m",
+                             progress=False, auto_adjust=True)
+            if not df.empty:
+                close_data = df.get("Close", df)
+                if isinstance(close_data, pd.DataFrame):
+                    for tk in tickers:
+                        if tk in close_data.columns:
+                            s = close_data[tk].dropna()
+                            if not s.empty:
+                                prices[tk] = float(s.iloc[-1])
+                elif isinstance(close_data, pd.Series):
+                    s = close_data.dropna()
+                    if not s.empty and tickers:
+                        prices[tickers[0]] = float(s.iloc[-1])
+    except Exception:
+        pass
+    return prices
+
 def _render_stock_card(r: dict):
     ticker   = r.get("ticker", "")
     price    = r.get("price", 0) or 0
@@ -1359,12 +1391,56 @@ with tab_paper:
     s     = paper.get_summary()
     positions = paper.open_positions
 
+    # ── Fetch live prices (cached 5 min) ─────────────────────────────────────
+    live_prices: dict = {}
+    if positions:
+        tickers_tuple = tuple(p["ticker"] for p in positions)
+        with st.spinner("Fetching live prices…"):
+            live_prices = _fetch_live_prices(tickers_tuple)
+
+    # Build per-position live data
+    live_pos_map: dict = {}
+    total_live_value = 0.0
+    total_cost_basis = 0.0
+    for p in positions:
+        tk     = p["ticker"]
+        ep     = float(p.get("entry_price") or 0)
+        shares = float(p.get("shares") or 0)
+        gross  = float(p.get("gross_invested") or 0)
+        cur    = live_prices.get(tk)
+        has_lv = cur is not None
+        if not has_lv:
+            cur = ep
+        cur_val = shares * cur
+        unr_pnl = cur_val - gross
+        unr_pct = (unr_pnl / gross * 100) if gross else 0.0
+        live_pos_map[tk] = {
+            "current_price":  cur,
+            "current_value":  cur_val,
+            "unrealized_pnl": unr_pnl,
+            "unrealized_pct": unr_pct,
+            "has_live_price": has_lv,
+        }
+        total_live_value += cur_val
+        total_cost_basis += gross
+
+    total_unrealized = total_live_value - total_cost_basis
+    unr_pct_total    = (total_unrealized / total_cost_basis * 100) if total_cost_basis else 0.0
+    prices_fetched   = bool(live_prices)
+
+    # Mark-to-market total (cash + current value of positions at live prices)
+    mtm_total = s["available_cash"] + (total_live_value if positions else 0.0)
+    mtm_ret   = mtm_total - s["starting_capital"]
+
     # ── Header KPIs ──────────────────────────────────────────────────────────
     st.markdown('<div class="section-hdr">Paper Portfolio — $1,000 Starting Capital</div>',
                 unsafe_allow_html=True)
     c1, c2, c3, c4, c5 = st.columns(5)
     ret_col = "green" if s["total_return"] >= 0 else "red"
-    with c1: kpi("Total Capital",  f"${s['total_capital']:,.2f}", "blue")
+    mtm_col = "green" if mtm_ret >= 0 else "red"
+    with c1: kpi("MTM Portfolio",
+                 f"${mtm_total:,.2f}",
+                 mtm_col)
     with c2: kpi("Total Return",
                  f"{'+'if s['total_return']>=0 else ''}${s['total_return']:,.2f}",
                  ret_col)
@@ -1383,6 +1459,28 @@ with tab_paper:
                  f"{'+'if s['realized_pnl']>=0 else ''}${s['realized_pnl']:,.2f}",
                  "green" if s["realized_pnl"] >= 0 else "red")
     with c4: kpi("Fee Drag",        f"-{s['fee_drag_pct']:.2f}%", "red")
+
+    # ── Unrealized P&L row ───────────────────────────────────────────────────
+    if positions:
+        st.markdown("<br>", unsafe_allow_html=True)
+        unr_col = "green" if total_unrealized >= 0 else "red"
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            kpi("Unrealized P&L",
+                f"{'+'if total_unrealized>=0 else ''}${total_unrealized:,.2f}",
+                unr_col)
+        with c2:
+            kpi("Unrealized %",
+                f"{'+'if unr_pct_total>=0 else ''}{unr_pct_total:.2f}%",
+                unr_col)
+        with c3:
+            kpi("Cost Basis (Open)",
+                f"${total_cost_basis:,.2f}",
+                "yellow")
+        if prices_fetched:
+            st.caption("✅ Live prices fetched — refreshes every 5 minutes")
+        else:
+            st.caption("⚠️ Live prices unavailable — showing cost basis (unrealized P&L = $0)")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -1463,13 +1561,38 @@ with tab_paper:
             gross  = p.get("gross_invested") or 0
             bf     = p.get("buy_fee") or 0
             far    = p.get("fee_adj_rr") or 0
+            tk     = p["ticker"]
 
-            # Estimated current P&L (entry price only — no live price fetch in dashboard)
-            est_sell_fee = shares * ep * 0.015
-            net_pnl_est  = -bf - est_sell_fee  # at entry price, net is negative (fees only)
+            lp       = live_pos_map.get(tk, {})
+            cur      = lp.get("current_price") or ep
+            unr      = lp.get("unrealized_pnl") or 0
+            unr_p    = lp.get("unrealized_pct") or 0
+            cur_val  = lp.get("current_value") or (shares * ep)
+            has_lv   = lp.get("has_live_price", False)
+            price_lbl = "Live Price" if has_lv else "Est Price"
+            unr_sign  = "+" if unr >= 0 else ""
 
-            with st.expander(f"**{p['ticker']}** — entered @ ${ep:.2f}  |  "
-                             f"Target ${tgt:.2f}  |  Stop ${stp:.2f}", expanded=True):
+            with st.expander(
+                f"**{tk}** — entered @ ${ep:.2f}  |  "
+                f"{price_lbl}: ${cur:.2f}  |  "
+                f"Unrealized P&L: {unr_sign}${unr:.2f} ({unr_sign}{unr_p:.1f}%)",
+                expanded=True,
+            ):
+                # ── Live P&L row ──────────────────────────────────────────────
+                lc1, lc2, lc3 = st.columns(3)
+                with lc1:
+                    chg_pct = (cur - ep) / ep * 100 if ep else 0
+                    st.metric(price_lbl, f"${cur:.2f}",
+                              delta=f"{chg_pct:+.2f}%")
+                with lc2:
+                    st.metric("Unrealized P&L",
+                              f"{unr_sign}${unr:.2f}",
+                              delta=f"{unr_sign}{unr_p:.2f}%")
+                with lc3:
+                    st.metric("Current Value", f"${cur_val:.2f}")
+
+                st.divider()
+
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     st.metric("Entry",     f"${ep:.2f}")

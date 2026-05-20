@@ -4468,6 +4468,97 @@ class PaperTradingEngine:
             "break_even_pct":   _FEE_ENGINE.break_even_move(1.0)["break_even_pct"],
         }
 
+    def get_unrealized_pnl(self) -> dict:
+        """Fetch live prices via yfinance and compute unrealized P&L for all open positions.
+
+        Returns a dict with keys:
+          total               – total unrealized P&L dollars
+          pct                 – total unrealized P&L as % of cost
+          positions           – list of per-position dicts
+          total_current_value – sum of (shares × live_price) for all positions
+          total_cost          – sum of gross_invested for all positions
+          fetched             – True if at least one live price was retrieved
+        """
+        positions = self.open_positions
+        if not positions:
+            return {"total": 0.0, "pct": 0.0, "positions": [],
+                    "total_current_value": 0.0, "total_cost": 0.0, "fetched": False}
+
+        tickers = [p["ticker"] for p in positions]
+        prices  = {}
+        fetched = False
+
+        try:
+            if len(tickers) == 1:
+                df = yf.download(tickers[0], period="2d", interval="5m",
+                                 progress=False, auto_adjust=True)
+                if not df.empty:
+                    prices[tickers[0]] = float(df["Close"].dropna().iloc[-1])
+            else:
+                df = yf.download(tickers, period="2d", interval="5m",
+                                 progress=False, auto_adjust=True)
+                if not df.empty:
+                    close_data = df.get("Close", df)
+                    if isinstance(close_data, pd.DataFrame):
+                        for tk in tickers:
+                            if tk in close_data.columns:
+                                s = close_data[tk].dropna()
+                                if not s.empty:
+                                    prices[tk] = float(s.iloc[-1])
+                    elif isinstance(close_data, pd.Series):
+                        s = close_data.dropna()
+                        if not s.empty and tickers:
+                            prices[tickers[0]] = float(s.iloc[-1])
+            fetched = bool(prices)
+        except Exception:
+            pass
+
+        result_positions = []
+        total_unrealized = 0.0
+        total_cost       = 0.0
+        total_current    = 0.0
+
+        for p in positions:
+            tk     = p["ticker"]
+            ep     = float(p.get("entry_price") or 0)
+            shares = float(p.get("shares") or 0)
+            gross  = float(p.get("gross_invested") or 0)   # cash deployed (incl buy fee)
+
+            cur      = prices.get(tk)
+            has_live = cur is not None
+            if not has_live:
+                cur = ep  # fall back to entry price so maths are neutral
+
+            cur_value = shares * cur
+            unr_pnl   = cur_value - gross
+            unr_pct   = (unr_pnl / gross * 100) if gross else 0.0
+
+            total_unrealized += unr_pnl
+            total_cost       += gross
+            total_current    += cur_value
+
+            result_positions.append({
+                "ticker":         tk,
+                "entry_price":    ep,
+                "current_price":  cur,
+                "shares":         shares,
+                "cost_basis":     gross,
+                "current_value":  cur_value,
+                "unrealized_pnl": unr_pnl,
+                "unrealized_pct": unr_pct,
+                "has_live_price": has_live,
+            })
+
+        total_pct = (total_unrealized / total_cost * 100) if total_cost else 0.0
+        return {
+            "total":               total_unrealized,
+            "pct":                 total_pct,
+            "positions":           result_positions,
+            "total_current_value": total_current,
+            "total_cost":          total_cost,
+            "fetched":             fetched,
+        }
+
 
 class CallLogger:
     """Records every scanner call and tracks outcomes persistently via SQLite."""

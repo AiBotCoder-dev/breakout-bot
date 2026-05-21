@@ -6399,17 +6399,17 @@ class OptionsChainAnalyzer:
 # ── Aggressive Options Scanner ────────────────────────────────────────────────
 
 class AggressiveOptionsScanner:
-    """Detect sweeps, blocks, gamma rips, and bullish flow across multiple tickers."""
+    """Detect sweeps, blocks, and gamma plays — 0DTE to 7DTE only."""
 
+    MAX_DTE           = 7      # hard cap — nothing longer than 1 week
     SWEEP_VOL_OI_MULT = 5.0    # vol > 5× OI  → fresh institutional
-    SWEEP_MIN_VOL     = 200    # minimum contracts for a sweep flag
-    BLOCK_MIN_VOL     = 5_000  # block trade threshold
-    GAMMA_MAX_DTE     = 7      # short-dated OTM calls
-    GAMMA_MIN_VOL     = 100
+    SWEEP_MIN_VOL     = 50     # lower bar for short-dated (0DTE has tiny OI)
+    BLOCK_MIN_VOL     = 1_000  # block threshold (smaller for weeklies)
+    GAMMA_MIN_VOL     = 50     # gamma rip: OTM call with any real volume
 
     def scan_ticker(self, ticker):
         """
-        Scan near-term expiries of *ticker* for unusual activity.
+        Scan 0DTE–7DTE expiries only for unusual activity.
         Returns list of alert dicts.
         """
         alerts = []
@@ -6420,14 +6420,23 @@ class AggressiveOptionsScanner:
             if not exps or spot <= 0:
                 return alerts
 
-            for expiry in exps[:4]:          # focus on the 4 nearest expiries
+            today = datetime.utcnow().date()
+            for expiry in exps:
+                try:
+                    dte = (datetime.strptime(expiry, "%Y-%m-%d").date() - today).days
+                except ValueError:
+                    continue
+                if dte > self.MAX_DTE:       # skip anything beyond 7 days
+                    break                    # expirations are sorted ascending
+                if dte < 0:
+                    continue
+
                 try:
                     chain = analyzer.get_chain(expiry)
                 except Exception:
                     continue
                 if not chain:
                     continue
-                dte = chain["dte"]
 
                 for opt_type, df in (("call", chain["calls"]), ("put", chain["puts"])):
                     for _, row in df.iterrows():
@@ -6438,20 +6447,25 @@ class AggressiveOptionsScanner:
                         iv_pct = float(row.get("iv_pct",       0) or 0)
                         symbol = str(row.get("contractSymbol", ""))
 
-                        if strike <= 0 or vol < 10:
+                        if strike <= 0 or vol < 5:
                             continue
 
                         tags = []
-                        # Sweep: high vol vs open interest → new positioning
+                        # 0DTE tag
+                        if dte == 0:
+                            tags.append("0DTE")
+                        # Sweep: high vol vs OI = new money, not hedge rolls
                         if vol >= self.SWEEP_MIN_VOL and (oi == 0 or vol >= oi * self.SWEEP_VOL_OI_MULT):
                             tags.append("SWEEP")
                         # Block trade
                         if vol >= self.BLOCK_MIN_VOL:
                             tags.append("BLOCK")
-                        # Gamma rip: short-dated OTM call with volume
-                        if (opt_type == "call" and dte <= self.GAMMA_MAX_DTE
-                                and strike > spot and vol >= self.GAMMA_MIN_VOL):
+                        # Gamma rip: OTM call, short-dated, real volume
+                        if opt_type == "call" and strike > spot and vol >= self.GAMMA_MIN_VOL:
                             tags.append("GAMMA_RIP")
+                        # Put sweep on breakout ticker = smart hedge / counter signal
+                        if opt_type == "put" and vol >= self.SWEEP_MIN_VOL and (oi == 0 or vol >= oi * self.SWEEP_VOL_OI_MULT):
+                            tags.append("PUT_SWEEP")
 
                         if tags:
                             alerts.append({
@@ -6486,13 +6500,16 @@ class AggressiveOptionsScanner:
 # ── Options Strategy Engine ───────────────────────────────────────────────────
 
 class OptionsStrategyEngine:
-    """Auto-suggest aggressive options strategies for a given ticker + bias."""
+    """Auto-suggest aggressive 0DTE–7DTE options plays for a given ticker + bias."""
 
     def suggest(self, ticker, bias="bullish"):
         """
-        Returns list of strategy suggestion dicts, each with:
-          strategy, description, legs, entry_cost, max_loss, max_profit,
-          dte, expiry, strike, opt_type, mid
+        Returns list of strategy suggestion dicts.  All plays are 0–7 DTE.
+        Strategies (bullish):
+          1. 0DTE Scalp          — ATM call,        DTE = 0 (same day)
+          2. 3DTE Momentum Call  — ATM call,        1–3 DTE
+          3. Weekly Power Call   — 1% OTM call,     5–7 DTE
+        Strategies (bearish): mirror with puts.
         """
         suggestions = []
         try:
@@ -6502,111 +6519,86 @@ class OptionsStrategyEngine:
             if not exps or spot <= 0:
                 return suggestions
 
-            bias = str(bias).lower()
+            bias     = str(bias).lower()
+            is_call  = (bias != "bearish")
+            opt_type = "call" if is_call else "put"
+            label    = "C" if is_call else "P"
 
-            if bias == "bullish":
-                # ── 1. Momentum Call: ATM, 21-35 DTE ─────────────────────────
-                exp25 = self._nearest_expiry(exps, 21, 35)
-                if exp25:
-                    data = analyzer.get_chain(exp25)
-                    if data:
-                        calls = data["calls"]
-                        atm   = self._atm_strike(calls["strike"].tolist(), spot)
-                        r     = calls[calls["strike"] == atm]
-                        if not r.empty:
-                            mid = float(r["mid"].iloc[0])
+            # ── 1. 0DTE Scalp ─────────────────────────────────────────────────
+            exp0 = self._nearest_expiry(exps, 0, 0)
+            if exp0:
+                data = analyzer.get_chain(exp0)
+                if data:
+                    df  = data["calls"] if is_call else data["puts"]
+                    atm = self._atm_strike(df["strike"].tolist(), spot)
+                    r   = df[df["strike"] == atm]
+                    if not r.empty:
+                        mid = float(r["mid"].iloc[0])
+                        if mid > 0:
                             suggestions.append({
-                                "strategy":    "Momentum Call",
-                                "description": f"ATM {ticker} ${atm:.0f}C  {data['dte']} DTE — ride the momentum",
-                                "legs":        [f"BUY 1× {ticker} {exp25} ${atm:.0f} CALL @ ${mid:.2f}"],
+                                "strategy":    "0DTE Scalp",
+                                "description": f"ATM {ticker} ${atm:.0f}{label}  0 DTE — pure intraday gamma",
+                                "legs":        [f"BUY 1× {ticker} {exp0} ${atm:.0f} {opt_type.upper()} @ ${mid:.2f}"],
                                 "entry_cost":  round(mid * 100, 2),
                                 "max_loss":    round(mid * 100, 2),
-                                "max_profit":  "Unlimited",
-                                "dte":         data["dte"],
-                                "expiry":      exp25,
+                                "max_profit":  "Unlimited" if is_call else f"${round(atm * 100, 2):.2f}",
+                                "dte":         0,
+                                "expiry":      exp0,
                                 "strike":      atm,
-                                "opt_type":    "call",
+                                "opt_type":    opt_type,
                                 "mid":         mid,
                             })
 
-                # ── 2. Weekly Gamma Play: 1.5% OTM, 3-7 DTE ─────────────────
-                exp7 = self._nearest_expiry(exps, 3, 7)
-                if exp7:
-                    data = analyzer.get_chain(exp7)
-                    if data:
-                        calls = data["calls"]
-                        otm   = self._otm_strike(calls["strike"].tolist(), spot, 0.015)
-                        r     = calls[calls["strike"] == otm]
-                        if not r.empty:
-                            mid = float(r["mid"].iloc[0])
+            # ── 2. 3DTE Momentum ──────────────────────────────────────────────
+            exp3 = self._nearest_expiry(exps, 1, 3)
+            if exp3:
+                data = analyzer.get_chain(exp3)
+                if data:
+                    df  = data["calls"] if is_call else data["puts"]
+                    atm = self._atm_strike(df["strike"].tolist(), spot)
+                    r   = df[df["strike"] == atm]
+                    if not r.empty:
+                        mid = float(r["mid"].iloc[0])
+                        if mid > 0:
                             suggestions.append({
-                                "strategy":    "Weekly Gamma Play",
-                                "description": f"OTM {ticker} ${otm:.0f}C  {data['dte']} DTE — lottery ticket",
-                                "legs":        [f"BUY 1× {ticker} {exp7} ${otm:.0f} CALL @ ${mid:.2f}"],
+                                "strategy":    "3DTE Momentum",
+                                "description": f"ATM {ticker} ${atm:.0f}{label}  {data['dte']} DTE — 2-3 day move",
+                                "legs":        [f"BUY 1× {ticker} {exp3} ${atm:.0f} {opt_type.upper()} @ ${mid:.2f}"],
                                 "entry_cost":  round(mid * 100, 2),
                                 "max_loss":    round(mid * 100, 2),
-                                "max_profit":  "Unlimited",
+                                "max_profit":  "Unlimited" if is_call else f"${round(atm * 100, 2):.2f}",
+                                "dte":         data["dte"],
+                                "expiry":      exp3,
+                                "strike":      atm,
+                                "opt_type":    opt_type,
+                                "mid":         mid,
+                            })
+
+            # ── 3. Weekly Power (5-7 DTE, slightly OTM) ──────────────────────
+            exp7 = self._nearest_expiry(exps, 5, 7)
+            if exp7:
+                data = analyzer.get_chain(exp7)
+                if data:
+                    df  = data["calls"] if is_call else data["puts"]
+                    if is_call:
+                        strike = self._otm_strike(df["strike"].tolist(), spot, 0.01)
+                    else:
+                        strike = self._itm_put_strike(df["strike"].tolist(), spot, 0.01)
+                    r = df[df["strike"] == strike]
+                    if not r.empty:
+                        mid = float(r["mid"].iloc[0])
+                        if mid > 0:
+                            suggestions.append({
+                                "strategy":    "Weekly Power",
+                                "description": f"OTM {ticker} ${strike:.0f}{label}  {data['dte']} DTE — end-of-week rip",
+                                "legs":        [f"BUY 1× {ticker} {exp7} ${strike:.0f} {opt_type.upper()} @ ${mid:.2f}"],
+                                "entry_cost":  round(mid * 100, 2),
+                                "max_loss":    round(mid * 100, 2),
+                                "max_profit":  "Unlimited" if is_call else f"${round(strike * 100, 2):.2f}",
                                 "dte":         data["dte"],
                                 "expiry":      exp7,
-                                "strike":      otm,
-                                "opt_type":    "call",
-                                "mid":         mid,
-                            })
-
-                # ── 3. Debit Call Spread: ATM + sell 5% OTM, 21-35 DTE ───────
-                if exp25:
-                    data = analyzer.get_chain(exp25)
-                    if data:
-                        calls = data["calls"]
-                        atm   = self._atm_strike(calls["strike"].tolist(), spot)
-                        upper = self._otm_strike(calls["strike"].tolist(), spot, 0.05)
-                        r_atm = calls[calls["strike"] == atm]
-                        r_upr = calls[calls["strike"] == upper]
-                        if not r_atm.empty and not r_upr.empty:
-                            b_mid = float(r_atm["mid"].iloc[0])
-                            s_mid = float(r_upr["mid"].iloc[0])
-                            debit = round((b_mid - s_mid) * 100, 2)
-                            width = round((upper - atm) * 100, 2)
-                            if debit > 0 and width > debit:
-                                suggestions.append({
-                                    "strategy":    "Debit Call Spread",
-                                    "description": f"${atm:.0f}/${upper:.0f} spread {data['dte']} DTE — defined risk",
-                                    "legs":        [
-                                        f"BUY  1× {ticker} {exp25} ${atm:.0f} CALL @ ${b_mid:.2f}",
-                                        f"SELL 1× {ticker} {exp25} ${upper:.0f} CALL @ ${s_mid:.2f}",
-                                    ],
-                                    "entry_cost":  debit,
-                                    "max_loss":    debit,
-                                    "max_profit":  round(width - debit, 2),
-                                    "dte":         data["dte"],
-                                    "expiry":      exp25,
-                                    "strike":      atm,
-                                    "opt_type":    "call",
-                                    "mid":         b_mid,
-                                })
-
-            elif bias == "bearish":
-                # ── 1. Momentum Put: ATM, 21-35 DTE ──────────────────────────
-                exp25 = self._nearest_expiry(exps, 21, 35)
-                if exp25:
-                    data = analyzer.get_chain(exp25)
-                    if data:
-                        puts = data["puts"]
-                        atm  = self._atm_strike(puts["strike"].tolist(), spot)
-                        r    = puts[puts["strike"] == atm]
-                        if not r.empty:
-                            mid = float(r["mid"].iloc[0])
-                            suggestions.append({
-                                "strategy":    "Momentum Put",
-                                "description": f"ATM {ticker} ${atm:.0f}P  {data['dte']} DTE — fade the move",
-                                "legs":        [f"BUY 1× {ticker} {exp25} ${atm:.0f} PUT @ ${mid:.2f}"],
-                                "entry_cost":  round(mid * 100, 2),
-                                "max_loss":    round(mid * 100, 2),
-                                "max_profit":  round(atm * 100, 2),
-                                "dte":         data["dte"],
-                                "expiry":      exp25,
-                                "strike":      atm,
-                                "opt_type":    "put",
+                                "strike":      strike,
+                                "opt_type":    opt_type,
                                 "mid":         mid,
                             })
 
@@ -6633,12 +6625,95 @@ class OptionsStrategyEngine:
         return min(strikes, key=lambda k: abs(k - spot)) if strikes else spot
 
     @staticmethod
-    def _otm_strike(strikes, spot, offset_pct=0.05):
+    def _otm_strike(strikes, spot, offset_pct=0.01):
         target = spot * (1 + offset_pct)
         otm = [s for s in strikes if s > spot]
         if not otm:
             return max(strikes) if strikes else spot
         return min(otm, key=lambda k: abs(k - target))
+
+    @staticmethod
+    def _itm_put_strike(strikes, spot, offset_pct=0.01):
+        """Slightly below spot — 1% OTM for puts."""
+        target = spot * (1 - offset_pct)
+        below = [s for s in strikes if s < spot]
+        if not below:
+            return min(strikes) if strikes else spot
+        return min(below, key=lambda k: abs(k - target))
+
+
+# ── Scan-to-Options Bridge ────────────────────────────────────────────────────
+
+def get_scan_options_plays(conn, top_n=8, bias_override=None):
+    """
+    Query the most recent breakout scan results from the *calls* table and
+    generate 0DTE–7DTE options plays for each ticker.
+
+    Parameters
+    ----------
+    conn          : PgAdapter / sqlite3 connection
+    top_n         : how many top-scoring tickers to process (default 8)
+    bias_override : force 'bullish' or 'bearish' for all tickers (None = auto)
+
+    Returns
+    -------
+    List of dicts, one per ticker:
+      ticker, explosive_score, breakout_prob, pattern_detected,
+      entry_price, target_price, stop_loss, scan_timestamp,
+      bias, suggestions (list of strategy dicts)
+    """
+    results = []
+    try:
+        # Get the most recent scan_id so we only look at the latest batch
+        row = conn.execute(
+            "SELECT scan_id FROM calls ORDER BY scan_timestamp DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return results
+        latest_scan_id = row[0] if row else None
+
+        if latest_scan_id:
+            rows = conn.execute(
+                "SELECT ticker, explosive_score, breakout_prob, pattern_detected, "
+                "entry_price, target_price, stop_loss, scan_timestamp "
+                "FROM calls WHERE scan_id = ? "
+                "ORDER BY explosive_score DESC LIMIT ?",
+                (latest_scan_id, top_n)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT ticker, explosive_score, breakout_prob, pattern_detected, "
+                "entry_price, target_price, stop_loss, scan_timestamp "
+                "FROM calls ORDER BY scan_timestamp DESC, explosive_score DESC LIMIT ?",
+                (top_n,)
+            ).fetchall()
+    except Exception:
+        return results
+
+    engine = OptionsStrategyEngine()
+    for row in rows:
+        try:
+            ticker = str(row.get("ticker") or row[0] or "")
+            if not ticker:
+                continue
+            # Breakout scanner picks are bullish by nature; allow override
+            bias = bias_override or "bullish"
+            plays = engine.suggest(ticker, bias=bias)
+            results.append({
+                "ticker":           ticker,
+                "explosive_score":  float(row.get("explosive_score") or 0),
+                "breakout_prob":    float(row.get("breakout_prob")   or 0),
+                "pattern_detected": str(row.get("pattern_detected")  or ""),
+                "entry_price":      float(row.get("entry_price")     or 0),
+                "target_price":     float(row.get("target_price")    or 0),
+                "stop_loss":        float(row.get("stop_loss")       or 0),
+                "scan_timestamp":   str(row.get("scan_timestamp")    or ""),
+                "bias":             bias,
+                "suggestions":      plays,
+            })
+        except Exception:
+            continue
+    return results
 
 
 # ── Options Paper Trading Engine ──────────────────────────────────────────────

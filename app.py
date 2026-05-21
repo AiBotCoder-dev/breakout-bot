@@ -2109,36 +2109,78 @@ with tab_options:
     # SUB-TAB 2 — UNUSUAL ACTIVITY SCANNER
     # ─────────────────────────────────────────────────────────────────────────
     with ot_unusual:
-        st.markdown('<div class="section-hdr">🔥 Unusual Options Activity Scanner</div>',
+        st.markdown('<div class="section-hdr">🔥 Unusual Options Flow — 0DTE to 7DTE Only</div>',
                     unsafe_allow_html=True)
         st.caption(
-            "Detects SWEEP (vol > 5× OI), BLOCK (>5,000 contracts), "
-            "GAMMA_RIP (OTM calls ≤7 DTE). High volume vs OI = fresh institutional positioning."
+            "Scans **0DTE–7DTE contracts only**. Tags: "
+            "0DTE (same-day expiry) · SWEEP (vol > 5× OI, new positioning) · "
+            "BLOCK (>1,000 contracts) · GAMMA_RIP (OTM call with real volume) · "
+            "PUT_SWEEP (bearish institutional hedge)."
         )
 
-        _ua1, _ua2 = st.columns([4, 1])
-        with _ua1:
+        # ── Ticker source ─────────────────────────────────────────────────────
+        _ua_src = st.radio(
+            "Ticker source",
+            ["📡 Latest scan results", "✏️ Enter manually"],
+            horizontal=True, key="ua_src_radio",
+        )
+
+        if _ua_src == "📡 Latest scan results":
+            # Auto-load tickers from the most recent breakout scan
+            @st.cache_data(ttl=120, show_spinner=False)
+            def _get_scan_tickers_for_ua(_conn_id):
+                try:
+                    row = conn.execute(
+                        "SELECT scan_id FROM calls ORDER BY scan_timestamp DESC LIMIT 1"
+                    ).fetchone()
+                    if not row:
+                        return []
+                    rows = conn.execute(
+                        "SELECT ticker FROM calls WHERE scan_id=? "
+                        "ORDER BY explosive_score DESC LIMIT 15",
+                        (row[0],)
+                    ).fetchall()
+                    return [r[0] for r in rows if r[0]]
+                except Exception:
+                    return []
+
+            _scan_tks = _get_scan_tickers_for_ua(id(conn))
+            if _scan_tks:
+                st.info(
+                    f"📡 **{len(_scan_tks)} tickers** loaded from latest scan: "
+                    + ", ".join(_scan_tks),
+                    icon="📡",
+                )
+                scan_tickers_raw = ", ".join(_scan_tks)
+            else:
+                st.warning("No scan results found. Run a breakout scan first, or switch to manual entry.", icon="⚠️")
+                scan_tickers_raw = opt_ticker
+        else:
             scan_tickers_raw = st.text_input(
                 "Tickers to scan (comma-separated)",
                 value=opt_ticker,
-                key="unusual_scan_tickers",
+                key="unusual_scan_tickers_manual",
                 placeholder="SPY, QQQ, AAPL, TSLA, NVDA",
             )
-        with _ua2:
-            scan_btn = st.button("🔍 Scan Now", use_container_width=True,
-                                 key="unusual_scan_btn")
+
+        scan_btn = st.button("🔍 Scan 0DTE–7DTE Flow Now", use_container_width=False,
+                             key="unusual_scan_btn")
 
         if scan_btn:
             scan_list = [t.strip().upper() for t in scan_tickers_raw.split(",") if t.strip()]
             if not scan_list:
                 st.warning("Enter at least one ticker.", icon="⚠️")
             else:
-                with st.spinner(f"Scanning {len(scan_list)} ticker(s) for unusual activity…"):
+                with st.spinner(f"Scanning {len(scan_list)} ticker(s) for 0DTE–7DTE unusual flow…"):
                     scanner_ua = ts.AggressiveOptionsScanner()
                     alerts     = scanner_ua.scan_many(scan_list)
 
                 if not alerts:
-                    st.info("No unusual activity detected. Markets may be quiet or data unavailable.", icon="🔇")
+                    st.info(
+                        "No unusual activity found in 0–7 DTE contracts. "
+                        "Markets may be quiet, or no short-dated expiries exist yet today.",
+                        icon="🔇",
+                    )
                 else:
                     st.success(f"**{len(alerts)} alert(s) found!**", icon="🔥")
 
@@ -2146,22 +2188,19 @@ with tab_options:
                     for a in alerts:
                         bias_icon = "🟢" if a["bias"] == "BULLISH" else "🔴"
                         tag_str   = a.get("tags", "")
-                        tags_md   = " ".join(
-                            f"**{t}**" for t in tag_str.split(" · ") if t
-                        )
                         rows_ua.append({
-                            "Ticker":   a["ticker"],
-                            "Bias":     f"{bias_icon} {a['bias']}",
-                            "Type":     a["type"],
-                            "Strike":   f"${a['strike']:.2f}",
-                            "Expiry":   a["expiry"],
-                            "DTE":      a["dte"],
-                            "Volume":   f"{a['volume']:,}",
-                            "OI":       f"{a['open_interest']:,}",
-                            "Vol/OI":   f"{a['vol_oi_ratio']:.1f}×",
-                            "Mid":      f"${a['mid_price']:.2f}",
-                            "IV %":     f"{a['iv_pct']:.1f}%",
-                            "Tags":     tag_str,
+                            "Ticker":  a["ticker"],
+                            "Bias":    f"{bias_icon} {a['bias']}",
+                            "Type":    a["type"],
+                            "Strike":  f"${a['strike']:.2f}",
+                            "Expiry":  a["expiry"],
+                            "DTE":     a["dte"],
+                            "Volume":  f"{a['volume']:,}",
+                            "OI":      f"{a['open_interest']:,}",
+                            "Vol/OI":  f"{a['vol_oi_ratio']:.1f}×",
+                            "Mid":     f"${a['mid_price']:.2f}",
+                            "IV %":    f"{a['iv_pct']:.1f}%",
+                            "Tags":    tag_str,
                         })
                     st.dataframe(pd.DataFrame(rows_ua),
                                  use_container_width=True, hide_index=True)
@@ -2170,127 +2209,197 @@ with tab_options:
                     fig_ua = go.Figure()
                     for a in alerts[:20]:
                         color = "#3fb950" if a["bias"] == "BULLISH" else "#f85149"
-                        label = f"{a['ticker']} ${a['strike']:.0f}{a['type'][0]} {a['expiry']}"
-                        fig_ua.add_bar(x=[label], y=[a["volume"]],
+                        lbl   = f"{a['ticker']} ${a['strike']:.0f}{a['type'][0]} ({a['dte']}d)"
+                        fig_ua.add_bar(x=[lbl], y=[a["volume"]],
                                        marker_color=color,
-                                       name=a["tags"])
+                                       text=a.get("tags", ""),
+                                       textposition="outside",
+                                       name=a.get("tags", ""))
                     fig_ua.update_layout(
                         showlegend=False,
                         paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
-                        font=dict(color="#c9d1d9"), height=300,
+                        font=dict(color="#c9d1d9"), height=320,
                         xaxis=dict(gridcolor="#21262d", tickangle=-35),
-                        yaxis=dict(gridcolor="#21262d", title="Volume"),
-                        margin=dict(l=10, r=10, t=10, b=80),
-                        title=dict(text="Top Unusual Contracts by Volume",
+                        yaxis=dict(gridcolor="#21262d", title="Volume (contracts)"),
+                        margin=dict(l=10, r=10, t=30, b=80),
+                        title=dict(text="0DTE–7DTE Unusual Flow — Top Contracts by Volume",
                                    font=dict(color="#c9d1d9")),
                     )
                     st.plotly_chart(fig_ua, use_container_width=True)
 
         else:
-            st.info("Enter tickers and press **Scan Now** to detect unusual options flow.", icon="🔍")
+            st.info("Choose a ticker source and press **Scan** to detect short-dated unusual flow.", icon="🔍")
 
     # ─────────────────────────────────────────────────────────────────────────
     # SUB-TAB 3 — STRATEGY BUILDER
     # ─────────────────────────────────────────────────────────────────────────
     with ot_strategy:
-        st.markdown('<div class="section-hdr">🎯 Aggressive Strategy Builder</div>',
+        st.markdown('<div class="section-hdr">🎯 Strategy Builder — 0DTE · 3DTE · Weekly Power</div>',
                     unsafe_allow_html=True)
         st.caption(
-            "Auto-generates high-conviction option plays based on spot price, "
-            "available expiries, and your directional bias."
+            "Generates three aggressive short-dated plays per ticker: "
+            "**0DTE Scalp** (ATM, same day) · **3DTE Momentum** (ATM, 1–3 days) · "
+            "**Weekly Power** (1% OTM, 5–7 days). "
+            "Use **Scan Results** mode to auto-build plays for every breakout pick at once."
         )
 
-        _sb1, _sb2 = st.columns([3, 1])
-        with _sb2:
-            strat_btn = st.button("⚡ Build Strategies", use_container_width=True,
-                                  key="strat_build_btn")
+        # ── Mode selector ─────────────────────────────────────────────────────
+        _sb_mode = st.radio(
+            "Build from",
+            ["📡 Latest scan results (all tickers)", "🎯 Single ticker"],
+            horizontal=True, key="strat_mode_radio",
+        )
 
-        if strat_btn:
-            if not opt_ticker:
-                st.warning("Enter a ticker in the control bar above.", icon="⚠️")
-            else:
-                with st.spinner(f"Building strategies for {opt_ticker} ({opt_bias})…"):
-                    engine      = ts.OptionsStrategyEngine()
-                    suggestions = engine.suggest(opt_ticker, bias=opt_bias.lower())
+        ops_engine_strat = ts.OptionsPaperEngine(conn)
 
-                if not suggestions:
+        def _render_strategy_cards(ticker, suggestions, scan_meta=None):
+            """Render expander cards for each strategy suggestion."""
+            if not suggestions:
+                st.warning(
+                    f"No 0–7 DTE plays available for **{ticker}** "
+                    "(market may be closed or no short-dated expiries exist).",
+                    icon="⚠️",
+                )
+                return
+
+            for sg in suggestions:
+                cost_str = (f"${sg['entry_cost']:.2f}"
+                            if isinstance(sg.get("entry_cost"), (int, float))
+                            else "—")
+                prof_str = (f"${sg['max_profit']:.2f}"
+                            if isinstance(sg.get("max_profit"), (int, float))
+                            else str(sg.get("max_profit", "—")))
+                loss_str = (f"${sg['max_loss']:.2f}"
+                            if isinstance(sg.get("max_loss"), (int, float))
+                            else "—")
+                dte_badge = f"{'🔴' if sg.get('dte', 99) == 0 else '🟡' if sg.get('dte', 99) <= 3 else '🟢'} {sg.get('dte', '?')} DTE"
+
+                exp_title = (
+                    f"**{ticker}** · {sg['strategy']}  {dte_badge}  "
+                    f"| Cost {cost_str}  Max Loss {loss_str}  Max Profit {prof_str}"
+                )
+                with st.expander(exp_title, expanded=True):
+                    if scan_meta:
+                        _mc1, _mc2, _mc3 = st.columns(3)
+                        _mc1.metric("Breakout Score",
+                                    f"{scan_meta.get('explosive_score', 0):.0f}")
+                        _mc2.metric("Prob",
+                                    f"{scan_meta.get('breakout_prob', 0):.0f}%")
+                        _mc3.metric("Pattern",
+                                    scan_meta.get("pattern_detected", "—") or "—")
+
+                    st.markdown("**Trade:**")
+                    for leg in sg.get("legs", []):
+                        st.code(leg)
+
+                    _s1, _s2, _s3, _s4 = st.columns(4)
+                    _s1.metric("Entry Cost", cost_str)
+                    _s2.metric("Max Loss",   loss_str)
+                    _s3.metric("Max Profit", prof_str)
+                    _s4.metric("DTE",        sg.get("dte", "—"))
+
+                    btn_key = (
+                        f"pbuy_{ticker}_{sg['strategy'].replace(' ', '_')}"
+                        f"_{sg.get('strike', 0):.0f}_{sg.get('expiry', '')}"
+                    )
+                    if st.button(
+                        f"💼 Paper Trade — {opt_contracts}× contract(s)",
+                        key=btn_key,
+                    ):
+                        mid        = sg.get("mid", 0)
+                        cost_total = mid * 100 * opt_contracts
+                        summ       = ops_engine_strat.get_summary()
+                        if cost_total > summ["available_cash"]:
+                            st.error(
+                                f"Not enough paper cash. Need ${cost_total:.2f}, "
+                                f"have ${summ['available_cash']:.2f}.",
+                                icon="❌",
+                            )
+                        else:
+                            res = ops_engine_strat.buy(
+                                ticker          = ticker,
+                                contract_symbol = (
+                                    f"{ticker}_{sg['expiry']}_"
+                                    f"{sg['opt_type']}_{sg['strike']:.0f}"
+                                ),
+                                option_type     = sg["opt_type"],
+                                strike          = sg["strike"],
+                                expiry          = sg["expiry"],
+                                contracts       = opt_contracts,
+                                entry_price     = mid,
+                                strategy        = sg["strategy"],
+                            )
+                            if res.get("ok"):
+                                st.success(
+                                    f"✅ Bought {opt_contracts}× {sg['strategy']} on {ticker} "
+                                    f"for ${res['cost']:.2f}. "
+                                    f"Cash left: ${res['cash_remaining']:.2f}",
+                                    icon="✅",
+                                )
+                                st.rerun()
+                            else:
+                                st.error(f"Trade failed: {res.get('error')}", icon="❌")
+
+        # ── Mode: from scan results ───────────────────────────────────────────
+        if _sb_mode == "📡 Latest scan results (all tickers)":
+            scan_run_btn = st.button("📡 Load Scan Picks & Build All Plays",
+                                     use_container_width=False,
+                                     key="scan_strat_run_btn")
+            if scan_run_btn:
+                with st.spinner("Loading latest scan picks and generating 0DTE–7DTE plays…"):
+                    scan_plays = ts.get_scan_options_plays(conn, top_n=8,
+                                                           bias_override=opt_bias.lower())
+
+                if not scan_plays:
                     st.warning(
-                        f"No strategies generated for **{opt_ticker}**. "
-                        "Options data may be unavailable or market is closed.",
+                        "No scan results in the database. "
+                        "Run the breakout scanner (Scan Results tab) first.",
                         icon="⚠️",
                     )
                 else:
-                    st.success(f"**{len(suggestions)} strategy(ies) ready for {opt_ticker}**", icon="🎯")
+                    total_plays = sum(len(p["suggestions"]) for p in scan_plays)
+                    st.success(
+                        f"**{len(scan_plays)} tickers · {total_plays} plays generated** "
+                        f"from latest scan  |  bias: {opt_bias}",
+                        icon="📡",
+                    )
+                    for sp in scan_plays:
+                        st.markdown(
+                            f"### {sp['ticker']}  "
+                            f"<small style='color:#8b949e'>score {sp['explosive_score']:.0f} · "
+                            f"prob {sp['breakout_prob']:.0f}% · "
+                            f"{sp['pattern_detected'] or 'pattern'}</small>",
+                            unsafe_allow_html=True,
+                        )
+                        _render_strategy_cards(sp["ticker"], sp["suggestions"], scan_meta=sp)
+                        st.divider()
+            else:
+                st.info(
+                    "Press **Load Scan Picks & Build All Plays** to auto-generate "
+                    "0DTE–7DTE plays for every ticker from the latest breakout scan.",
+                    icon="📡",
+                )
 
-                    ops_engine = ts.OptionsPaperEngine(conn)
-
-                    for sg in suggestions:
-                        cost_str = (f"${sg['entry_cost']:.2f}"
-                                    if isinstance(sg.get("entry_cost"), (int, float))
-                                    else str(sg.get("entry_cost", "—")))
-                        prof_str = (f"${sg['max_profit']:.2f}"
-                                    if isinstance(sg.get("max_profit"), (int, float))
-                                    else str(sg.get("max_profit", "—")))
-                        loss_str = (f"${sg['max_loss']:.2f}"
-                                    if isinstance(sg.get("max_loss"), (int, float))
-                                    else str(sg.get("max_loss", "—")))
-
-                        with st.expander(
-                            f"**{sg['strategy']}** — {sg['description']}  "
-                            f"| Cost: {cost_str}  Max Loss: {loss_str}  Max Profit: {prof_str}",
-                            expanded=True,
-                        ):
-                            # Legs
-                            st.markdown("**Trade legs:**")
-                            for leg in sg.get("legs", []):
-                                st.code(leg)
-
-                            # Key metrics
-                            _s1, _s2, _s3, _s4 = st.columns(4)
-                            _s1.metric("Entry Cost",  cost_str)
-                            _s2.metric("Max Loss",    loss_str)
-                            _s3.metric("Max Profit",  prof_str)
-                            _s4.metric("DTE",         sg.get("dte", "—"))
-
-                            # Paper trade button
-                            btn_key = f"paper_buy_{sg['strategy'].replace(' ', '_')}_{sg.get('strike')}"
-                            if st.button(f"💼 Paper Trade — Buy {opt_contracts}× contract(s)",
-                                         key=btn_key):
-                                mid  = sg.get("mid", 0)
-                                cost_total = mid * 100 * opt_contracts
-                                summ = ops_engine.get_summary()
-                                if cost_total > summ["available_cash"]:
-                                    st.error(
-                                        f"Not enough paper cash. Need ${cost_total:.2f}, "
-                                        f"have ${summ['available_cash']:.2f}.", icon="❌"
-                                    )
-                                else:
-                                    result = ops_engine.buy(
-                                        ticker          = opt_ticker,
-                                        contract_symbol = f"{opt_ticker}_{sg['expiry']}_{sg['opt_type']}_{sg['strike']:.0f}",
-                                        option_type     = sg["opt_type"],
-                                        strike          = sg["strike"],
-                                        expiry          = sg["expiry"],
-                                        contracts       = opt_contracts,
-                                        entry_price     = mid,
-                                        strategy        = sg["strategy"],
-                                    )
-                                    if result.get("ok"):
-                                        st.success(
-                                            f"✅ Bought {opt_contracts}× {sg['strategy']} "
-                                            f"for ${result['cost']:.2f}. "
-                                            f"Cash remaining: ${result['cash_remaining']:.2f}",
-                                            icon="✅",
-                                        )
-                                        st.rerun()
-                                    else:
-                                        st.error(f"Trade failed: {result.get('error')}", icon="❌")
+        # ── Mode: single ticker ───────────────────────────────────────────────
         else:
-            st.info(
-                "Select a ticker and bias above, then press **Build Strategies** "
-                "to generate momentum calls, weekly gamma plays, and debit spreads.",
-                icon="🎯",
-            )
+            single_btn = st.button("⚡ Build Strategies", key="single_strat_btn")
+            if single_btn:
+                if not opt_ticker:
+                    st.warning("Enter a ticker in the control bar above.", icon="⚠️")
+                else:
+                    with st.spinner(f"Building 0DTE–7DTE plays for {opt_ticker} ({opt_bias})…"):
+                        engine_s    = ts.OptionsStrategyEngine()
+                        suggestions = engine_s.suggest(opt_ticker, bias=opt_bias.lower())
+                    st.success(
+                        f"**{len(suggestions)} play(s) for {opt_ticker}**", icon="🎯"
+                    ) if suggestions else None
+                    _render_strategy_cards(opt_ticker, suggestions)
+            else:
+                st.info(
+                    "Press **Build Strategies** to generate 0DTE Scalp, "
+                    "3DTE Momentum, and Weekly Power plays for the selected ticker.",
+                    icon="🎯",
+                )
 
     # ─────────────────────────────────────────────────────────────────────────
     # SUB-TAB 4 — OPTIONS PAPER TRADES

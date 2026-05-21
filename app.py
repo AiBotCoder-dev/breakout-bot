@@ -2296,7 +2296,7 @@ with tab_options:
     # SUB-TAB 4 — OPTIONS PAPER TRADES
     # ─────────────────────────────────────────────────────────────────────────
     with ot_paper:
-        st.markdown('<div class="section-hdr">💰 Options Paper Portfolio — $5,000 Virtual Capital</div>',
+        st.markdown('<div class="section-hdr">💰 Options Paper Portfolio — $500 Virtual Capital</div>',
                     unsafe_allow_html=True)
 
         ops_engine = ts.OptionsPaperEngine(conn)
@@ -2441,9 +2441,9 @@ with tab_options:
 
         st.divider()
         st.markdown("#### ⚠️ Reset Paper Account")
-        st.caption("This permanently deletes all options paper trades and resets cash to $5,000.")
+        st.caption("This permanently deletes all options paper trades and resets cash to $500.")
         if st.button("🗑 Reset Options Paper Account", key="ops_reset_btn",
                      type="secondary"):
             ops_engine.reset()
-            st.success("Options paper account reset to $5,000.", icon="🔄")
+            st.success("Options paper account reset to $500.", icon="🔄")
             st.rerun()

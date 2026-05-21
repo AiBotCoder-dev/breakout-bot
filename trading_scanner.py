@@ -6185,7 +6185,7 @@ except ImportError:
     _SCIPY_OK = False
 
 _RISK_FREE      = 0.05        # assumed risk-free rate (5 %)
-_OPTIONS_BUDGET = 5_000.0     # virtual paper capital
+_OPTIONS_BUDGET = 500.0       # virtual paper capital
 
 
 def _bs_greeks(S, K, T, r, sigma, opt_type="call"):

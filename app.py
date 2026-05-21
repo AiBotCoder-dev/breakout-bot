@@ -1954,9 +1954,66 @@ with tab_fees:
 
 with tab_options:
     st.markdown(
-        '<div class="section-hdr">⚡ Options Trading — High-Conviction Aggressive Plays</div>',
+        '<div class="section-hdr">⚡ Options Trading — Weekly Plays (5–7 DTE Sweet Spot)</div>',
         unsafe_allow_html=True,
     )
+
+    # ── Market context bar (VIX · Fear & Greed · Economic events) ────────────
+    @st.cache_data(ttl=300, show_spinner=False)
+    def _get_market_context():
+        return {
+            "vix":    ts.get_vix_level(),
+            "fg":     ts.get_fear_greed(),
+            "events": ts.get_economic_events(days_ahead=7),
+        }
+
+    _ctx = _get_market_context()
+    _vix = _ctx["vix"]
+    _fg  = _ctx["fg"]
+    _eco = _ctx["events"]
+
+    _mc1, _mc2, _mc3 = st.columns([1, 1, 2])
+
+    with _mc1:
+        if _vix:
+            _vix_colors = {"LOW": "🟢", "NORMAL": "🟡", "ELEVATED": "🟠", "EXTREME": "🔴"}
+            _vix_icon   = _vix_colors.get(_vix["regime"], "⚪")
+            st.metric(
+                label=f"{_vix_icon} VIX — {_vix['regime']}",
+                value=f"{_vix['vix']:.2f}",
+                help=_vix["advice"],
+            )
+        else:
+            st.metric("VIX", "—", help="Could not fetch VIX")
+
+    with _mc2:
+        if _fg:
+            st.metric(
+                label=f"{_fg['emoji']} Fear & Greed",
+                value=f"{_fg['score']:.0f} / 100",
+                delta=_fg["rating"],
+                help=(
+                    "0–25 Extreme Fear · 26–45 Fear · 46–55 Neutral · "
+                    "56–75 Greed · 76–100 Extreme Greed"
+                ),
+            )
+        else:
+            st.metric("Fear & Greed", "—", help="Could not fetch index")
+
+    with _mc3:
+        if _eco:
+            _eco_lines = "  |  ".join(
+                f"**{e['title']}** {e['date']} {e['time']}" for e in _eco[:4]
+            )
+            st.warning(
+                f"🗓 **High-impact events this week:** {_eco_lines}  "
+                "— IV can spike or crush around these. Check before entering.",
+                icon="🗓",
+            )
+        else:
+            st.info("No high-impact USD events in the next 7 days.", icon="🗓")
+
+    st.divider()
 
     # ── Ticker + bias controls (shared across all sub-tabs) ───────────────────
     _oc1, _oc2, _oc3 = st.columns([2, 1, 1])
@@ -2112,10 +2169,10 @@ with tab_options:
         st.markdown('<div class="section-hdr">🔥 Unusual Options Flow — 0DTE to 7DTE Only</div>',
                     unsafe_allow_html=True)
         st.caption(
-            "Scans **0DTE–7DTE contracts only**. Tags: "
-            "0DTE (same-day expiry) · SWEEP (vol > 5× OI, new positioning) · "
-            "BLOCK (>1,000 contracts) · GAMMA_RIP (OTM call with real volume) · "
-            "PUT_SWEEP (bearish institutional hedge)."
+            "Scans **0DTE–7DTE contracts** for institutional flow signals — "
+            "focus on 5–7 DTE (weekly) contracts that confirm your breakout play. "
+            "Tags: SWEEP (vol > 5× OI = new money) · BLOCK (>1,000 contracts) · "
+            "GAMMA_RIP (OTM call with volume) · PUT_SWEEP (bearish institutional hedge)."
         )
 
         # ── Ticker source ─────────────────────────────────────────────────────
@@ -2234,13 +2291,14 @@ with tab_options:
     # SUB-TAB 3 — STRATEGY BUILDER
     # ─────────────────────────────────────────────────────────────────────────
     with ot_strategy:
-        st.markdown('<div class="section-hdr">🎯 Strategy Builder — 0DTE · 3DTE · Weekly Power</div>',
+        st.markdown('<div class="section-hdr">🎯 Strategy Builder — Weekly Plays (5–7 DTE Focus)</div>',
                     unsafe_allow_html=True)
         st.caption(
-            "Generates three aggressive short-dated plays per ticker: "
-            "**0DTE Scalp** (ATM, same day) · **3DTE Momentum** (ATM, 1–3 days) · "
-            "**Weekly Power** (1% OTM, 5–7 days). "
-            "Use **Scan Results** mode to auto-build plays for every breakout pick at once."
+            "Generates three plays per ticker targeting the **current week's Friday expiry (~5–7 DTE)**. "
+            "**Weekly ATM** (full delta, highest probability) · "
+            "**Weekly OTM** (2% out-of-money, cheaper entry, needs bigger move) · "
+            "**Mid-Week ATM** (2–4 DTE, faster decay — use only with high conviction). "
+            "Earnings warnings are shown automatically for every play."
         )
 
         # ── Mode selector ─────────────────────────────────────────────────────
@@ -2287,6 +2345,16 @@ with tab_options:
                                     f"{scan_meta.get('breakout_prob', 0):.0f}%")
                         _mc3.metric("Pattern",
                                     scan_meta.get("pattern_detected", "—") or "—")
+
+                    # ── Earnings warning ──────────────────────────────────────
+                    _expiry_str = sg.get("expiry", "")
+                    if _expiry_str:
+                        try:
+                            _ew = ts.check_earnings_in_window(ticker, _expiry_str)
+                            if _ew.get("has_earnings"):
+                                st.error(_ew["warning"], icon="⚠️")
+                        except Exception:
+                            pass
 
                     st.markdown("**Trade:**")
                     for leg in sg.get("legs", []):

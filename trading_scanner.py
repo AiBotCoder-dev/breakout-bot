@@ -6500,16 +6500,16 @@ class AggressiveOptionsScanner:
 # ── Options Strategy Engine ───────────────────────────────────────────────────
 
 class OptionsStrategyEngine:
-    """Auto-suggest aggressive 0DTE–7DTE options plays for a given ticker + bias."""
+    """Auto-suggest weekly options plays (primary: 5–7 DTE, fallback: 2–4 DTE)."""
 
     def suggest(self, ticker, bias="bullish"):
         """
-        Returns list of strategy suggestion dicts.  All plays are 0–7 DTE.
+        Focuses on the current week's Friday expiry (~5–7 DTE sweet spot).
         Strategies (bullish):
-          1. 0DTE Scalp          — ATM call,        DTE = 0 (same day)
-          2. 3DTE Momentum Call  — ATM call,        1–3 DTE
-          3. Weekly Power Call   — 1% OTM call,     5–7 DTE
-        Strategies (bearish): mirror with puts.
+          1. Weekly ATM    — ATM call,    5–7 DTE  (highest probability, full delta)
+          2. Weekly OTM    — 2% OTM call, 5–7 DTE  (cheaper, higher gamma lever)
+          3. Mid-Week ATM  — ATM call,    2–4 DTE  (faster, if no 5-7 DTE found)
+        Strategies (bearish): same with puts.
         """
         suggestions = []
         try:
@@ -6524,83 +6524,105 @@ class OptionsStrategyEngine:
             opt_type = "call" if is_call else "put"
             label    = "C" if is_call else "P"
 
-            # ── 1. 0DTE Scalp ─────────────────────────────────────────────────
-            exp0 = self._nearest_expiry(exps, 0, 0)
-            if exp0:
-                data = analyzer.get_chain(exp0)
-                if data:
-                    df  = data["calls"] if is_call else data["puts"]
-                    atm = self._atm_strike(df["strike"].tolist(), spot)
-                    r   = df[df["strike"] == atm]
-                    if not r.empty:
-                        mid = float(r["mid"].iloc[0])
-                        if mid > 0:
-                            suggestions.append({
-                                "strategy":    "0DTE Scalp",
-                                "description": f"ATM {ticker} ${atm:.0f}{label}  0 DTE — pure intraday gamma",
-                                "legs":        [f"BUY 1× {ticker} {exp0} ${atm:.0f} {opt_type.upper()} @ ${mid:.2f}"],
-                                "entry_cost":  round(mid * 100, 2),
-                                "max_loss":    round(mid * 100, 2),
-                                "max_profit":  "Unlimited" if is_call else f"${round(atm * 100, 2):.2f}",
-                                "dte":         0,
-                                "expiry":      exp0,
-                                "strike":      atm,
-                                "opt_type":    opt_type,
-                                "mid":         mid,
-                            })
+            # Fetch the 5-7 DTE chain once; reuse for both Weekly plays
+            exp_week  = self._nearest_expiry(exps, 5, 7)
+            week_data = analyzer.get_chain(exp_week) if exp_week else None
 
-            # ── 2. 3DTE Momentum ──────────────────────────────────────────────
-            exp3 = self._nearest_expiry(exps, 1, 3)
-            if exp3:
-                data = analyzer.get_chain(exp3)
-                if data:
-                    df  = data["calls"] if is_call else data["puts"]
-                    atm = self._atm_strike(df["strike"].tolist(), spot)
-                    r   = df[df["strike"] == atm]
-                    if not r.empty:
-                        mid = float(r["mid"].iloc[0])
-                        if mid > 0:
-                            suggestions.append({
-                                "strategy":    "3DTE Momentum",
-                                "description": f"ATM {ticker} ${atm:.0f}{label}  {data['dte']} DTE — 2-3 day move",
-                                "legs":        [f"BUY 1× {ticker} {exp3} ${atm:.0f} {opt_type.upper()} @ ${mid:.2f}"],
-                                "entry_cost":  round(mid * 100, 2),
-                                "max_loss":    round(mid * 100, 2),
-                                "max_profit":  "Unlimited" if is_call else f"${round(atm * 100, 2):.2f}",
-                                "dte":         data["dte"],
-                                "expiry":      exp3,
-                                "strike":      atm,
-                                "opt_type":    opt_type,
-                                "mid":         mid,
-                            })
+            # ── 1. Weekly ATM (5–7 DTE, at-the-money) ────────────────────────
+            if week_data:
+                df  = week_data["calls"] if is_call else week_data["puts"]
+                atm = self._atm_strike(df["strike"].tolist(), spot)
+                r   = df[df["strike"] == atm]
+                if not r.empty:
+                    mid = float(r["mid"].iloc[0])
+                    iv  = float(r.get("iv_pct", pd.Series([0])).iloc[0]) if "iv_pct" in r.columns else 0.0
+                    if mid > 0:
+                        suggestions.append({
+                            "strategy":    "Weekly ATM",
+                            "description": (
+                                f"ATM {ticker} ${atm:.0f}{label}  "
+                                f"{week_data['dte']} DTE — sweet spot, full delta exposure"
+                            ),
+                            "legs":       [
+                                f"BUY 1× {ticker} {exp_week} "
+                                f"${atm:.0f} {opt_type.upper()} @ ${mid:.2f}"
+                            ],
+                            "entry_cost": round(mid * 100, 2),
+                            "max_loss":   round(mid * 100, 2),
+                            "max_profit": "Unlimited" if is_call else f"${atm * 100:.2f}",
+                            "dte":        week_data["dte"],
+                            "expiry":     exp_week,
+                            "strike":     atm,
+                            "opt_type":   opt_type,
+                            "mid":        mid,
+                            "iv_pct":     iv,
+                        })
 
-            # ── 3. Weekly Power (5-7 DTE, slightly OTM) ──────────────────────
-            exp7 = self._nearest_expiry(exps, 5, 7)
-            if exp7:
-                data = analyzer.get_chain(exp7)
-                if data:
-                    df  = data["calls"] if is_call else data["puts"]
-                    if is_call:
-                        strike = self._otm_strike(df["strike"].tolist(), spot, 0.01)
-                    else:
-                        strike = self._itm_put_strike(df["strike"].tolist(), spot, 0.01)
-                    r = df[df["strike"] == strike]
-                    if not r.empty:
-                        mid = float(r["mid"].iloc[0])
-                        if mid > 0:
-                            suggestions.append({
-                                "strategy":    "Weekly Power",
-                                "description": f"OTM {ticker} ${strike:.0f}{label}  {data['dte']} DTE — end-of-week rip",
-                                "legs":        [f"BUY 1× {ticker} {exp7} ${strike:.0f} {opt_type.upper()} @ ${mid:.2f}"],
-                                "entry_cost":  round(mid * 100, 2),
-                                "max_loss":    round(mid * 100, 2),
-                                "max_profit":  "Unlimited" if is_call else f"${round(strike * 100, 2):.2f}",
-                                "dte":         data["dte"],
-                                "expiry":      exp7,
-                                "strike":      strike,
-                                "opt_type":    opt_type,
-                                "mid":         mid,
-                            })
+            # ── 2. Weekly OTM (5–7 DTE, 2% out-of-the-money) ─────────────────
+            if week_data:
+                df = week_data["calls"] if is_call else week_data["puts"]
+                if is_call:
+                    otm_strike = self._otm_strike(df["strike"].tolist(), spot, 0.02)
+                else:
+                    otm_strike = self._itm_put_strike(df["strike"].tolist(), spot, 0.02)
+                r_otm = df[df["strike"] == otm_strike]
+                # Only add if it's a different strike from ATM
+                if not r_otm.empty and otm_strike != (suggestions[0]["strike"] if suggestions else None):
+                    mid = float(r_otm["mid"].iloc[0])
+                    iv  = float(r_otm["iv_pct"].iloc[0]) if "iv_pct" in r_otm.columns else 0.0
+                    if mid > 0:
+                        suggestions.append({
+                            "strategy":    "Weekly OTM",
+                            "description": (
+                                f"2% OTM {ticker} ${otm_strike:.0f}{label}  "
+                                f"{week_data['dte']} DTE — cheaper entry, needs bigger move"
+                            ),
+                            "legs":       [
+                                f"BUY 1× {ticker} {exp_week} "
+                                f"${otm_strike:.0f} {opt_type.upper()} @ ${mid:.2f}"
+                            ],
+                            "entry_cost": round(mid * 100, 2),
+                            "max_loss":   round(mid * 100, 2),
+                            "max_profit": "Unlimited" if is_call else f"${otm_strike * 100:.2f}",
+                            "dte":        week_data["dte"],
+                            "expiry":     exp_week,
+                            "strike":     otm_strike,
+                            "opt_type":   opt_type,
+                            "mid":        mid,
+                            "iv_pct":     iv,
+                        })
+
+            # ── 3. Mid-Week ATM (2–4 DTE fallback) ───────────────────────────
+            exp_mid  = self._nearest_expiry(exps, 2, 4)
+            mid_data = analyzer.get_chain(exp_mid) if exp_mid else None
+            if mid_data:
+                df  = mid_data["calls"] if is_call else mid_data["puts"]
+                atm = self._atm_strike(df["strike"].tolist(), spot)
+                r   = df[df["strike"] == atm]
+                if not r.empty:
+                    mid = float(r["mid"].iloc[0])
+                    iv  = float(r["iv_pct"].iloc[0]) if "iv_pct" in r.columns else 0.0
+                    if mid > 0:
+                        suggestions.append({
+                            "strategy":    "Mid-Week ATM",
+                            "description": (
+                                f"ATM {ticker} ${atm:.0f}{label}  "
+                                f"{mid_data['dte']} DTE — faster play, more theta risk"
+                            ),
+                            "legs":       [
+                                f"BUY 1× {ticker} {exp_mid} "
+                                f"${atm:.0f} {opt_type.upper()} @ ${mid:.2f}"
+                            ],
+                            "entry_cost": round(mid * 100, 2),
+                            "max_loss":   round(mid * 100, 2),
+                            "max_profit": "Unlimited" if is_call else f"${atm * 100:.2f}",
+                            "dte":        mid_data["dte"],
+                            "expiry":     exp_mid,
+                            "strike":     atm,
+                            "opt_type":   opt_type,
+                            "mid":        mid,
+                            "iv_pct":     iv,
+                        })
 
         except Exception:
             pass
@@ -6958,7 +6980,7 @@ CREATE TABLE IF NOT EXISTS options_state (
         }
 
     def reset(self):
-        """Wipe all options trades and reset cash to $5,000."""
+        """Wipe all options trades and reset cash to $500."""
         try:
             self.conn.execute("DELETE FROM options_positions")
         except Exception:
@@ -6972,3 +6994,190 @@ CREATE TABLE IF NOT EXISTS options_state (
         self._trades   = 0
         self._starting = _OPTIONS_BUDGET
         self._save_state()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MARKET CONTEXT UTILITIES — VIX · Fear & Greed · Economic Calendar · Earnings
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_vix_level():
+    """
+    Fetch current VIX from yfinance.
+    Returns dict {vix, regime, advice} or None on failure.
+    """
+    try:
+        price = None
+        try:
+            price = getattr(yf.Ticker("^VIX").fast_info, "last_price", None)
+        except Exception:
+            pass
+        if not price:
+            hist = yf.download("^VIX", period="1d", interval="5m",
+                               progress=False, auto_adjust=True)
+            if not hist.empty:
+                if isinstance(hist.columns, pd.MultiIndex):
+                    hist.columns = hist.columns.get_level_values(0)
+                price = float(hist["Close"].dropna().iloc[-1])
+        if not price:
+            return None
+        level = round(float(price), 2)
+        if level < 15:
+            regime = "LOW"
+            advice = "Vol is cheap — option buyers have edge; premiums affordable"
+        elif level < 20:
+            regime = "NORMAL"
+            advice = "Typical vol environment — balanced risk/reward"
+        elif level < 30:
+            regime = "ELEVATED"
+            advice = "Vol expensive — be selective; weekly spreads better value"
+        else:
+            regime = "EXTREME"
+            advice = "Fear spike — options very expensive; only high-conviction plays"
+        return {"vix": level, "regime": regime, "advice": advice}
+    except Exception:
+        return None
+
+
+def get_fear_greed():
+    """
+    Fetch CNN Fear & Greed index from their public data endpoint.
+    Returns dict {score, rating, emoji, color} or None on failure.
+    """
+    try:
+        resp = requests.get(
+            "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+            timeout=8,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; TradingBot/1.0)"},
+        )
+        if resp.status_code != 200:
+            return None
+        fg     = resp.json().get("fear_and_greed", {})
+        score  = round(float(fg.get("score", 50)), 1)
+        rating = str(fg.get("rating", "Neutral"))
+        if score <= 25:
+            emoji, color = "😱", "#f85149"
+        elif score <= 45:
+            emoji, color = "😨", "#e3b341"
+        elif score <= 55:
+            emoji, color = "😐", "#8b949e"
+        elif score <= 75:
+            emoji, color = "😏", "#3fb950"
+        else:
+            emoji, color = "🤑", "#58a6ff"
+        return {"score": score, "rating": rating, "emoji": emoji, "color": color}
+    except Exception:
+        return None
+
+
+def get_economic_events(days_ahead=7):
+    """
+    Fetch high-impact USD economic events for the next N days.
+    Source: ForexFactory public JSON feed.
+    Returns list of {title, date, time, impact} dicts, sorted by date.
+    Returns [] on failure.
+    """
+    events = []
+    today  = datetime.utcnow().date()
+    cutoff = today + timedelta(days=days_ahead)
+    for url in [
+        "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+        "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
+    ]:
+        try:
+            resp = requests.get(
+                url, timeout=8,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; TradingBot/1.0)"},
+            )
+            if resp.status_code != 200:
+                continue
+            for ev in resp.json():
+                if ev.get("country") != "USD":
+                    continue
+                if str(ev.get("impact", "")).lower() != "high":
+                    continue
+                try:
+                    ev_date = datetime.strptime(
+                        str(ev.get("date", ""))[:10], "%Y-%m-%d"
+                    ).date()
+                except ValueError:
+                    continue
+                if today <= ev_date <= cutoff:
+                    events.append({
+                        "title":  str(ev.get("title", "")),
+                        "date":   str(ev_date),
+                        "time":   str(ev.get("time", "")),
+                        "impact": "High",
+                    })
+        except Exception:
+            continue
+    seen, unique = set(), []
+    for e in events:
+        key = f"{e['date']}_{e['title']}"
+        if key not in seen:
+            seen.add(key)
+            unique.append(e)
+    return sorted(unique, key=lambda x: x["date"])
+
+
+def check_earnings_in_window(ticker, expiry_date_str):
+    """
+    Check if *ticker* reports earnings between today and *expiry_date_str*.
+    Returns dict:
+      has_earnings  — bool
+      earnings_date — str  (only if has_earnings)
+      days_away     — int  (only if has_earnings)
+      warning       — str  (only if has_earnings)
+    """
+    try:
+        cal = yf.Ticker(ticker).calendar
+        if cal is None:
+            return {"has_earnings": False}
+
+        earnings_date = None
+
+        # yfinance ≥ 0.2.x returns a plain dict
+        if isinstance(cal, dict):
+            ed = cal.get("Earnings Date")
+            if ed is not None:
+                candidates = ed if isinstance(ed, (list, tuple)) else [ed]
+                for c in candidates:
+                    try:
+                        earnings_date = pd.Timestamp(c).date()
+                        break
+                    except Exception:
+                        pass
+
+        # Older yfinance returns a DataFrame
+        elif hasattr(cal, "columns"):
+            try:
+                col = next(
+                    (c for c in cal.columns if "Earnings" in str(c)), None
+                )
+                if col is not None:
+                    val = cal[col].dropna()
+                    if not val.empty:
+                        earnings_date = pd.Timestamp(val.iloc[0]).date()
+            except Exception:
+                pass
+
+        if earnings_date is None:
+            return {"has_earnings": False}
+
+        today  = datetime.utcnow().date()
+        expiry = datetime.strptime(expiry_date_str, "%Y-%m-%d").date()
+
+        if today <= earnings_date <= expiry:
+            days_away = (earnings_date - today).days
+            return {
+                "has_earnings":  True,
+                "earnings_date": str(earnings_date),
+                "days_away":     days_away,
+                "warning": (
+                    f"⚠️ EARNINGS in {days_away}d ({earnings_date}) — "
+                    "IV will spike before then crush after the report. "
+                    "Exit before earnings or size down significantly."
+                ),
+            }
+    except Exception:
+        pass
+    return {"has_earnings": False}

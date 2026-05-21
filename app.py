@@ -2311,7 +2311,7 @@ with tab_options:
         ops_engine_strat = ts.OptionsPaperEngine(conn)
 
         def _render_strategy_cards(ticker, suggestions, scan_meta=None):
-            """Render expander cards for each strategy suggestion."""
+            """Render enriched strategy cards with PoP, EQ, Conviction, and Sizing."""
             if not suggestions:
                 st.warning(
                     f"No 0–7 DTE plays available for **{ticker}** "
@@ -2320,31 +2320,42 @@ with tab_options:
                 )
                 return
 
+            # ── Quick position sizing inputs (once per ticker render) ─────────
+            _vix_data    = _ctx.get("vix")
+            _closed_hist = ops_engine_strat.get_positions("CLOSED")
+
             for sg in suggestions:
                 cost_str = (f"${sg['entry_cost']:.2f}"
-                            if isinstance(sg.get("entry_cost"), (int, float))
-                            else "—")
+                            if isinstance(sg.get("entry_cost"), (int, float)) else "—")
                 prof_str = (f"${sg['max_profit']:.2f}"
                             if isinstance(sg.get("max_profit"), (int, float))
                             else str(sg.get("max_profit", "—")))
                 loss_str = (f"${sg['max_loss']:.2f}"
-                            if isinstance(sg.get("max_loss"), (int, float))
-                            else "—")
-                dte_badge = f"{'🔴' if sg.get('dte', 99) == 0 else '🟡' if sg.get('dte', 99) <= 3 else '🟢'} {sg.get('dte', '?')} DTE"
+                            if isinstance(sg.get("max_loss"), (int, float)) else "—")
+                dte_badge = (
+                    f"{'🔴' if sg.get('dte', 99) == 0 else '🟡' if sg.get('dte', 99) <= 3 else '🟢'} "
+                    f"{sg.get('dte', '?')} DTE"
+                )
+                pop_val = sg.get("pop")
+                pop_str = f"{pop_val:.0f}%" if pop_val is not None else "—"
 
                 exp_title = (
                     f"**{ticker}** · {sg['strategy']}  {dte_badge}  "
                     f"| Cost {cost_str}  Max Loss {loss_str}  Max Profit {prof_str}"
+                    f"  PoP {pop_str}"
                 )
                 with st.expander(exp_title, expanded=True):
+
+                    # ── Scan meta ─────────────────────────────────────────────
                     if scan_meta:
                         _mc1, _mc2, _mc3 = st.columns(3)
                         _mc1.metric("Breakout Score",
                                     f"{scan_meta.get('explosive_score', 0):.0f}")
-                        _mc2.metric("Prob",
+                        _mc2.metric("Breakout Prob",
                                     f"{scan_meta.get('breakout_prob', 0):.0f}%")
                         _mc3.metric("Pattern",
                                     scan_meta.get("pattern_detected", "—") or "—")
+                        st.divider()
 
                     # ── Earnings warning ──────────────────────────────────────
                     _expiry_str = sg.get("expiry", "")
@@ -2356,26 +2367,185 @@ with tab_options:
                         except Exception:
                             pass
 
+                    # ── Trade legs ────────────────────────────────────────────
                     st.markdown("**Trade:**")
                     for leg in sg.get("legs", []):
                         st.code(leg)
 
-                    _s1, _s2, _s3, _s4 = st.columns(4)
-                    _s1.metric("Entry Cost", cost_str)
-                    _s2.metric("Max Loss",   loss_str)
-                    _s3.metric("Max Profit", prof_str)
-                    _s4.metric("DTE",        sg.get("dte", "—"))
+                    # ── Row 1: Core metrics ───────────────────────────────────
+                    _r1a, _r1b, _r1c, _r1d = st.columns(4)
+                    _r1a.metric("Entry Cost", cost_str)
+                    _r1b.metric("Max Loss",   loss_str)
+                    _r1c.metric("Max Profit", prof_str)
+                    _r1d.metric("DTE",        sg.get("dte", "—"))
 
+                    # ── Row 2: Probability & EV metrics ──────────────────────
+                    _r2a, _r2b, _r2c, _r2d = st.columns(4)
+                    _r2a.metric(
+                        "PoP at Expiry",
+                        f"{sg['pop']:.0f}%" if sg.get("pop") is not None else "—",
+                        help="Probability of Profit: odds of finishing beyond break-even at expiry",
+                    )
+                    _r2b.metric(
+                        "Prob ITM",
+                        f"{sg.get('prob_itm', 50):.0f}%",
+                        help="Approximate probability the option expires in-the-money (≈ |delta|)",
+                    )
+                    _r2c.metric(
+                        "Break-even Move",
+                        f"{sg.get('breakeven_move_pct', 0):.1f}%",
+                        help="Stock must move this % from current price to break even at expiry",
+                    )
+                    ev_sig = sg.get("ev_signal", "—")
+                    _r2d.metric(
+                        "EV Signal",
+                        ev_sig,
+                        help="Favorable = IV Rank < 30 (cheap options). Unfavorable = IV Rank > 60.",
+                    )
+
+                    st.divider()
+
+                    # ── Dynamic Sizing recommendation ─────────────────────────
+                    _mid_price = sg.get("mid", 0)
+                    if _mid_price > 0:
+                        _summ_now = ops_engine_strat.get_summary()
+                        _sizing   = ts.get_position_sizing(
+                            account_cash  = _summ_now["available_cash"],
+                            mid_price     = _mid_price,
+                            vix_data      = _vix_data,
+                            closed_trades = _closed_hist,
+                        )
+                        _sz_color = "#3fb950" if _sizing["contracts"] > 0 else "#f85149"
+                        st.markdown(
+                            f"<div style='background:#161b22;border:1px solid #30363d;"
+                            f"border-radius:6px;padding:8px 12px;margin:4px 0'>"
+                            f"<b>📐 Sizing:</b> "
+                            f"<span style='color:{_sz_color}'>{_sizing['advice']}</span>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+                        _rec_contracts = _sizing.get("contracts", 1)
+                    else:
+                        _rec_contracts = opt_contracts
+
+                    # ── On-demand Analysis: Entry Quality + Conviction ─────────
+                    _ana_key = (
+                        f"analysis_{ticker}_{sg['strategy'].replace(' ','_')}"
+                        f"_{sg.get('expiry','')}"
+                    )
+                    _ana_btn_key = f"analyze_btn_{_ana_key}"
+                    if st.button("🔍 Analyse Entry Quality & Conviction",
+                                 key=_ana_btn_key,
+                                 help="Runs live VWAP, volume, IV rank, and flow checks (~5 s)"):
+                        with st.spinner(f"Scoring {ticker} entry quality & conviction…"):
+                            try:
+                                _eq   = ts.get_entry_quality(ticker, opt_bias.lower())
+                                _conv = ts.get_conviction_score(
+                                    ticker, sg.get("expiry", ""), opt_bias.lower(),
+                                    conn, _vix_data, _eq
+                                )
+                                st.session_state[_ana_key] = {"eq": _eq, "conv": _conv}
+                            except Exception as _ae:
+                                st.warning(f"Analysis error: {_ae}", icon="⚠️")
+
+                    if _ana_key in st.session_state:
+                        _ana  = st.session_state[_ana_key]
+                        _eq   = _ana.get("eq",   {})
+                        _conv = _ana.get("conv", {})
+
+                        _ca1, _ca2 = st.columns(2)
+
+                        # Entry Quality panel
+                        with _ca1:
+                            _eq_score = _eq.get("score", 0)
+                            _eq_grade = _eq.get("grade", "—")
+                            _eq_color = (
+                                "#3fb950" if _eq_grade == "A" else
+                                "#58a6ff" if _eq_grade == "B" else
+                                "#e3b341" if _eq_grade == "C" else "#f85149"
+                            )
+                            st.markdown(
+                                f"<div style='background:#161b22;border:1px solid #30363d;"
+                                f"border-radius:6px;padding:10px 14px'>"
+                                f"<b>📊 Entry Quality</b>  "
+                                f"<span style='color:{_eq_color};font-size:1.3em'>"
+                                f"<b>{_eq_score}/100 {_eq_grade}</b></span><br>"
+                                f"<small>{_eq.get('advice','')}</small></div>",
+                                unsafe_allow_html=True,
+                            )
+                            for _ck, _cv in (_eq.get("components") or {}).items():
+                                _pts = _cv.get("pts", 0)
+                                _max = {"time_of_day": 30, "vwap": 25,
+                                        "extension": 20, "volume": 15, "iv_rank": 10}.get(_ck, 20)
+                                _pct = int(_pts / _max * 100) if _max else 0
+                                _bar_c = "#3fb950" if _pct >= 70 else "#e3b341" if _pct >= 40 else "#f85149"
+                                st.markdown(
+                                    f"<div style='display:flex;align-items:center;gap:8px;margin:2px 0'>"
+                                    f"<div style='width:90px;font-size:0.75em;color:#8b949e'>{_ck.replace('_',' ').title()}</div>"
+                                    f"<div style='flex:1;background:#21262d;border-radius:3px;height:8px'>"
+                                    f"<div style='width:{_pct}%;background:{_bar_c};height:8px;border-radius:3px'></div></div>"
+                                    f"<div style='width:30px;font-size:0.75em;text-align:right'>{_pts}</div>"
+                                    f"</div>",
+                                    unsafe_allow_html=True,
+                                )
+                                st.caption(f"  {_cv.get('label', '')}")
+
+                        # Conviction panel
+                        with _ca2:
+                            _cv_score = _conv.get("score", 0)
+                            _cv_grade = _conv.get("grade", "—")
+                            _cv_color = (
+                                "#3fb950" if _cv_grade == "A" else
+                                "#58a6ff" if _cv_grade == "B" else
+                                "#e3b341" if _cv_grade == "C" else "#f85149"
+                            )
+                            st.markdown(
+                                f"<div style='background:#161b22;border:1px solid #30363d;"
+                                f"border-radius:6px;padding:10px 14px'>"
+                                f"<b>🎯 Conviction Score</b>  "
+                                f"<span style='color:{_cv_color};font-size:1.3em'>"
+                                f"<b>{_cv_score}/100 {_cv_grade}</b></span><br>"
+                                f"<small>{_conv.get('advice','')}</small></div>",
+                                unsafe_allow_html=True,
+                            )
+                            _sig_names = {
+                                "breakout_scan":   "Breakout Scan",
+                                "unusual_flow":    "Options Flow",
+                                "vix_regime":      "VIX Regime",
+                                "earnings_safety": "Earnings Safety",
+                                "entry_quality":   "Entry Quality",
+                            }
+                            for _sk, _sv in (_conv.get("signals") or {}).items():
+                                _pts = _sv.get("pts", 0)
+                                _pct = int(_pts / 20 * 100)
+                                _bar_c = "#3fb950" if _pct >= 70 else "#e3b341" if _pct >= 40 else "#f85149"
+                                _name  = _sig_names.get(_sk, _sk.replace("_", " ").title())
+                                st.markdown(
+                                    f"<div style='display:flex;align-items:center;gap:8px;margin:2px 0'>"
+                                    f"<div style='width:110px;font-size:0.75em;color:#8b949e'>{_name}</div>"
+                                    f"<div style='flex:1;background:#21262d;border-radius:3px;height:8px'>"
+                                    f"<div style='width:{_pct}%;background:{_bar_c};height:8px;border-radius:3px'></div></div>"
+                                    f"<div style='width:30px;font-size:0.75em;text-align:right'>{_pts}/20</div>"
+                                    f"</div>",
+                                    unsafe_allow_html=True,
+                                )
+                                st.caption(f"  {_sv.get('label', '')}")
+
+                    st.divider()
+
+                    # ── Paper Trade button ────────────────────────────────────
                     btn_key = (
                         f"pbuy_{ticker}_{sg['strategy'].replace(' ', '_')}"
                         f"_{sg.get('strike', 0):.0f}_{sg.get('expiry', '')}"
                     )
+                    _use_contracts = max(1, _rec_contracts if _rec_contracts > 0 else opt_contracts)
                     if st.button(
-                        f"💼 Paper Trade — {opt_contracts}× contract(s)",
+                        f"💼 Paper Trade — {_use_contracts}× contract(s)"
+                        + (" (recommended)" if _rec_contracts != opt_contracts else ""),
                         key=btn_key,
                     ):
                         mid        = sg.get("mid", 0)
-                        cost_total = mid * 100 * opt_contracts
+                        cost_total = mid * 100 * _use_contracts
                         summ       = ops_engine_strat.get_summary()
                         if cost_total > summ["available_cash"]:
                             st.error(
@@ -2393,13 +2563,13 @@ with tab_options:
                                 option_type     = sg["opt_type"],
                                 strike          = sg["strike"],
                                 expiry          = sg["expiry"],
-                                contracts       = opt_contracts,
+                                contracts       = _use_contracts,
                                 entry_price     = mid,
                                 strategy        = sg["strategy"],
                             )
                             if res.get("ok"):
                                 st.success(
-                                    f"✅ Bought {opt_contracts}× {sg['strategy']} on {ticker} "
+                                    f"✅ Bought {_use_contracts}× {sg['strategy']} on {ticker} "
                                     f"for ${res['cost']:.2f}. "
                                     f"Cash left: ${res['cash_remaining']:.2f}",
                                     icon="✅",
@@ -2455,17 +2625,23 @@ with tab_options:
                 if not opt_ticker:
                     st.warning("Enter a ticker in the control bar above.", icon="⚠️")
                 else:
-                    with st.spinner(f"Building 0DTE–7DTE plays for {opt_ticker} ({opt_bias})…"):
+                    with st.spinner(
+                        f"Building 5–7 DTE plays for {opt_ticker} ({opt_bias}) "
+                        "with PoP, break-even, and sizing…"
+                    ):
                         engine_s    = ts.OptionsStrategyEngine()
                         suggestions = engine_s.suggest(opt_ticker, bias=opt_bias.lower())
                     st.success(
-                        f"**{len(suggestions)} play(s) for {opt_ticker}**", icon="🎯"
+                        f"**{len(suggestions)} play(s) for {opt_ticker}** — "
+                        "click 🔍 inside each card for Entry Quality & Conviction analysis",
+                        icon="🎯",
                     ) if suggestions else None
                     _render_strategy_cards(opt_ticker, suggestions)
             else:
                 st.info(
-                    "Press **Build Strategies** to generate 0DTE Scalp, "
-                    "3DTE Momentum, and Weekly Power plays for the selected ticker.",
+                    "Press **Build Strategies** to generate Weekly ATM, Weekly OTM, "
+                    "and Mid-Week ATM plays with PoP, break-even move, and dynamic sizing. "
+                    "Click 🔍 on any card for a full Entry Quality + Conviction score.",
                     icon="🎯",
                 )
 
@@ -2478,16 +2654,34 @@ with tab_options:
 
         ops_engine = ts.OptionsPaperEngine(conn)
 
-        # Run expiry check on every page load
+        # ── Auto-expiry + exit alerts ─────────────────────────────────────────
         _expired = ops_engine.expire_check()
         if _expired:
             for _ep in _expired:
                 st.warning(
-                    f"⏰ **{_ep.get('ticker')} ${_ep.get('strike'):.0f}"
+                    f"⏰ **{_ep.get('ticker')} ${_ep.get('strike', 0):.0f}"
                     f"{str(_ep.get('option_type',''))[0].upper()}** expired worthless "
                     f"(P&L: ${_ep.get('net_pnl', 0):.2f})",
                     icon="⏰",
                 )
+
+        _exit_alerts = ops_engine.check_exit_alerts()
+        if _exit_alerts:
+            st.markdown("### 🚨 Auto-Exit Alerts")
+            for _al in _exit_alerts:
+                _atype = _al.get("alert_type", "")
+                if _atype == "TAKE_PROFIT":
+                    st.success(_al["message"], icon="🎯")
+                elif _atype == "STOP_LOSS":
+                    st.error(_al["message"], icon="🛑")
+                else:  # TIME_DECAY
+                    st.warning(_al["message"], icon="⏱")
+            st.caption(
+                "Auto-exit rules: close at **+50% profit** to lock gains · "
+                "cut at **-50% loss** to preserve capital · "
+                "exit by **2 DTE** to avoid theta destruction."
+            )
+            st.divider()
 
         ops_summary = ops_engine.get_summary()
 

@@ -6221,6 +6221,26 @@ def _bs_greeks(S, K, T, r, sigma, opt_type="call"):
         return {}
 
 
+def _pop_from_bs(S, K_be, T, sigma, opt_type="call"):
+    """
+    Probability of Profit at expiry using Black-Scholes.
+    K_be — break-even price (strike + premium for calls, strike − premium for puts).
+    Returns float 0–100, or None on failure.
+    """
+    if not _SCIPY_OK:
+        return None
+    try:
+        if T <= 0 or sigma <= 0 or S <= 0 or K_be <= 0:
+            return None
+        d2 = (np.log(S / K_be) + (_RISK_FREE - 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        if opt_type == "call":
+            return round(float(_norm.cdf(d2)) * 100, 1)
+        else:
+            return round(float(_norm.cdf(-d2)) * 100, 1)
+    except Exception:
+        return None
+
+
 # ── Options Chain Analyzer ────────────────────────────────────────────────────
 
 class OptionsChainAnalyzer:
@@ -6557,6 +6577,11 @@ class OptionsStrategyEngine:
                             "mid":        mid,
                             "iv_pct":     iv,
                         })
+                        suggestions[-1].update(
+                            OptionsStrategyEngine._compute_pop_metrics(
+                                spot, atm, mid, week_data["dte"], iv, opt_type
+                            )
+                        )
 
             # ── 2. Weekly OTM (5–7 DTE, 2% out-of-the-money) ─────────────────
             if week_data:
@@ -6591,6 +6616,11 @@ class OptionsStrategyEngine:
                             "mid":        mid,
                             "iv_pct":     iv,
                         })
+                        suggestions[-1].update(
+                            OptionsStrategyEngine._compute_pop_metrics(
+                                spot, otm_strike, mid, week_data["dte"], iv, opt_type
+                            )
+                        )
 
             # ── 3. Mid-Week ATM (2–4 DTE fallback) ───────────────────────────
             exp_mid  = self._nearest_expiry(exps, 2, 4)
@@ -6623,6 +6653,11 @@ class OptionsStrategyEngine:
                             "mid":        mid,
                             "iv_pct":     iv,
                         })
+                        suggestions[-1].update(
+                            OptionsStrategyEngine._compute_pop_metrics(
+                                spot, atm, mid, mid_data["dte"], iv, opt_type
+                            )
+                        )
 
         except Exception:
             pass
@@ -6662,6 +6697,27 @@ class OptionsStrategyEngine:
         if not below:
             return min(strikes) if strikes else spot
         return min(below, key=lambda k: abs(k - target))
+
+    @staticmethod
+    def _compute_pop_metrics(spot, strike, mid, dte, iv, opt_type):
+        """
+        Compute PoP, break-even move %, prob-ITM, and EV signal for a single
+        long option leg.  Returns a dict of extra keys to merge into a suggestion.
+        """
+        T    = max(int(dte), 1) / 365.0
+        sig  = (float(iv) / 100.0) if (iv and float(iv) > 0) else 0.30
+        is_c = (opt_type == "call")
+        be   = float(strike) + float(mid) if is_c else float(strike) - float(mid)
+        pop  = _pop_from_bs(float(spot), be, T, sig, opt_type)
+        gs   = _bs_greeks(float(spot), float(strike), T, _RISK_FREE, sig, opt_type)
+        iv_f = float(iv) if iv else 50.0
+        return {
+            "breakeven_move_pct": round(float(mid) / float(spot) * 100, 2) if spot > 0 else 0.0,
+            "pop":                pop,
+            "prob_itm":           round(abs(gs.get("delta", 0.5)) * 100, 1) if gs else 50.0,
+            "ev_signal":          ("Favorable" if iv_f < 30
+                                   else "Unfavorable" if iv_f > 60 else "Neutral"),
+        }
 
 
 # ── Scan-to-Options Bridge ────────────────────────────────────────────────────
@@ -6900,6 +6956,95 @@ CREATE TABLE IF NOT EXISTS options_state (
                 d["net_pnl"] = result["net_pnl"]
                 closed.append(d)
         return closed
+
+    def check_exit_alerts(self):
+        """
+        Scan open positions for auto-exit trigger conditions.
+
+        Alert types (non-exclusive per position):
+          TAKE_PROFIT — unrealized P&L >= +50 %
+          STOP_LOSS   — unrealized P&L <= -50 %
+          TIME_DECAY  — ≤ 2 calendar days to expiry
+
+        Returns list of alert dicts:
+          id, ticker, strike, option_type, expiry, dte_remaining,
+          unrealized_pct, alert_type, message
+        """
+        alerts = []
+        today  = datetime.utcnow().date()
+        positions = self.get_positions("OPEN")
+        for p in positions:
+            pid    = p.get("id")
+            tkr    = str(p.get("ticker",      "") or "")
+            stk    = float(p.get("strike",    0)  or 0)
+            otype  = str(p.get("option_type", "call") or "call")
+            exp    = str(p.get("expiry",      "") or "")
+            letter = otype[0].upper() if otype else "C"
+
+            # DTE remaining
+            try:
+                exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+                dte_rem  = max(0, (exp_date - today).days)
+            except Exception:
+                dte_rem  = 99
+
+            unreal_pct = p.get("unrealized_pct")   # None if no live price
+
+            # ── +50 % take profit ─────────────────────────────────────────
+            if unreal_pct is not None and unreal_pct >= 50:
+                alerts.append({
+                    "id":             pid,
+                    "ticker":         tkr,
+                    "strike":         stk,
+                    "option_type":    otype,
+                    "expiry":         exp,
+                    "dte_remaining":  dte_rem,
+                    "unrealized_pct": unreal_pct,
+                    "alert_type":     "TAKE_PROFIT",
+                    "message": (
+                        f"🎯 TAKE PROFIT — {tkr} ${stk:.0f}{letter} "
+                        f"is up {unreal_pct:+.1f}%.  "
+                        f"Rule: close at 50 % profit to lock gains."
+                    ),
+                })
+
+            # ── -50 % stop loss ───────────────────────────────────────────
+            elif unreal_pct is not None and unreal_pct <= -50:
+                alerts.append({
+                    "id":             pid,
+                    "ticker":         tkr,
+                    "strike":         stk,
+                    "option_type":    otype,
+                    "expiry":         exp,
+                    "dte_remaining":  dte_rem,
+                    "unrealized_pct": unreal_pct,
+                    "alert_type":     "STOP_LOSS",
+                    "message": (
+                        f"🛑 STOP LOSS — {tkr} ${stk:.0f}{letter} "
+                        f"is down {unreal_pct:.1f}%.  "
+                        f"Rule: cut losses at -50 % to preserve capital."
+                    ),
+                })
+
+            # ── ≤ 2 DTE time-decay warning ────────────────────────────────
+            if 0 <= dte_rem <= 2:
+                alerts.append({
+                    "id":             pid,
+                    "ticker":         tkr,
+                    "strike":         stk,
+                    "option_type":    otype,
+                    "expiry":         exp,
+                    "dte_remaining":  dte_rem,
+                    "unrealized_pct": unreal_pct,
+                    "alert_type":     "TIME_DECAY",
+                    "message": (
+                        f"⏱ TIME DECAY — {tkr} ${stk:.0f}{letter} "
+                        f"expires in {dte_rem} day(s) ({exp}).  "
+                        f"Theta decay is maximal — exit or accept full loss."
+                    ),
+                })
+
+        return alerts
 
     def get_positions(self, status="OPEN"):
         """Return positions list. OPEN positions get live unrealized P&L."""
@@ -7181,3 +7326,392 @@ def check_earnings_in_window(ticker, expiry_date_str):
     except Exception:
         pass
     return {"has_earnings": False}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RISK & PROFITABILITY UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_entry_quality(ticker, bias="bullish"):
+    """
+    Entry Quality Score 0–100 built from five independent signals:
+
+      1. Time of day ET  (30 pts) — prime windows score higher
+      2. VWAP position   (25 pts) — price above/below VWAP matches bias
+      3. Extension %     (20 pts) — proximity to VWAP; overextension penalised
+      4. Volume ratio    (15 pts) — today vs 20-day average, projected to full day
+      5. IV rank         (10 pts) — lower rank → cheaper options → better entry
+
+    Returns dict:
+      score      — int 0-100
+      grade      — "A" / "B" / "C" / "D"
+      advice     — plain-English summary
+      components — per-signal breakdown {pts, label, ...}
+    """
+    # ── 1. Time of day ────────────────────────────────────────────────────────
+    try:
+        import pytz
+        now_et   = datetime.now(pytz.timezone("US/Eastern"))
+        time_dec = now_et.hour + now_et.minute / 60.0
+    except Exception:
+        time_dec = 10.5   # assume mid-morning if timezone unavailable
+
+    components = {}
+    score      = 0
+
+    if 9.75 <= time_dec <= 10.5:
+        t_pts, t_lbl = 30, "Prime open 9:45–10:30 ✓"
+    elif 10.5 < time_dec <= 11.5:
+        t_pts, t_lbl = 22, "Good window 10:30–11:30"
+    elif 14.0 <= time_dec <= 15.0:
+        t_pts, t_lbl = 25, "Power hour 2–3 PM ✓"
+    elif 15.0 < time_dec <= 15.5:
+        t_pts, t_lbl = 18, "Late momentum 3–3:30 PM"
+    elif 11.5 < time_dec < 14.0:
+        t_pts, t_lbl = 8,  "Midday dead zone — avoid"
+    else:
+        t_pts, t_lbl = 5,  "Off-hours"
+    score += t_pts
+    components["time_of_day"] = {"pts": t_pts, "label": t_lbl}
+
+    # ── 2–4. Intraday data ────────────────────────────────────────────────────
+    is_bullish = str(bias).lower() != "bearish"
+    try:
+        hist1m = yf.download(ticker, period="1d", interval="1m",
+                             progress=False, auto_adjust=True)
+        if isinstance(hist1m.columns, pd.MultiIndex):
+            hist1m.columns = hist1m.columns.get_level_values(0)
+        hist1m = hist1m.dropna(subset=["Close"])
+
+        if not hist1m.empty:
+            close    = hist1m["Close"]
+            volume   = hist1m["Volume"].clip(lower=0)
+            spot     = float(close.iloc[-1])
+            cum_vol  = volume.cumsum()
+            vwap     = (close * volume).cumsum() / cum_vol.replace(0, np.nan)
+            vwap_now = float(vwap.iloc[-1]) if not vwap.empty else spot
+
+            # 2. VWAP (25 pts)
+            above = spot > vwap_now
+            if (is_bullish and above) or (not is_bullish and not above):
+                v_pts = 25
+                v_lbl = f"Price {'above' if above else 'below'} VWAP ✓  (VWAP ${vwap_now:.2f})"
+            else:
+                v_pts = 0
+                v_lbl = f"Price on wrong side of VWAP ${vwap_now:.2f} ✗"
+            score += v_pts
+            components["vwap"] = {"pts": v_pts, "label": v_lbl, "vwap": round(vwap_now, 2)}
+
+            # 3. Extension (20 pts)
+            ext_pct = abs(spot - vwap_now) / vwap_now * 100 if vwap_now > 0 else 0.0
+            if ext_pct <= 0.5:
+                e_pts, e_lbl = 20, f"Tight ({ext_pct:.2f}% from VWAP) — ideal entry ✓"
+            elif ext_pct <= 1.5:
+                e_pts, e_lbl = 14, f"Moderate extension ({ext_pct:.2f}% from VWAP)"
+            elif ext_pct <= 3.0:
+                e_pts, e_lbl = 6,  f"Extended {ext_pct:.2f}% — risky entry"
+            else:
+                e_pts, e_lbl = 0,  f"Overextended {ext_pct:.2f}% — wait for pullback"
+            score += e_pts
+            components["extension"] = {"pts": e_pts, "label": e_lbl,
+                                        "ext_pct": round(ext_pct, 2)}
+
+            # 4. Volume ratio (15 pts)
+            try:
+                hist_d  = yf.download(ticker, period="1mo", interval="1d",
+                                      progress=False, auto_adjust=True)
+                if isinstance(hist_d.columns, pd.MultiIndex):
+                    hist_d.columns = hist_d.columns.get_level_values(0)
+                avg_vol  = float(hist_d["Volume"].tail(20).mean()) if not hist_d.empty else 0
+                elapsed  = max(1, len(hist1m))
+                proj_vol = float(volume.sum()) * 390 / elapsed
+                ratio    = proj_vol / avg_vol if avg_vol > 0 else 1.0
+                if ratio >= 1.5:
+                    vol_pts, vol_lbl = 15, f"High volume ({ratio:.1f}× avg) — conviction ✓"
+                elif ratio >= 1.0:
+                    vol_pts, vol_lbl = 10, f"Normal volume ({ratio:.1f}× avg)"
+                else:
+                    vol_pts, vol_lbl = 3,  f"Low volume ({ratio:.1f}× avg) — weak move"
+            except Exception:
+                ratio = 1.0
+                vol_pts, vol_lbl = 7, "Volume data unavailable (neutral)"
+            score += vol_pts
+            components["volume"] = {"pts": vol_pts, "label": vol_lbl,
+                                     "ratio": round(ratio, 2)}
+        else:
+            score += 12
+            components["vwap"]      = {"pts": 0,  "label": "No intraday data"}
+            components["extension"] = {"pts": 0,  "label": "No intraday data"}
+            components["volume"]    = {"pts": 12, "label": "No intraday data (partial)"}
+    except Exception:
+        score += 12
+        components["vwap"]      = {"pts": 0,  "label": "Data unavailable"}
+        components["extension"] = {"pts": 0,  "label": "Data unavailable"}
+        components["volume"]    = {"pts": 12, "label": "Data unavailable"}
+
+    # ── 5. IV rank (10 pts) ───────────────────────────────────────────────────
+    try:
+        ivr     = OptionsChainAnalyzer(ticker).iv_rank()
+        iv_rank = float(ivr.get("iv_rank", 50)) if ivr else 50.0
+        if iv_rank < 30:
+            iv_pts, iv_lbl = 10, f"IV Rank {iv_rank:.0f} — cheap options ✓"
+        elif iv_rank < 60:
+            iv_pts, iv_lbl = 5,  f"IV Rank {iv_rank:.0f} — normal premium"
+        else:
+            iv_pts, iv_lbl = 0,  f"IV Rank {iv_rank:.0f} — expensive options ✗"
+    except Exception:
+        iv_rank = 50.0
+        iv_pts, iv_lbl = 5, "IV data unavailable (neutral)"
+    score += iv_pts
+    components["iv_rank"] = {"pts": iv_pts, "label": iv_lbl,
+                              "rank": round(iv_rank, 1)}
+
+    # ── Grade ─────────────────────────────────────────────────────────────────
+    score = min(100, max(0, score))
+    if score >= 75:
+        grade, advice = "A", "Excellent setup — high-conviction entry"
+    elif score >= 60:
+        grade, advice = "B", "Good setup — proceed with standard sizing"
+    elif score >= 45:
+        grade, advice = "C", "Marginal — reduce size or wait for better entry"
+    else:
+        grade, advice = "D", "Poor setup — avoid or paper trade only"
+
+    return {"score": score, "grade": grade, "advice": advice, "components": components}
+
+
+def get_conviction_score(ticker, expiry, bias, conn,
+                         vix_data=None, entry_quality=None):
+    """
+    5-signal Conviction Score 0–100.  Each signal contributes 20 pts.
+
+      1. Breakout scan membership — ticker in latest scan with strong explosive_score
+      2. Unusual options flow     — unusual activity aligns with bias direction
+      3. VIX regime               — LOW/NORMAL favoured; ELEVATED/EXTREME penalised
+      4. Earnings safety          — no earnings inside the trade window
+      5. Entry quality            — entry_quality score >= 60 for full credit
+
+    Returns dict:
+      score   — int 0-100
+      grade   — "A" / "B" / "C" / "D"
+      advice  — recommended action
+      signals — per-signal breakdown {pts, label}
+    """
+    signals    = {}
+    score      = 0
+    is_bullish = str(bias).lower() != "bearish"
+
+    # ── 1. Breakout scan (20 pts) ─────────────────────────────────────────────
+    try:
+        row = conn.execute(
+            "SELECT explosive_score FROM calls "
+            "WHERE ticker=? ORDER BY scan_timestamp DESC LIMIT 1",
+            (str(ticker).upper(),)
+        ).fetchone()
+        if row:
+            exp_score = float(row.get("explosive_score") or row[0] or 0)
+            if exp_score >= 70:
+                s1_pts, s1_lbl = 20, f"Strong breakout score {exp_score:.0f} ✓"
+            elif exp_score >= 40:
+                s1_pts, s1_lbl = 12, f"Moderate score {exp_score:.0f}"
+            else:
+                s1_pts, s1_lbl = 5,  f"Weak score {exp_score:.0f}"
+        else:
+            s1_pts, s1_lbl = 0, "Not in breakout scan ✗"
+    except Exception:
+        s1_pts, s1_lbl = 10, "Scan data unavailable (neutral)"
+    score += s1_pts
+    signals["breakout_scan"] = {"pts": s1_pts, "label": s1_lbl}
+
+    # ── 2. Unusual flow (20 pts) ──────────────────────────────────────────────
+    try:
+        flow       = AggressiveOptionsScanner().scan_ticker(ticker)
+        bull_flow  = sum(1 for f in flow if f.get("bias") == "BULLISH")
+        bear_flow  = sum(1 for f in flow if f.get("bias") == "BEARISH")
+        total_flow = bull_flow + bear_flow
+        if total_flow == 0:
+            s2_pts, s2_lbl = 10, "No unusual flow detected (neutral)"
+        else:
+            aligned   = bull_flow if is_bullish else bear_flow
+            align_pct = aligned / total_flow * 100
+            if align_pct >= 70:
+                s2_pts = 20
+                s2_lbl = f"{'Bullish' if is_bullish else 'Bearish'} flow {align_pct:.0f}% aligned ✓"
+            elif align_pct >= 40:
+                s2_pts, s2_lbl = 10, f"Mixed flow — {align_pct:.0f}% aligned"
+            else:
+                s2_pts, s2_lbl = 0,  f"Flow opposing bias ✗"
+    except Exception:
+        s2_pts, s2_lbl = 10, "Flow data unavailable (neutral)"
+    score += s2_pts
+    signals["unusual_flow"] = {"pts": s2_pts, "label": s2_lbl}
+
+    # ── 3. VIX regime (20 pts) ────────────────────────────────────────────────
+    vix = vix_data or get_vix_level()
+    if vix:
+        regime = vix.get("regime", "NORMAL")
+        if regime == "LOW":
+            s3_pts, s3_lbl = 20, f"VIX {vix['vix']:.1f} — LOW vol ✓"
+        elif regime == "NORMAL":
+            s3_pts, s3_lbl = 16, f"VIX {vix['vix']:.1f} — NORMAL"
+        elif regime == "ELEVATED":
+            s3_pts, s3_lbl = 8,  f"VIX {vix['vix']:.1f} — ELEVATED"
+        else:
+            s3_pts, s3_lbl = 2,  f"VIX {vix['vix']:.1f} — EXTREME ✗"
+    else:
+        s3_pts, s3_lbl = 10, "VIX unavailable (neutral)"
+    score += s3_pts
+    signals["vix_regime"] = {"pts": s3_pts, "label": s3_lbl}
+
+    # ── 4. Earnings safety (20 pts) ───────────────────────────────────────────
+    try:
+        ew = check_earnings_in_window(ticker, expiry)
+        if not ew.get("has_earnings"):
+            s4_pts, s4_lbl = 20, "No earnings in window ✓"
+        else:
+            days_away = ew.get("days_away", 0)
+            if days_away >= 5:
+                s4_pts, s4_lbl = 8,  f"Earnings in {days_away}d — risk elevated"
+            else:
+                s4_pts, s4_lbl = 0,  f"Earnings in {days_away}d — very high risk ✗"
+    except Exception:
+        s4_pts, s4_lbl = 15, "Earnings data unavailable (partial)"
+    score += s4_pts
+    signals["earnings_safety"] = {"pts": s4_pts, "label": s4_lbl}
+
+    # ── 5. Entry quality (20 pts) ─────────────────────────────────────────────
+    eq = entry_quality
+    if eq is None:
+        try:
+            eq = get_entry_quality(ticker, bias)
+        except Exception:
+            eq = None
+    if eq:
+        eq_score = eq.get("score", 50)
+        if eq_score >= 75:
+            s5_pts, s5_lbl = 20, f"Entry quality {eq_score}/100 — A ✓"
+        elif eq_score >= 60:
+            s5_pts, s5_lbl = 15, f"Entry quality {eq_score}/100 — B"
+        elif eq_score >= 45:
+            s5_pts, s5_lbl = 8,  f"Entry quality {eq_score}/100 — C"
+        else:
+            s5_pts, s5_lbl = 2,  f"Entry quality {eq_score}/100 — poor ✗"
+    else:
+        s5_pts, s5_lbl = 10, "Entry quality unavailable (neutral)"
+    score += s5_pts
+    signals["entry_quality"] = {"pts": s5_pts, "label": s5_lbl}
+
+    # ── Grade ─────────────────────────────────────────────────────────────────
+    score = min(100, max(0, score))
+    if score >= 80:
+        grade, advice = "A", "HIGH CONVICTION — full standard size"
+    elif score >= 65:
+        grade, advice = "B", "Good conviction — standard position size"
+    elif score >= 50:
+        grade, advice = "C", "Moderate conviction — reduce to half size"
+    else:
+        grade, advice = "D", "Low conviction — skip or paper trade only"
+
+    return {"score": score, "grade": grade, "advice": advice, "signals": signals}
+
+
+def get_position_sizing(account_cash, mid_price, vix_data=None,
+                        closed_trades=None, risk_pct=5.0):
+    """
+    Dynamic position sizing: VIX-adjusted fixed fraction blended with half-Kelly
+    derived from live trade history.
+
+    Parameters
+    ----------
+    account_cash  : float — available cash
+    mid_price     : float — option premium per share (1 contract = 100 shares)
+    vix_data      : dict from get_vix_level() or None
+    closed_trades : list of position dicts with 'net_pnl' and 'gross_invested'
+    risk_pct      : float — base % of capital to risk per trade (default 5 %)
+
+    Returns dict:
+      contracts     — recommended number of contracts (≥ 1 or 0 if too expensive)
+      total_cost    — dollar cost of recommended size
+      max_risk_pct  — total_cost as % of account
+      kelly_f       — half-Kelly fraction (0 if history < 10 trades)
+      vix_mult      — VIX regime multiplier applied
+      sizing_method — 'half_kelly' or 'fixed_fraction'
+      advice        — human-readable explanation
+    """
+    if account_cash <= 0 or mid_price <= 0:
+        return {"contracts": 0,
+                "advice": "Insufficient cash or invalid premium price.",
+                "total_cost": 0, "max_risk_pct": 0,
+                "kelly_f": 0, "vix_mult": 1.0, "sizing_method": "n/a"}
+
+    # ── VIX multiplier ────────────────────────────────────────────────────────
+    vix = vix_data or get_vix_level()
+    if vix:
+        regime   = vix.get("regime", "NORMAL")
+        vix_mult = {"LOW": 1.2, "NORMAL": 1.0, "ELEVATED": 0.6, "EXTREME": 0.3}.get(regime, 1.0)
+    else:
+        vix_mult = 1.0
+
+    # ── Half-Kelly (needs ≥ 10 closed trades) ─────────────────────────────────
+    kelly_f       = 0.0
+    sizing_method = "fixed_fraction"
+    if closed_trades and len(closed_trades) >= 10:
+        try:
+            pairs   = [(float(t.get("net_pnl", 0) or 0),
+                        float(t.get("gross_invested", 1) or 1))
+                       for t in closed_trades]
+            returns = [p / i for p, i in pairs if i > 0]
+            wins    = [r for r in returns if r > 0]
+            losses  = [abs(r) for r in returns if r < 0]
+            if wins and losses:
+                p_win      = len(wins) / len(returns)
+                b_avg      = sum(wins)   / len(wins)
+                a_avg      = sum(losses) / len(losses)
+                full_kelly = (p_win * b_avg - (1 - p_win) * a_avg) / b_avg if b_avg > 0 else 0.0
+                kelly_f    = max(0.0, min(0.25, full_kelly / 2))
+                sizing_method = "half_kelly"
+        except Exception:
+            kelly_f = 0.0
+
+    # ── Effective fraction ────────────────────────────────────────────────────
+    base_frac = risk_pct / 100.0
+    if sizing_method == "half_kelly" and kelly_f > 0:
+        effective_frac = (base_frac + kelly_f) / 2
+    else:
+        effective_frac = base_frac
+    effective_frac *= vix_mult
+
+    risk_dollars      = round(account_cash * effective_frac, 2)
+    cost_per_contract = round(mid_price * 100, 2)
+    contracts         = max(1, int(risk_dollars / cost_per_contract))
+
+    # Safety cap: never > 25 % of cash in one trade
+    max_by_cash = max(1, int(account_cash * 0.25 / cost_per_contract))
+    contracts   = min(contracts, max_by_cash)
+
+    total_cost   = round(cost_per_contract * contracts, 2)
+    max_risk_pct = round(total_cost / account_cash * 100, 1) if account_cash > 0 else 0.0
+
+    if total_cost > account_cash:
+        return {"contracts": 0,
+                "advice": f"Insufficient cash — 1 contract costs ${cost_per_contract:.2f}.",
+                "total_cost": 0, "max_risk_pct": 0,
+                "kelly_f": round(kelly_f, 4), "vix_mult": vix_mult,
+                "sizing_method": sizing_method}
+
+    advice = (
+        f"{'Half-Kelly' if sizing_method == 'half_kelly' else 'Fixed-fraction'} sizing: "
+        f"{contracts} contract(s) @ ${mid_price:.2f} = ${total_cost:.2f} "
+        f"({max_risk_pct:.1f}% of capital)  ·  VIX mult {vix_mult:.1f}×"
+        + (f"  ·  Kelly f={kelly_f:.3f}" if kelly_f > 0 else "")
+    )
+    return {
+        "contracts":    contracts,
+        "risk_dollars": round(risk_dollars, 2),
+        "total_cost":   total_cost,
+        "max_risk_pct": max_risk_pct,
+        "kelly_f":      round(kelly_f, 4),
+        "vix_mult":     vix_mult,
+        "sizing_method": sizing_method,
+        "advice":        advice,
+    }

@@ -6172,3 +6172,728 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OPTIONS ENGINE — Black-Scholes · Chain Analyzer · Scanner · Strategy · Paper
+# ══════════════════════════════════════════════════════════════════════════════
+
+try:
+    from scipy.stats import norm as _norm
+    _SCIPY_OK = True
+except ImportError:
+    _SCIPY_OK = False
+
+_RISK_FREE      = 0.05        # assumed risk-free rate (5 %)
+_OPTIONS_BUDGET = 5_000.0     # virtual paper capital
+
+
+def _bs_greeks(S, K, T, r, sigma, opt_type="call"):
+    """Black-Scholes price + Greeks. Returns {} on bad inputs or missing scipy."""
+    if not _SCIPY_OK:
+        return {}
+    try:
+        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+            return {}
+        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        d2 = d1 - sigma * np.sqrt(T)
+        pdf_d1 = _norm.pdf(d1)
+        if opt_type == "call":
+            price = S * _norm.cdf(d1) - K * np.exp(-r * T) * _norm.cdf(d2)
+            delta = _norm.cdf(d1)
+            theta = (-(S * pdf_d1 * sigma) / (2 * np.sqrt(T))
+                     - r * K * np.exp(-r * T) * _norm.cdf(d2)) / 365
+        else:
+            price = K * np.exp(-r * T) * _norm.cdf(-d2) - S * _norm.cdf(-d1)
+            delta = _norm.cdf(d1) - 1
+            theta = (-(S * pdf_d1 * sigma) / (2 * np.sqrt(T))
+                     + r * K * np.exp(-r * T) * _norm.cdf(-d2)) / 365
+        gamma = pdf_d1 / (S * sigma * np.sqrt(T))
+        vega  = S * pdf_d1 * np.sqrt(T) / 100
+        return {
+            "bs_price": round(float(price), 4),
+            "delta":    round(float(delta), 3),
+            "gamma":    round(float(gamma), 5),
+            "theta":    round(float(theta), 4),
+            "vega":     round(float(vega),  4),
+        }
+    except Exception:
+        return {}
+
+
+# ── Options Chain Analyzer ────────────────────────────────────────────────────
+
+class OptionsChainAnalyzer:
+    """Fetch + enrich a full options chain for a single ticker."""
+
+    def __init__(self, ticker):
+        self.ticker = str(ticker).upper()
+        self._tk = yf.Ticker(self.ticker)
+
+    # ── public ───────────────────────────────────────────────────────────────
+
+    def expirations(self):
+        """Return list of available expiry date strings."""
+        try:
+            return list(self._tk.options)
+        except Exception:
+            return []
+
+    def get_chain(self, expiry=None):
+        """
+        Return dict:
+          calls, puts  — enriched DataFrames
+          spot         — current price
+          expiry       — date string used
+          dte          — calendar days to expiry
+        Returns {} on failure.
+        """
+        exps = self.expirations()
+        if not exps:
+            return {}
+        if expiry is None or expiry not in exps:
+            expiry = exps[0]
+        try:
+            chain = self._tk.option_chain(expiry)
+        except Exception:
+            return {}
+
+        spot = self._get_spot()
+        dte  = max(0, (datetime.strptime(expiry, "%Y-%m-%d").date()
+                       - datetime.utcnow().date()).days)
+        T = dte / 365.0
+
+        calls = self._enrich(chain.calls.copy(), spot, T, "call")
+        puts  = self._enrich(chain.puts.copy(),  spot, T, "put")
+
+        return {"calls": calls, "puts": puts, "spot": spot,
+                "expiry": expiry, "dte": dte}
+
+    def iv_rank(self):
+        """
+        IV rank 0-100 using 30-day realised HV as IV proxy.
+        Returns dict with iv_rank, current_hv, hv_52_hi, hv_52_lo.
+        """
+        try:
+            hist = yf.download(self.ticker, period="1y", interval="1d",
+                               progress=False, auto_adjust=True)
+            if hist is None or hist.empty:
+                return {}
+            if isinstance(hist.columns, pd.MultiIndex):
+                hist.columns = hist.columns.get_level_values(0)
+            closes    = hist["Close"].dropna()
+            log_ret   = np.log(closes / closes.shift(1)).dropna()
+            hv_series = log_ret.rolling(30).std() * np.sqrt(252) * 100
+            hv_series = hv_series.dropna()
+            if len(hv_series) < 30:
+                return {}
+            current  = float(hv_series.iloc[-1])
+            hi       = float(hv_series.max())
+            lo       = float(hv_series.min())
+            rng      = hi - lo
+            rank     = round((current - lo) / rng * 100, 1) if rng > 0 else 50.0
+            return {"iv_rank": rank, "current_hv": round(current, 1),
+                    "hv_52_hi": round(hi, 1), "hv_52_lo": round(lo, 1)}
+        except Exception:
+            return {}
+
+    def max_pain(self, expiry=None):
+        """Compute max pain strike. Returns float or None."""
+        try:
+            data = self.get_chain(expiry)
+            if not data:
+                return None
+            calls   = data["calls"]
+            puts    = data["puts"]
+            strikes = sorted(set(calls["strike"].tolist() + puts["strike"].tolist()))
+            if not strikes:
+                return None
+            pain = []
+            c_oi = dict(zip(calls["strike"], calls.get("openInterest", pd.Series([], dtype=float)).fillna(0)))
+            p_oi = dict(zip(puts["strike"],  puts.get("openInterest",  pd.Series([], dtype=float)).fillna(0)))
+            for S_t in strikes:
+                c_loss = sum(max(0, S_t - k) * oi * 100 for k, oi in c_oi.items())
+                p_loss = sum(max(0, k - S_t) * oi * 100 for k, oi in p_oi.items())
+                pain.append(c_loss + p_loss)
+            return float(strikes[pain.index(min(pain))])
+        except Exception:
+            return None
+
+    def cp_ratio(self, expiry=None):
+        """Call-to-Put volume ratio. Returns float or None."""
+        try:
+            data = self.get_chain(expiry)
+            if not data:
+                return None
+            cv = data["calls"]["volume"].fillna(0).sum()
+            pv = data["puts"]["volume"].fillna(0).sum()
+            return round(float(cv) / float(pv), 2) if pv > 0 else None
+        except Exception:
+            return None
+
+    # ── private ──────────────────────────────────────────────────────────────
+
+    def _get_spot(self):
+        try:
+            info = self._tk.fast_info
+            for attr in ("last_price", "regularMarketPrice"):
+                p = getattr(info, attr, None)
+                if p:
+                    return float(p)
+        except Exception:
+            pass
+        try:
+            h = yf.download(self.ticker, period="1d", interval="1m",
+                            progress=False, auto_adjust=True)
+            if isinstance(h.columns, pd.MultiIndex):
+                h.columns = h.columns.get_level_values(0)
+            return float(h["Close"].dropna().iloc[-1])
+        except Exception:
+            return 0.0
+
+    def _enrich(self, df, spot, T, opt_type):
+        """Add mid, iv_pct, moneyness, ITM flag, BS Greeks."""
+        df = df.copy()
+        bid = df.get("bid", pd.Series([0.0] * len(df))).fillna(0)
+        ask = df.get("ask", pd.Series([0.0] * len(df))).fillna(0)
+        df["mid"] = ((bid + ask) / 2).round(2)
+
+        if "impliedVolatility" in df.columns:
+            df["iv_pct"] = (df["impliedVolatility"].fillna(0) * 100).round(1)
+        else:
+            df["iv_pct"] = 0.0
+
+        if "strike" in df.columns and spot > 0:
+            df["itm"] = (df["strike"] < spot) if opt_type == "call" else (df["strike"] > spot)
+            df["moneyness"] = (df["strike"] / spot).round(3)
+
+        greeks_rows = []
+        for _, row in df.iterrows():
+            K     = float(row.get("strike", 0) or 0)
+            sigma = float(row.get("impliedVolatility", 0) or 0)
+            g = _bs_greeks(spot, K, T, _RISK_FREE, sigma, opt_type) if K > 0 and sigma > 0 and T > 0 else {}
+            greeks_rows.append(g)
+
+        gdf = pd.DataFrame(greeks_rows, index=df.index)
+        for col in ("delta", "gamma", "theta", "vega"):
+            if col in gdf.columns:
+                df[col] = gdf[col]
+        return df
+
+    @staticmethod
+    def _live_mid_for_strike(ticker, expiry, opt_type, strike):
+        """Fetch current bid/ask mid for a specific contract. Returns float or None."""
+        try:
+            chain = yf.Ticker(ticker).option_chain(expiry)
+            df    = chain.calls if opt_type == "call" else chain.puts
+            row   = df[df["strike"] == strike]
+            if row.empty:
+                return None
+            b = float(row["bid"].iloc[0] or 0)
+            a = float(row["ask"].iloc[0] or 0)
+            return round((b + a) / 2, 2) if b + a > 0 else None
+        except Exception:
+            return None
+
+
+# ── Aggressive Options Scanner ────────────────────────────────────────────────
+
+class AggressiveOptionsScanner:
+    """Detect sweeps, blocks, gamma rips, and bullish flow across multiple tickers."""
+
+    SWEEP_VOL_OI_MULT = 5.0    # vol > 5× OI  → fresh institutional
+    SWEEP_MIN_VOL     = 200    # minimum contracts for a sweep flag
+    BLOCK_MIN_VOL     = 5_000  # block trade threshold
+    GAMMA_MAX_DTE     = 7      # short-dated OTM calls
+    GAMMA_MIN_VOL     = 100
+
+    def scan_ticker(self, ticker):
+        """
+        Scan near-term expiries of *ticker* for unusual activity.
+        Returns list of alert dicts.
+        """
+        alerts = []
+        try:
+            analyzer = OptionsChainAnalyzer(ticker)
+            exps     = analyzer.expirations()
+            spot     = analyzer._get_spot()
+            if not exps or spot <= 0:
+                return alerts
+
+            for expiry in exps[:4]:          # focus on the 4 nearest expiries
+                try:
+                    chain = analyzer.get_chain(expiry)
+                except Exception:
+                    continue
+                if not chain:
+                    continue
+                dte = chain["dte"]
+
+                for opt_type, df in (("call", chain["calls"]), ("put", chain["puts"])):
+                    for _, row in df.iterrows():
+                        strike = float(row.get("strike", 0) or 0)
+                        vol    = float(row.get("volume",       0) or 0)
+                        oi     = float(row.get("openInterest", 0) or 0)
+                        mid    = float(row.get("mid",          0) or 0)
+                        iv_pct = float(row.get("iv_pct",       0) or 0)
+                        symbol = str(row.get("contractSymbol", ""))
+
+                        if strike <= 0 or vol < 10:
+                            continue
+
+                        tags = []
+                        # Sweep: high vol vs open interest → new positioning
+                        if vol >= self.SWEEP_MIN_VOL and (oi == 0 or vol >= oi * self.SWEEP_VOL_OI_MULT):
+                            tags.append("SWEEP")
+                        # Block trade
+                        if vol >= self.BLOCK_MIN_VOL:
+                            tags.append("BLOCK")
+                        # Gamma rip: short-dated OTM call with volume
+                        if (opt_type == "call" and dte <= self.GAMMA_MAX_DTE
+                                and strike > spot and vol >= self.GAMMA_MIN_VOL):
+                            tags.append("GAMMA_RIP")
+
+                        if tags:
+                            alerts.append({
+                                "ticker":          ticker.upper(),
+                                "expiry":          expiry,
+                                "dte":             dte,
+                                "type":            opt_type.upper(),
+                                "strike":          strike,
+                                "spot":            spot,
+                                "volume":          int(vol),
+                                "open_interest":   int(oi),
+                                "vol_oi_ratio":    round(vol / oi, 1) if oi > 0 else 999,
+                                "mid_price":       mid,
+                                "iv_pct":          iv_pct,
+                                "tags":            " · ".join(tags),
+                                "contract_symbol": symbol,
+                                "bias":            "BULLISH" if opt_type == "call" else "BEARISH",
+                            })
+        except Exception:
+            pass
+        return alerts
+
+    def scan_many(self, tickers):
+        """Scan multiple tickers. Returns alerts sorted by volume descending."""
+        all_alerts = []
+        for tk in tickers:
+            all_alerts.extend(self.scan_ticker(tk))
+        all_alerts.sort(key=lambda x: x.get("volume", 0), reverse=True)
+        return all_alerts
+
+
+# ── Options Strategy Engine ───────────────────────────────────────────────────
+
+class OptionsStrategyEngine:
+    """Auto-suggest aggressive options strategies for a given ticker + bias."""
+
+    def suggest(self, ticker, bias="bullish"):
+        """
+        Returns list of strategy suggestion dicts, each with:
+          strategy, description, legs, entry_cost, max_loss, max_profit,
+          dte, expiry, strike, opt_type, mid
+        """
+        suggestions = []
+        try:
+            analyzer = OptionsChainAnalyzer(ticker)
+            exps     = analyzer.expirations()
+            spot     = analyzer._get_spot()
+            if not exps or spot <= 0:
+                return suggestions
+
+            bias = str(bias).lower()
+
+            if bias == "bullish":
+                # ── 1. Momentum Call: ATM, 21-35 DTE ─────────────────────────
+                exp25 = self._nearest_expiry(exps, 21, 35)
+                if exp25:
+                    data = analyzer.get_chain(exp25)
+                    if data:
+                        calls = data["calls"]
+                        atm   = self._atm_strike(calls["strike"].tolist(), spot)
+                        r     = calls[calls["strike"] == atm]
+                        if not r.empty:
+                            mid = float(r["mid"].iloc[0])
+                            suggestions.append({
+                                "strategy":    "Momentum Call",
+                                "description": f"ATM {ticker} ${atm:.0f}C  {data['dte']} DTE — ride the momentum",
+                                "legs":        [f"BUY 1× {ticker} {exp25} ${atm:.0f} CALL @ ${mid:.2f}"],
+                                "entry_cost":  round(mid * 100, 2),
+                                "max_loss":    round(mid * 100, 2),
+                                "max_profit":  "Unlimited",
+                                "dte":         data["dte"],
+                                "expiry":      exp25,
+                                "strike":      atm,
+                                "opt_type":    "call",
+                                "mid":         mid,
+                            })
+
+                # ── 2. Weekly Gamma Play: 1.5% OTM, 3-7 DTE ─────────────────
+                exp7 = self._nearest_expiry(exps, 3, 7)
+                if exp7:
+                    data = analyzer.get_chain(exp7)
+                    if data:
+                        calls = data["calls"]
+                        otm   = self._otm_strike(calls["strike"].tolist(), spot, 0.015)
+                        r     = calls[calls["strike"] == otm]
+                        if not r.empty:
+                            mid = float(r["mid"].iloc[0])
+                            suggestions.append({
+                                "strategy":    "Weekly Gamma Play",
+                                "description": f"OTM {ticker} ${otm:.0f}C  {data['dte']} DTE — lottery ticket",
+                                "legs":        [f"BUY 1× {ticker} {exp7} ${otm:.0f} CALL @ ${mid:.2f}"],
+                                "entry_cost":  round(mid * 100, 2),
+                                "max_loss":    round(mid * 100, 2),
+                                "max_profit":  "Unlimited",
+                                "dte":         data["dte"],
+                                "expiry":      exp7,
+                                "strike":      otm,
+                                "opt_type":    "call",
+                                "mid":         mid,
+                            })
+
+                # ── 3. Debit Call Spread: ATM + sell 5% OTM, 21-35 DTE ───────
+                if exp25:
+                    data = analyzer.get_chain(exp25)
+                    if data:
+                        calls = data["calls"]
+                        atm   = self._atm_strike(calls["strike"].tolist(), spot)
+                        upper = self._otm_strike(calls["strike"].tolist(), spot, 0.05)
+                        r_atm = calls[calls["strike"] == atm]
+                        r_upr = calls[calls["strike"] == upper]
+                        if not r_atm.empty and not r_upr.empty:
+                            b_mid = float(r_atm["mid"].iloc[0])
+                            s_mid = float(r_upr["mid"].iloc[0])
+                            debit = round((b_mid - s_mid) * 100, 2)
+                            width = round((upper - atm) * 100, 2)
+                            if debit > 0 and width > debit:
+                                suggestions.append({
+                                    "strategy":    "Debit Call Spread",
+                                    "description": f"${atm:.0f}/${upper:.0f} spread {data['dte']} DTE — defined risk",
+                                    "legs":        [
+                                        f"BUY  1× {ticker} {exp25} ${atm:.0f} CALL @ ${b_mid:.2f}",
+                                        f"SELL 1× {ticker} {exp25} ${upper:.0f} CALL @ ${s_mid:.2f}",
+                                    ],
+                                    "entry_cost":  debit,
+                                    "max_loss":    debit,
+                                    "max_profit":  round(width - debit, 2),
+                                    "dte":         data["dte"],
+                                    "expiry":      exp25,
+                                    "strike":      atm,
+                                    "opt_type":    "call",
+                                    "mid":         b_mid,
+                                })
+
+            elif bias == "bearish":
+                # ── 1. Momentum Put: ATM, 21-35 DTE ──────────────────────────
+                exp25 = self._nearest_expiry(exps, 21, 35)
+                if exp25:
+                    data = analyzer.get_chain(exp25)
+                    if data:
+                        puts = data["puts"]
+                        atm  = self._atm_strike(puts["strike"].tolist(), spot)
+                        r    = puts[puts["strike"] == atm]
+                        if not r.empty:
+                            mid = float(r["mid"].iloc[0])
+                            suggestions.append({
+                                "strategy":    "Momentum Put",
+                                "description": f"ATM {ticker} ${atm:.0f}P  {data['dte']} DTE — fade the move",
+                                "legs":        [f"BUY 1× {ticker} {exp25} ${atm:.0f} PUT @ ${mid:.2f}"],
+                                "entry_cost":  round(mid * 100, 2),
+                                "max_loss":    round(mid * 100, 2),
+                                "max_profit":  round(atm * 100, 2),
+                                "dte":         data["dte"],
+                                "expiry":      exp25,
+                                "strike":      atm,
+                                "opt_type":    "put",
+                                "mid":         mid,
+                            })
+
+        except Exception:
+            pass
+        return suggestions
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _nearest_expiry(exps, min_dte, max_dte):
+        today = datetime.utcnow().date()
+        for exp in exps:
+            try:
+                dte = (datetime.strptime(exp, "%Y-%m-%d").date() - today).days
+                if min_dte <= dte <= max_dte:
+                    return exp
+            except ValueError:
+                pass
+        return None
+
+    @staticmethod
+    def _atm_strike(strikes, spot):
+        return min(strikes, key=lambda k: abs(k - spot)) if strikes else spot
+
+    @staticmethod
+    def _otm_strike(strikes, spot, offset_pct=0.05):
+        target = spot * (1 + offset_pct)
+        otm = [s for s in strikes if s > spot]
+        if not otm:
+            return max(strikes) if strikes else spot
+        return min(otm, key=lambda k: abs(k - target))
+
+
+# ── Options Paper Trading Engine ──────────────────────────────────────────────
+
+class OptionsPaperEngine:
+    """Virtual options trading — $5,000 capital, 1 contract = 100 shares."""
+
+    _INIT_SQL = """
+CREATE TABLE IF NOT EXISTS options_positions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker           TEXT,
+    contract_symbol  TEXT,
+    option_type      TEXT,
+    strike           REAL,
+    expiry           DATE,
+    contracts        INTEGER,
+    entry_price      REAL,
+    entry_date       DATE,
+    gross_invested   REAL,
+    status           TEXT DEFAULT 'OPEN',
+    exit_price       REAL,
+    exit_date        DATE,
+    exit_reason      TEXT,
+    gross_pnl        REAL,
+    net_pnl          REAL,
+    strategy         TEXT
+);
+CREATE TABLE IF NOT EXISTS options_state (
+    id               INTEGER PRIMARY KEY,
+    available_cash   REAL,
+    realized_pnl     REAL,
+    trades_made      INTEGER,
+    starting_capital REAL
+);
+"""
+
+    def __init__(self, conn):
+        self.conn = conn
+        try:
+            self.conn.executescript(self._INIT_SQL)
+        except Exception:
+            pass
+        self._load_state()
+
+    # ── persistence ──────────────────────────────────────────────────────────
+
+    def _load_state(self):
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM options_state WHERE id=1"
+            ).fetchone()
+        except Exception:
+            row = None
+        if row:
+            try:
+                self._cash     = float(row.get("available_cash",   0) or 0)
+                self._realized = float(row.get("realized_pnl",     0) or 0)
+                self._trades   = int(  row.get("trades_made",      0) or 0)
+                self._starting = float(row.get("starting_capital", _OPTIONS_BUDGET) or _OPTIONS_BUDGET)
+                return
+            except Exception:
+                pass
+        self._cash     = _OPTIONS_BUDGET
+        self._realized = 0.0
+        self._trades   = 0
+        self._starting = _OPTIONS_BUDGET
+        self._save_state()
+
+    def _save_state(self):
+        try:
+            self.conn.execute(
+                "INSERT INTO options_state "
+                "(id, available_cash, realized_pnl, trades_made, starting_capital) "
+                "VALUES (1, ?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "available_cash=excluded.available_cash, "
+                "realized_pnl=excluded.realized_pnl, "
+                "trades_made=excluded.trades_made, "
+                "starting_capital=excluded.starting_capital",
+                (self._cash, self._realized, self._trades, self._starting)
+            )
+        except Exception:
+            pass
+
+    # ── trading ──────────────────────────────────────────────────────────────
+
+    def buy(self, ticker, contract_symbol, option_type,
+            strike, expiry, contracts, entry_price, strategy="manual"):
+        """Buy options. entry_price = premium per share; cost = price × 100 × contracts."""
+        contracts  = max(1, int(contracts))
+        cost       = round(float(entry_price) * 100 * contracts, 2)
+        if cost <= 0:
+            return {"ok": False, "error": "Invalid entry price"}
+        if cost > self._cash:
+            return {"ok": False,
+                    "error": f"Insufficient cash (need ${cost:.2f}, have ${self._cash:.2f})"}
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        try:
+            self.conn.execute(
+                "INSERT INTO options_positions "
+                "(ticker, contract_symbol, option_type, strike, expiry, contracts, "
+                "entry_price, entry_date, gross_invested, status, strategy) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)",
+                (str(ticker).upper(), str(contract_symbol),
+                 str(option_type).lower(), float(strike), str(expiry),
+                 contracts, float(entry_price), today, cost, str(strategy))
+            )
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        self._cash   -= cost
+        self._trades += 1
+        self._save_state()
+        return {"ok": True, "cost": cost, "cash_remaining": round(self._cash, 2)}
+
+    def close(self, position_id, exit_price, exit_reason="MANUAL"):
+        """Close open position at exit_price (per share premium)."""
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM options_positions WHERE id=? AND status='OPEN'",
+                (int(position_id),)
+            ).fetchone()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        if not row:
+            return {"ok": False, "error": "Position not found or already closed"}
+
+        contracts  = int(row.get("contracts", 1) or 1)
+        invested   = float(row.get("gross_invested", 0) or 0)
+        gross_exit = round(float(exit_price) * 100 * contracts, 2)
+        gross_pnl  = round(gross_exit - invested, 2)
+        today      = datetime.utcnow().strftime("%Y-%m-%d")
+        try:
+            self.conn.execute(
+                "UPDATE options_positions "
+                "SET status='CLOSED', exit_price=?, exit_date=?, "
+                "exit_reason=?, gross_pnl=?, net_pnl=? WHERE id=?",
+                (float(exit_price), today, str(exit_reason),
+                 gross_pnl, gross_pnl, int(position_id))
+            )
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        self._cash     += gross_exit
+        self._realized += gross_pnl
+        self._save_state()
+        return {"ok": True, "net_pnl": gross_pnl, "cash": round(self._cash, 2)}
+
+    def expire_check(self):
+        """Auto-expire worthless options past their expiry date."""
+        closed = []
+        today  = datetime.utcnow().strftime("%Y-%m-%d")
+        try:
+            expired = self.conn.execute(
+                "SELECT * FROM options_positions WHERE status='OPEN' AND expiry < ?",
+                (today,)
+            ).fetchall()
+        except Exception:
+            return []
+        for row in expired:
+            result = self.close(int(row.get("id")), 0.0, "EXPIRED_WORTHLESS")
+            if result.get("ok"):
+                d = {k: row.get(k) for k in row.keys()}
+                d["net_pnl"] = result["net_pnl"]
+                closed.append(d)
+        return closed
+
+    def get_positions(self, status="OPEN"):
+        """Return positions list. OPEN positions get live unrealized P&L."""
+        try:
+            rows = self.conn.execute(
+                "SELECT * FROM options_positions WHERE status=? ORDER BY entry_date DESC",
+                (status,)
+            ).fetchall()
+        except Exception:
+            return []
+        result = []
+        for row in rows:
+            d = {k: row.get(k) for k in row.keys()}
+            if status == "OPEN":
+                contracts = int(d.get("contracts", 1) or 1)
+                invested  = float(d.get("gross_invested", 0) or 0)
+                live      = OptionsChainAnalyzer._live_mid_for_strike(
+                    str(d.get("ticker", "")),
+                    str(d.get("expiry", "")),
+                    str(d.get("option_type", "call")),
+                    float(d.get("strike", 0) or 0),
+                )
+                if live and live > 0:
+                    cur_val = live * 100 * contracts
+                    d["current_price"]  = live
+                    d["current_value"]  = round(cur_val, 2)
+                    d["unrealized_pnl"] = round(cur_val - invested, 2)
+                    d["unrealized_pct"] = round(
+                        (cur_val - invested) / invested * 100, 1
+                    ) if invested > 0 else 0.0
+                else:
+                    d["current_price"]  = None
+                    d["current_value"]  = None
+                    d["unrealized_pnl"] = None
+                    d["unrealized_pct"] = None
+            result.append(d)
+        return result
+
+    def get_summary(self):
+        try:
+            n_open = int(
+                self.conn.execute(
+                    "SELECT COUNT(*) FROM options_positions WHERE status='OPEN'"
+                ).fetchone()[0] or 0
+            )
+        except Exception:
+            n_open = 0
+        try:
+            row = self.conn.execute(
+                "SELECT COUNT(*), SUM(net_pnl) "
+                "FROM options_positions WHERE status='CLOSED'"
+            ).fetchone()
+            n_closed   = int(row[0] or 0)
+            total_real = float(row[1] or 0)
+        except Exception:
+            n_closed   = 0
+            total_real = 0.0
+        try:
+            n_wins = int(
+                self.conn.execute(
+                    "SELECT COUNT(*) FROM options_positions "
+                    "WHERE status='CLOSED' AND net_pnl > 0"
+                ).fetchone()[0] or 0
+            )
+        except Exception:
+            n_wins = 0
+        win_rate = round(n_wins / n_closed * 100, 1) if n_closed > 0 else 0.0
+        return {
+            "available_cash":   round(self._cash,     2),
+            "realized_pnl":     round(self._realized, 2),
+            "starting_capital": self._starting,
+            "total_return_pct": round(self._realized / self._starting * 100, 2),
+            "n_open":           n_open,
+            "n_closed":         n_closed,
+            "n_wins":           n_wins,
+            "win_rate":         win_rate,
+            "trades_made":      self._trades,
+        }
+
+    def reset(self):
+        """Wipe all options trades and reset cash to $5,000."""
+        try:
+            self.conn.execute("DELETE FROM options_positions")
+        except Exception:
+            pass
+        try:
+            self.conn.execute("DELETE FROM options_state")
+        except Exception:
+            pass
+        self._cash     = _OPTIONS_BUDGET
+        self._realized = 0.0
+        self._trades   = 0
+        self._starting = _OPTIONS_BUDGET
+        self._save_state()

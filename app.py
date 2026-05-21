@@ -829,13 +829,14 @@ if run_btn:
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
-tab_dash, tab_results, tab_chart, tab_analytics, tab_paper, tab_fees = st.tabs([
+tab_dash, tab_results, tab_chart, tab_analytics, tab_paper, tab_fees, tab_options = st.tabs([
     "📊  Dashboard",
     "🔍  Scan Results",
     "📈  Stock Chart",
     "📉  Analytics",
     "💼  Paper Portfolio",
     "💰  Fees Tracker",
+    "⚡  Options",
 ])
 
 
@@ -1945,3 +1946,504 @@ with tab_fees:
     else:
         st.info("No fee transactions recorded yet. "
                 "Paper trades will appear here once the portfolio is active.", icon="💰")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 7 — OPTIONS TRADING (Aggressive Fast-Money Focus)
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_options:
+    st.markdown(
+        '<div class="section-hdr">⚡ Options Trading — High-Conviction Aggressive Plays</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Ticker + bias controls (shared across all sub-tabs) ───────────────────
+    _oc1, _oc2, _oc3 = st.columns([2, 1, 1])
+    with _oc1:
+        opt_ticker = st.text_input(
+            "Ticker symbol", value="SPY", key="opt_ticker_input",
+            placeholder="e.g. SPY, AAPL, TSLA",
+        ).upper().strip()
+    with _oc2:
+        opt_bias = st.selectbox("Directional bias", ["Bullish", "Bearish"],
+                                key="opt_bias_sel")
+    with _oc3:
+        opt_contracts = st.number_input("Contracts (paper)", min_value=1,
+                                        max_value=50, value=1, step=1,
+                                        key="opt_contracts_input")
+
+    ot_chain, ot_unusual, ot_strategy, ot_paper = st.tabs([
+        "⛓  Chain Viewer",
+        "🔥  Unusual Activity",
+        "🎯  Strategy Builder",
+        "💰  Paper Trades",
+    ])
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SUB-TAB 1 — CHAIN VIEWER
+    # ─────────────────────────────────────────────────────────────────────────
+    with ot_chain:
+        st.markdown('<div class="section-hdr">Full Options Chain + Greeks</div>',
+                    unsafe_allow_html=True)
+        if not opt_ticker:
+            st.info("Enter a ticker above to load the chain.", icon="⛓")
+        else:
+            @st.cache_data(ttl=120, show_spinner=False)
+            def _load_chain(tk, exp):
+                return ts.OptionsChainAnalyzer(tk).get_chain(exp)
+
+            @st.cache_data(ttl=3600, show_spinner=False)
+            def _load_exps(tk):
+                return ts.OptionsChainAnalyzer(tk).expirations()
+
+            @st.cache_data(ttl=3600, show_spinner=False)
+            def _load_ivrank(tk):
+                return ts.OptionsChainAnalyzer(tk).iv_rank()
+
+            with st.spinner(f"Loading expiries for {opt_ticker}…"):
+                _exps = _load_exps(opt_ticker)
+
+            if not _exps:
+                st.warning(f"No options data found for **{opt_ticker}**. "
+                           "Try a different ticker.", icon="⚠️")
+            else:
+                _cc1, _cc2 = st.columns([3, 1])
+                with _cc1:
+                    selected_expiry = st.selectbox("Expiry", _exps,
+                                                   key="chain_expiry_sel")
+                with _cc2:
+                    chain_side = st.radio("Show", ["Calls", "Puts", "Both"],
+                                         horizontal=True, key="chain_side_radio")
+
+                with st.spinner(f"Fetching {opt_ticker} chain…"):
+                    _chain_data = _load_chain(opt_ticker, selected_expiry)
+
+                if not _chain_data:
+                    st.error("Could not load chain data. Try again.", icon="❌")
+                else:
+                    spot    = _chain_data.get("spot", 0)
+                    dte_val = _chain_data.get("dte", 0)
+                    mp      = ts.OptionsChainAnalyzer(opt_ticker).max_pain(selected_expiry)
+                    cp_r    = ts.OptionsChainAnalyzer(opt_ticker).cp_ratio(selected_expiry)
+
+                    # ── IV rank ribbon ────────────────────────────────────────
+                    _ivr = _load_ivrank(opt_ticker)
+                    _m1, _m2, _m3, _m4, _m5 = st.columns(5)
+                    _m1.metric("Spot", f"${spot:.2f}")
+                    _m2.metric("DTE", dte_val)
+                    _m3.metric("Max Pain", f"${mp:.2f}" if mp else "—")
+                    _m4.metric("C/P Ratio", f"{cp_r:.2f}" if cp_r else "—",
+                               help=">2 = bullish flow  |  <0.5 = bearish flood")
+                    _m5.metric(
+                        "IV Rank",
+                        f"{_ivr.get('iv_rank', '—')}%" if _ivr else "—",
+                        help="0=cheap vol  |  100=expensive vol",
+                    )
+
+                    # ── Chain table ───────────────────────────────────────────
+                    def _fmt_chain(df, side):
+                        keep = ["strike", "mid", "bid", "ask", "volume",
+                                "openInterest", "iv_pct",
+                                "delta", "gamma", "theta", "vega",
+                                "itm", "moneyness"]
+                        df = df[[c for c in keep if c in df.columns]].copy()
+                        rename = {
+                            "strike": "Strike", "mid": "Mid", "bid": "Bid",
+                            "ask": "Ask", "volume": "Vol",
+                            "openInterest": "OI", "iv_pct": "IV %",
+                            "delta": "Δ", "gamma": "Γ", "theta": "Θ",
+                            "vega": "V", "itm": "ITM", "moneyness": "M/S",
+                        }
+                        df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+                        return df
+
+                    if chain_side in ("Calls", "Both"):
+                        st.markdown("**📈 CALLS**")
+                        c_df = _fmt_chain(_chain_data["calls"], "call")
+                        st.dataframe(
+                            c_df.style.apply(
+                                lambda row: ["background-color:#1a3a1a" if row.get("ITM") else "" for _ in row],
+                                axis=1
+                            ) if "ITM" in c_df.columns else c_df,
+                            use_container_width=True, hide_index=True,
+                        )
+
+                    if chain_side in ("Puts", "Both"):
+                        st.markdown("**📉 PUTS**")
+                        p_df = _fmt_chain(_chain_data["puts"], "put")
+                        st.dataframe(p_df, use_container_width=True, hide_index=True)
+
+                    # ── Open Interest bar chart ───────────────────────────────
+                    st.markdown('<div class="section-hdr">Open Interest by Strike</div>',
+                                unsafe_allow_html=True)
+                    c_oi = _chain_data["calls"][["strike", "openInterest"]].copy()
+                    p_oi = _chain_data["puts"][["strike",  "openInterest"]].copy()
+                    c_oi.columns = ["Strike", "OI"]
+                    p_oi.columns = ["Strike", "OI"]
+                    fig_oi = go.Figure()
+                    fig_oi.add_bar(x=c_oi["Strike"], y=c_oi["OI"],
+                                   name="Calls", marker_color="#3fb950")
+                    fig_oi.add_bar(x=p_oi["Strike"], y=-p_oi["OI"],
+                                   name="Puts",  marker_color="#f85149")
+                    if spot:
+                        fig_oi.add_vline(x=spot, line_color="#e3b341",
+                                         line_dash="dash",
+                                         annotation_text=f"Spot ${spot:.0f}")
+                    if mp:
+                        fig_oi.add_vline(x=mp, line_color="#58a6ff",
+                                         line_dash="dot",
+                                         annotation_text=f"Max Pain ${mp:.0f}")
+                    fig_oi.update_layout(
+                        barmode="overlay", bargap=0,
+                        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                        font=dict(color="#c9d1d9"), height=320,
+                        xaxis=dict(gridcolor="#21262d", title="Strike"),
+                        yaxis=dict(gridcolor="#21262d", title="Open Interest"),
+                        legend=dict(bgcolor="#161b22"),
+                        margin=dict(l=10, r=10, t=10, b=10),
+                    )
+                    st.plotly_chart(fig_oi, use_container_width=True)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SUB-TAB 2 — UNUSUAL ACTIVITY SCANNER
+    # ─────────────────────────────────────────────────────────────────────────
+    with ot_unusual:
+        st.markdown('<div class="section-hdr">🔥 Unusual Options Activity Scanner</div>',
+                    unsafe_allow_html=True)
+        st.caption(
+            "Detects SWEEP (vol > 5× OI), BLOCK (>5,000 contracts), "
+            "GAMMA_RIP (OTM calls ≤7 DTE). High volume vs OI = fresh institutional positioning."
+        )
+
+        _ua1, _ua2 = st.columns([4, 1])
+        with _ua1:
+            scan_tickers_raw = st.text_input(
+                "Tickers to scan (comma-separated)",
+                value=opt_ticker,
+                key="unusual_scan_tickers",
+                placeholder="SPY, QQQ, AAPL, TSLA, NVDA",
+            )
+        with _ua2:
+            scan_btn = st.button("🔍 Scan Now", use_container_width=True,
+                                 key="unusual_scan_btn")
+
+        if scan_btn:
+            scan_list = [t.strip().upper() for t in scan_tickers_raw.split(",") if t.strip()]
+            if not scan_list:
+                st.warning("Enter at least one ticker.", icon="⚠️")
+            else:
+                with st.spinner(f"Scanning {len(scan_list)} ticker(s) for unusual activity…"):
+                    scanner_ua = ts.AggressiveOptionsScanner()
+                    alerts     = scanner_ua.scan_many(scan_list)
+
+                if not alerts:
+                    st.info("No unusual activity detected. Markets may be quiet or data unavailable.", icon="🔇")
+                else:
+                    st.success(f"**{len(alerts)} alert(s) found!**", icon="🔥")
+
+                    rows_ua = []
+                    for a in alerts:
+                        bias_icon = "🟢" if a["bias"] == "BULLISH" else "🔴"
+                        tag_str   = a.get("tags", "")
+                        tags_md   = " ".join(
+                            f"**{t}**" for t in tag_str.split(" · ") if t
+                        )
+                        rows_ua.append({
+                            "Ticker":   a["ticker"],
+                            "Bias":     f"{bias_icon} {a['bias']}",
+                            "Type":     a["type"],
+                            "Strike":   f"${a['strike']:.2f}",
+                            "Expiry":   a["expiry"],
+                            "DTE":      a["dte"],
+                            "Volume":   f"{a['volume']:,}",
+                            "OI":       f"{a['open_interest']:,}",
+                            "Vol/OI":   f"{a['vol_oi_ratio']:.1f}×",
+                            "Mid":      f"${a['mid_price']:.2f}",
+                            "IV %":     f"{a['iv_pct']:.1f}%",
+                            "Tags":     tag_str,
+                        })
+                    st.dataframe(pd.DataFrame(rows_ua),
+                                 use_container_width=True, hide_index=True)
+
+                    # ── Volume bar chart ──────────────────────────────────────
+                    fig_ua = go.Figure()
+                    for a in alerts[:20]:
+                        color = "#3fb950" if a["bias"] == "BULLISH" else "#f85149"
+                        label = f"{a['ticker']} ${a['strike']:.0f}{a['type'][0]} {a['expiry']}"
+                        fig_ua.add_bar(x=[label], y=[a["volume"]],
+                                       marker_color=color,
+                                       name=a["tags"])
+                    fig_ua.update_layout(
+                        showlegend=False,
+                        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                        font=dict(color="#c9d1d9"), height=300,
+                        xaxis=dict(gridcolor="#21262d", tickangle=-35),
+                        yaxis=dict(gridcolor="#21262d", title="Volume"),
+                        margin=dict(l=10, r=10, t=10, b=80),
+                        title=dict(text="Top Unusual Contracts by Volume",
+                                   font=dict(color="#c9d1d9")),
+                    )
+                    st.plotly_chart(fig_ua, use_container_width=True)
+
+        else:
+            st.info("Enter tickers and press **Scan Now** to detect unusual options flow.", icon="🔍")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SUB-TAB 3 — STRATEGY BUILDER
+    # ─────────────────────────────────────────────────────────────────────────
+    with ot_strategy:
+        st.markdown('<div class="section-hdr">🎯 Aggressive Strategy Builder</div>',
+                    unsafe_allow_html=True)
+        st.caption(
+            "Auto-generates high-conviction option plays based on spot price, "
+            "available expiries, and your directional bias."
+        )
+
+        _sb1, _sb2 = st.columns([3, 1])
+        with _sb2:
+            strat_btn = st.button("⚡ Build Strategies", use_container_width=True,
+                                  key="strat_build_btn")
+
+        if strat_btn:
+            if not opt_ticker:
+                st.warning("Enter a ticker in the control bar above.", icon="⚠️")
+            else:
+                with st.spinner(f"Building strategies for {opt_ticker} ({opt_bias})…"):
+                    engine      = ts.OptionsStrategyEngine()
+                    suggestions = engine.suggest(opt_ticker, bias=opt_bias.lower())
+
+                if not suggestions:
+                    st.warning(
+                        f"No strategies generated for **{opt_ticker}**. "
+                        "Options data may be unavailable or market is closed.",
+                        icon="⚠️",
+                    )
+                else:
+                    st.success(f"**{len(suggestions)} strategy(ies) ready for {opt_ticker}**", icon="🎯")
+
+                    ops_engine = ts.OptionsPaperEngine(conn)
+
+                    for sg in suggestions:
+                        cost_str = (f"${sg['entry_cost']:.2f}"
+                                    if isinstance(sg.get("entry_cost"), (int, float))
+                                    else str(sg.get("entry_cost", "—")))
+                        prof_str = (f"${sg['max_profit']:.2f}"
+                                    if isinstance(sg.get("max_profit"), (int, float))
+                                    else str(sg.get("max_profit", "—")))
+                        loss_str = (f"${sg['max_loss']:.2f}"
+                                    if isinstance(sg.get("max_loss"), (int, float))
+                                    else str(sg.get("max_loss", "—")))
+
+                        with st.expander(
+                            f"**{sg['strategy']}** — {sg['description']}  "
+                            f"| Cost: {cost_str}  Max Loss: {loss_str}  Max Profit: {prof_str}",
+                            expanded=True,
+                        ):
+                            # Legs
+                            st.markdown("**Trade legs:**")
+                            for leg in sg.get("legs", []):
+                                st.code(leg)
+
+                            # Key metrics
+                            _s1, _s2, _s3, _s4 = st.columns(4)
+                            _s1.metric("Entry Cost",  cost_str)
+                            _s2.metric("Max Loss",    loss_str)
+                            _s3.metric("Max Profit",  prof_str)
+                            _s4.metric("DTE",         sg.get("dte", "—"))
+
+                            # Paper trade button
+                            btn_key = f"paper_buy_{sg['strategy'].replace(' ', '_')}_{sg.get('strike')}"
+                            if st.button(f"💼 Paper Trade — Buy {opt_contracts}× contract(s)",
+                                         key=btn_key):
+                                mid  = sg.get("mid", 0)
+                                cost_total = mid * 100 * opt_contracts
+                                summ = ops_engine.get_summary()
+                                if cost_total > summ["available_cash"]:
+                                    st.error(
+                                        f"Not enough paper cash. Need ${cost_total:.2f}, "
+                                        f"have ${summ['available_cash']:.2f}.", icon="❌"
+                                    )
+                                else:
+                                    result = ops_engine.buy(
+                                        ticker          = opt_ticker,
+                                        contract_symbol = f"{opt_ticker}_{sg['expiry']}_{sg['opt_type']}_{sg['strike']:.0f}",
+                                        option_type     = sg["opt_type"],
+                                        strike          = sg["strike"],
+                                        expiry          = sg["expiry"],
+                                        contracts       = opt_contracts,
+                                        entry_price     = mid,
+                                        strategy        = sg["strategy"],
+                                    )
+                                    if result.get("ok"):
+                                        st.success(
+                                            f"✅ Bought {opt_contracts}× {sg['strategy']} "
+                                            f"for ${result['cost']:.2f}. "
+                                            f"Cash remaining: ${result['cash_remaining']:.2f}",
+                                            icon="✅",
+                                        )
+                                        st.rerun()
+                                    else:
+                                        st.error(f"Trade failed: {result.get('error')}", icon="❌")
+        else:
+            st.info(
+                "Select a ticker and bias above, then press **Build Strategies** "
+                "to generate momentum calls, weekly gamma plays, and debit spreads.",
+                icon="🎯",
+            )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SUB-TAB 4 — OPTIONS PAPER TRADES
+    # ─────────────────────────────────────────────────────────────────────────
+    with ot_paper:
+        st.markdown('<div class="section-hdr">💰 Options Paper Portfolio — $5,000 Virtual Capital</div>',
+                    unsafe_allow_html=True)
+
+        ops_engine = ts.OptionsPaperEngine(conn)
+
+        # Run expiry check on every page load
+        _expired = ops_engine.expire_check()
+        if _expired:
+            for _ep in _expired:
+                st.warning(
+                    f"⏰ **{_ep.get('ticker')} ${_ep.get('strike'):.0f}"
+                    f"{str(_ep.get('option_type',''))[0].upper()}** expired worthless "
+                    f"(P&L: ${_ep.get('net_pnl', 0):.2f})",
+                    icon="⏰",
+                )
+
+        ops_summary = ops_engine.get_summary()
+
+        # ── Portfolio KPIs ────────────────────────────────────────────────────
+        _pm1, _pm2, _pm3, _pm4, _pm5, _pm6 = st.columns(6)
+        _pm1.metric("Cash Available",
+                    f"${ops_summary['available_cash']:,.2f}")
+        pnl_color = "normal" if ops_summary["realized_pnl"] >= 0 else "inverse"
+        _pm2.metric("Realized P&L",
+                    f"${ops_summary['realized_pnl']:+,.2f}")
+        _pm3.metric("Total Return",
+                    f"{ops_summary['total_return_pct']:+.1f}%")
+        _pm4.metric("Win Rate",
+                    f"{ops_summary['win_rate']:.0f}%",
+                    f"{ops_summary['n_wins']}/{ops_summary['n_closed']} closed")
+        _pm5.metric("Open Positions", ops_summary["n_open"])
+        _pm6.metric("Trades Taken",   ops_summary["trades_made"])
+
+        st.divider()
+
+        # ── Open positions ────────────────────────────────────────────────────
+        st.markdown("### 📂 Open Positions")
+        open_pos = ops_engine.get_positions("OPEN")
+        if not open_pos:
+            st.info("No open options positions. Use the Strategy Builder tab to enter trades.", icon="📂")
+        else:
+            rows_op = []
+            for p in open_pos:
+                pnl     = p.get("unrealized_pnl")
+                pct     = p.get("unrealized_pct")
+                cur_p   = p.get("current_price")
+                pnl_str = f"${pnl:+.2f} ({pct:+.1f}%)" if pnl is not None else "—"
+                rows_op.append({
+                    "ID":       p.get("id"),
+                    "Ticker":   p.get("ticker"),
+                    "Type":     str(p.get("option_type", "")).upper(),
+                    "Strike":   f"${p.get('strike', 0):.2f}",
+                    "Expiry":   p.get("expiry"),
+                    "Qty":      p.get("contracts"),
+                    "Entry $":  f"${p.get('entry_price', 0):.2f}",
+                    "Cost":     f"${p.get('gross_invested', 0):.2f}",
+                    "Current":  f"${cur_p:.2f}" if cur_p else "—",
+                    "Unreal P&L": pnl_str,
+                    "Strategy": p.get("strategy", "manual"),
+                })
+            st.dataframe(pd.DataFrame(rows_op),
+                         use_container_width=True, hide_index=True)
+
+            # ── Close position form ───────────────────────────────────────────
+            st.markdown("#### Close a Position")
+            _cl1, _cl2, _cl3 = st.columns([1, 2, 1])
+            with _cl1:
+                close_id = st.number_input("Position ID", min_value=1,
+                                           step=1, key="close_pos_id")
+            with _cl2:
+                close_price = st.number_input("Exit premium (per share $)",
+                                              min_value=0.0, step=0.01,
+                                              format="%.2f", key="close_pos_price")
+            with _cl3:
+                close_reason = st.selectbox("Reason",
+                                            ["TARGET_HIT", "STOP_OUT", "MANUAL",
+                                             "EXPIRING_SOON"],
+                                            key="close_pos_reason")
+            if st.button("🔒 Close Position", key="close_pos_btn"):
+                result = ops_engine.close(close_id, close_price, close_reason)
+                if result.get("ok"):
+                    pnl_v = result["net_pnl"]
+                    icon  = "✅" if pnl_v >= 0 else "🛑"
+                    st.success(
+                        f"{icon} Position #{close_id} closed. "
+                        f"P&L: ${pnl_v:+.2f}  |  Cash: ${result['cash']:.2f}",
+                        icon=icon,
+                    )
+                    st.rerun()
+                else:
+                    st.error(f"Error: {result.get('error')}", icon="❌")
+
+        st.divider()
+
+        # ── Closed positions history ──────────────────────────────────────────
+        st.markdown("### 📜 Closed Positions History")
+        closed_pos = ops_engine.get_positions("CLOSED")
+        if not closed_pos:
+            st.info("No closed positions yet.", icon="📜")
+        else:
+            rows_cl = []
+            for p in closed_pos:
+                pnl_v   = p.get("net_pnl") or 0
+                pnl_str = f"${pnl_v:+.2f}"
+                rows_cl.append({
+                    "ID":       p.get("id"),
+                    "Ticker":   p.get("ticker"),
+                    "Type":     str(p.get("option_type", "")).upper(),
+                    "Strike":   f"${p.get('strike', 0):.2f}",
+                    "Expiry":   p.get("expiry"),
+                    "Qty":      p.get("contracts"),
+                    "Entry $":  f"${p.get('entry_price', 0):.2f}",
+                    "Exit $":   f"${p.get('exit_price', 0) or 0:.2f}",
+                    "Net P&L":  pnl_str,
+                    "Reason":   p.get("exit_reason", "—"),
+                    "Closed":   p.get("exit_date", "—"),
+                    "Strategy": p.get("strategy", "manual"),
+                })
+            df_cl = pd.DataFrame(rows_cl)
+            st.dataframe(df_cl, use_container_width=True, hide_index=True)
+
+            # P&L waterfall chart
+            if len(rows_cl) > 1:
+                pnl_vals = [p.get("net_pnl") or 0 for p in closed_pos]
+                labels   = [f"{p.get('ticker')} ${p.get('strike', 0):.0f}"
+                            f"{str(p.get('option_type',''))[0].upper()}"
+                            for p in closed_pos]
+                colors   = ["#3fb950" if v >= 0 else "#f85149" for v in pnl_vals]
+                fig_cl   = go.Figure(go.Bar(
+                    x=labels, y=pnl_vals,
+                    marker_color=colors,
+                    text=[f"${v:+.0f}" for v in pnl_vals],
+                    textposition="outside",
+                ))
+                fig_cl.update_layout(
+                    paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                    font=dict(color="#c9d1d9"), height=280,
+                    xaxis=dict(gridcolor="#21262d", tickangle=-30),
+                    yaxis=dict(gridcolor="#21262d", title="Net P&L ($)"),
+                    margin=dict(l=10, r=10, t=10, b=60),
+                )
+                st.plotly_chart(fig_cl, use_container_width=True)
+
+        st.divider()
+        st.markdown("#### ⚠️ Reset Paper Account")
+        st.caption("This permanently deletes all options paper trades and resets cash to $5,000.")
+        if st.button("🗑 Reset Options Paper Account", key="ops_reset_btn",
+                     type="secondary"):
+            ops_engine.reset()
+            st.success("Options paper account reset to $5,000.", icon="🔄")
+            st.rerun()

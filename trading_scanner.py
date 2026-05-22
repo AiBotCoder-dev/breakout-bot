@@ -135,7 +135,15 @@ class MarketClock:
 
         for sh, sm, eh, em, quality, name, color in cls._WINDOWS:
             if sh * 60 + sm <= total < eh * 60 + em:
-                end_dt    = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+                # Handle the 24:00 sentinel ("end of day" — midnight rollover).
+                # datetime.replace() only accepts hour 0–23, so we add 1 day
+                # and set hour=0 instead.
+                if eh >= 24:
+                    end_dt = (now + timedelta(days=1)).replace(
+                        hour=0, minute=0, second=0, microsecond=0)
+                else:
+                    end_dt = now.replace(hour=eh, minute=em,
+                                         second=0, microsecond=0)
                 remaining = max(0, int((end_dt - now).total_seconds()))
                 return {
                     "quality":            quality,

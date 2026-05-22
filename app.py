@@ -692,6 +692,30 @@ with st.sidebar:
                 "- `OPENROUTER_API_KEY`:  https://openrouter.ai/keys",
                 icon="🔑",
             )
+
+            # ── Debug: show what we actually detect ─────────────────────────
+            with st.expander("🔧 Debug — why isn't this working?", expanded=False):
+                _dbg = {}
+                for _k in ("GROQ_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY"):
+                    _v_env = os.environ.get(_k, "")
+                    _v_sec = ""
+                    try:
+                        if _k in st.secrets:
+                            _v_sec = str(st.secrets[_k])
+                    except Exception as _e:
+                        _v_sec = f"<err: {type(_e).__name__}>"
+                    _dbg[_k] = {
+                        "in os.environ": bool(_v_env),
+                        "env preview":   (_v_env[:6] + "…") if _v_env else "—",
+                        "in st.secrets": bool(_v_sec) and "<err" not in _v_sec,
+                        "secrets preview": (_v_sec[:6] + "…") if _v_sec and "<err" not in _v_sec else _v_sec or "—",
+                    }
+                st.json(_dbg)
+                st.caption(
+                    "If `in st.secrets` is True but `in os.environ` is False, the "
+                    "bridge in app.py imports failed — reboot the app from "
+                    "Streamlit Cloud dashboard."
+                )
         else:
             st.caption(f"⚡ Powered by **{_AI.provider.upper()}**")
 

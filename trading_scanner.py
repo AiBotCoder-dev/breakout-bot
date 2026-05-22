@@ -6187,7 +6187,10 @@ if __name__ == "__main__":
 # ══════════════════════════════════════════════════════════════════════════════
 
 try:
-    from scipy.stats import norm as _norm
+    # IMPORTANT: do NOT import this as `_norm` — that name is already used at
+    # module level (line 729) for the DataFrame OHLCV normalizer.  Shadowing it
+    # would silently break the entire scanner.  Use a distinct name.
+    from scipy.stats import norm as _norm_dist
     _SCIPY_OK = True
 except ImportError:
     _SCIPY_OK = False
@@ -6205,17 +6208,17 @@ def _bs_greeks(S, K, T, r, sigma, opt_type="call"):
             return {}
         d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
-        pdf_d1 = _norm.pdf(d1)
+        pdf_d1 = _norm_dist.pdf(d1)
         if opt_type == "call":
-            price = S * _norm.cdf(d1) - K * np.exp(-r * T) * _norm.cdf(d2)
-            delta = _norm.cdf(d1)
+            price = S * _norm_dist.cdf(d1) - K * np.exp(-r * T) * _norm_dist.cdf(d2)
+            delta = _norm_dist.cdf(d1)
             theta = (-(S * pdf_d1 * sigma) / (2 * np.sqrt(T))
-                     - r * K * np.exp(-r * T) * _norm.cdf(d2)) / 365
+                     - r * K * np.exp(-r * T) * _norm_dist.cdf(d2)) / 365
         else:
-            price = K * np.exp(-r * T) * _norm.cdf(-d2) - S * _norm.cdf(-d1)
-            delta = _norm.cdf(d1) - 1
+            price = K * np.exp(-r * T) * _norm_dist.cdf(-d2) - S * _norm_dist.cdf(-d1)
+            delta = _norm_dist.cdf(d1) - 1
             theta = (-(S * pdf_d1 * sigma) / (2 * np.sqrt(T))
-                     + r * K * np.exp(-r * T) * _norm.cdf(-d2)) / 365
+                     + r * K * np.exp(-r * T) * _norm_dist.cdf(-d2)) / 365
         gamma = pdf_d1 / (S * sigma * np.sqrt(T))
         vega  = S * pdf_d1 * np.sqrt(T) / 100
         return {
@@ -6242,9 +6245,9 @@ def _pop_from_bs(S, K_be, T, sigma, opt_type="call"):
             return None
         d2 = (np.log(S / K_be) + (_RISK_FREE - 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
         if opt_type == "call":
-            return round(float(_norm.cdf(d2)) * 100, 1)
+            return round(float(_norm_dist.cdf(d2)) * 100, 1)
         else:
-            return round(float(_norm.cdf(-d2)) * 100, 1)
+            return round(float(_norm_dist.cdf(-d2)) * 100, 1)
     except Exception:
         return None
 

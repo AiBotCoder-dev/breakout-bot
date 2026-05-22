@@ -785,25 +785,38 @@ with st.sidebar:
             if _opens:
                 st.markdown("**Open positions — live stop/target distances + unrealized P&L:**")
 
-                # Use the OFFICIAL get_unrealized_pnl() method so numbers match
-                # the Paper Trades tab exactly (5-min bars + nets out buy fees).
-                _unrl_data = _pe_diag.get_unrealized_pnl()
-                _live_map  = {x["ticker"]: x for x in _unrl_data.get("positions", [])}
+                # Use the SAME cached price source the Paper Trades tab uses —
+                # _fetch_live_prices() is @st.cache_data(ttl=300) so both views
+                # show identical numbers at any moment in time.
+                _live_tickers = tuple(p["ticker"] for p in _opens)
+                try:
+                    _live_prices_diag = _fetch_live_prices(_live_tickers)
+                except Exception:
+                    _live_prices_diag = {}
 
                 _ph_rows   = []
+                _tot_unrl  = 0.0
+                _tot_cost  = 0.0
                 for _p in _opens:
                     _tk     = _p.get("ticker", "?")
                     _entry  = float(_p.get("entry_price")    or 0)
                     _stop   = float(_p.get("stop_loss")      or 0)
                     _tgt    = float(_p.get("target_price")   or 0)
                     _shares = float(_p.get("shares")         or 0)
+                    _gross  = float(_p.get("gross_invested") or 0)   # includes buy fee
                     _entry_date = str(_p.get("entry_date", ""))
 
-                    # ── Pull live price + P&L from the official method ──────
-                    _live = _live_map.get(_tk, {})
-                    _cur  = float(_live.get("current_price") or 0)
-                    _unrl_d = float(_live.get("unrealized_pnl") or 0)
-                    _unrl_p = float(_live.get("unrealized_pct") or 0)
+                    # ── Live price from cached source (matches Paper Trades) ──
+                    _cur = float(_live_prices_diag.get(_tk) or 0)
+                    if _cur > 0 and _gross > 0:
+                        _cur_val = _shares * _cur
+                        _unrl_d  = _cur_val - _gross          # nets buy fee (gross includes it)
+                        _unrl_p  = _unrl_d / _gross * 100
+                        _tot_unrl += _unrl_d
+                        _tot_cost += _gross
+                    else:
+                        _unrl_d = 0.0
+                        _unrl_p = 0.0
 
                     # ── Days held ────────────────────────────────────────────
                     _days = "?"
@@ -848,9 +861,7 @@ with st.sidebar:
                 st.dataframe(pd.DataFrame(_ph_rows), hide_index=True,
                              use_container_width=True)
 
-                # ── Unrealized P&L total (from official method) ─────────────
-                _tot_unrl = float(_unrl_data.get("total", 0))
-                _tot_cost = float(_unrl_data.get("total_cost", 0))
+                # ── Unrealized P&L total (uses same cached price source) ────
                 if _tot_cost > 0:
                     _tot_pct = _tot_unrl / _tot_cost * 100
                     _c = "#3fb950" if _tot_unrl >= 0 else "#f85149"
@@ -863,8 +874,8 @@ with st.sidebar:
                         unsafe_allow_html=True,
                     )
                     st.caption(
-                        "Matches the **Unrealized P&L** shown in the main Paper Trades tab "
-                        "exactly (same method, nets out buy fees). Updates every page refresh."
+                        "Now matches the **Unrealized P&L** shown in the main Paper Trades tab "
+                        "exactly — both use the same 5-min cached price snapshot."
                     )
 
                 # ── Breach check ─────────────────────────────────────────────

@@ -8850,6 +8850,159 @@ def get_market_context_full():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DURATION PREDICTION ENGINE
+#   Predicts how many trading days a setup should take to reach its target,
+#   based on ATR-implied daily move speed × pattern type × market regime.
+#   Used by the Dashboard "Day #" column to show actual vs expected progress.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Pattern → speed multiplier.  Lower = faster setups, higher = slower.
+# Derived from historical observation of how each pattern typically resolves.
+_PATTERN_DURATION_MULT = {
+    "high and tight flag":  0.5,
+    "high tight flag":      0.5,
+    "flag":                 0.7,
+    "pennant":              0.7,
+    "breakout":             0.6,
+    "gap and go":           0.4,
+    "vcp":                  0.8,
+    "ascending triangle":   0.9,
+    "triangle":             1.0,
+    "symmetrical triangle": 1.0,
+    "wedge":                1.2,
+    "falling wedge":        1.2,
+    "rising wedge":         1.2,
+    "double bottom":        1.3,
+    "double top":           1.3,
+    "cup and handle":       1.5,
+    "cup":                  1.3,
+    "inverse head shoulders": 1.6,
+    "head and shoulders":   1.6,
+    "rectangle":            1.4,
+    "channel":              1.2,
+    "no pattern":           1.0,
+}
+
+# Market regime → duration scaling.  Bull markets compress, bear stretches.
+_REGIME_DURATION_MULT = {
+    "STRONG BULL":  0.70,
+    "BULL":         0.85,
+    "NEUTRAL":      1.00,
+    "RECOVERING":   1.20,
+    "BEAR":         1.50,
+    "UNKNOWN":      1.00,
+}
+
+
+def predict_duration_to_target(ticker, entry_price, target_price,
+                                pattern="", market_regime=None,
+                                min_days=1, max_days=30):
+    """
+    Predict trading days until *ticker* reaches *target_price* from *entry_price*.
+
+    Model:
+        base_days     = move_required_pct / avg_daily_move_pct
+        predicted     = base_days × pattern_multiplier × regime_multiplier
+        clipped to [min_days, max_days]
+
+    Where avg_daily_move_pct = 14-day ATR / entry_price × 100.
+
+    Returns dict:
+        predicted_days  — int, the central estimate
+        min_days_est    — int, lower bound (60 %)
+        max_days_est    — int, upper bound (150 %)
+        confidence      — 'HIGH' / 'MEDIUM' / 'LOW'
+        atr_pct         — average daily move as % of entry
+        move_required_pct — % move needed to hit target
+        pattern_mult    — pattern speed multiplier applied
+        regime_mult     — regime scaling applied
+        method          — description of model used
+    """
+    try:
+        entry_price  = float(entry_price)
+        target_price = float(target_price)
+        if entry_price <= 0 or target_price <= 0:
+            return None
+
+        # ── Move required to hit target ───────────────────────────────────────
+        move_required_pct = (target_price - entry_price) / entry_price * 100
+        if move_required_pct <= 0:
+            # Target is at or below entry — already there
+            return {
+                "predicted_days":    0,
+                "min_days_est":      0,
+                "max_days_est":      0,
+                "confidence":        "HIGH",
+                "atr_pct":           0.0,
+                "move_required_pct": round(move_required_pct, 2),
+                "pattern_mult":      1.0,
+                "regime_mult":       1.0,
+                "method":            "Target already reached at entry price",
+            }
+
+        # ── ATR-based daily move estimate ─────────────────────────────────────
+        hist = yf.download(ticker, period="3mo", interval="1d",
+                           progress=False, auto_adjust=True)
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist.columns = hist.columns.get_level_values(0)
+        hist = hist.dropna(subset=["Close"])
+        if len(hist) < 15:
+            return None
+
+        # 14-day ATR
+        hl = (hist["High"] - hist["Low"]).abs()
+        hc = (hist["High"] - hist["Close"].shift(1)).abs()
+        lc = (hist["Low"]  - hist["Close"].shift(1)).abs()
+        tr  = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+        atr = float(tr.rolling(14).mean().dropna().iloc[-1])
+        atr_pct = atr / entry_price * 100 if entry_price > 0 else 0
+
+        if atr_pct <= 0.1:   # essentially zero daily move
+            return None
+
+        base_days = move_required_pct / atr_pct
+
+        # ── Pattern multiplier ────────────────────────────────────────────────
+        pat_key = str(pattern or "").strip().lower()
+        pattern_mult = _PATTERN_DURATION_MULT.get(pat_key, 1.0)
+
+        # ── Regime multiplier ─────────────────────────────────────────────────
+        regime_mult = 1.0
+        if market_regime:
+            regime_mult = _REGIME_DURATION_MULT.get(
+                str(market_regime.get("regime", "NEUTRAL")), 1.0
+            )
+
+        # ── Final prediction with clamps ──────────────────────────────────────
+        predicted = base_days * pattern_mult * regime_mult
+        predicted = max(min_days, min(max_days, int(round(predicted))))
+        lo        = max(min_days, int(round(predicted * 0.6)))
+        hi        = min(max_days, int(round(predicted * 1.5)))
+
+        # ── Confidence: high for moderate moves, low for outliers ─────────────
+        if 3 <= move_required_pct <= 15 and atr_pct >= 1.0:
+            confidence = "HIGH"
+        elif 1.5 <= move_required_pct <= 25 and atr_pct >= 0.5:
+            confidence = "MEDIUM"
+        else:
+            confidence = "LOW"
+
+        return {
+            "predicted_days":     predicted,
+            "min_days_est":       lo,
+            "max_days_est":       hi,
+            "confidence":         confidence,
+            "atr_pct":            round(atr_pct, 2),
+            "move_required_pct":  round(move_required_pct, 2),
+            "pattern_mult":       pattern_mult,
+            "regime_mult":        regime_mult,
+            "method":             f"ATR ({atr_pct:.2f}%/d) × pattern ({pattern_mult:.2f}×) × regime ({regime_mult:.2f}×)",
+        }
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SELF-LEARNING RISK ENGINE
 #   Two-layer drawdown protection with persistent learning across resets.
 #     • -15 % drawdown  → enters PUNISHMENT mode (halt + raise score floor)

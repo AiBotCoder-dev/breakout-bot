@@ -1696,6 +1696,17 @@ with tab_dash:
                 except Exception as _re:
                     st.error(f"Refresh failed: {_re}")
 
+    # ── Cached duration predictor (per ticker+target, 1 h TTL) ───────────────
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def _cached_duration_prediction(ticker: str, entry: float, target: float,
+                                       pattern: str) -> dict:
+        try:
+            return ts.predict_duration_to_target(
+                ticker, entry, target, pattern=pattern
+            ) or {}
+        except Exception:
+            return {}
+
     open_pos = tracker.get_open_positions()
     if not open_pos:
         st.info("No open positions. Run a scan to start tracking.", icon="📂")
@@ -1717,15 +1728,48 @@ with tab_dash:
                     _ed_dt = datetime.strptime(_ed[:10], "%Y-%m-%d").date()
                     day_n = (today - _ed_dt).days + 1
                 elif hasattr(_ed, "year"):
-                    # datetime.date OR datetime.datetime from psycopg2
                     _ed_dt = _ed.date() if hasattr(_ed, "hour") else _ed
                     day_n = (today - _ed_dt).days + 1
                 else:
-                    # pandas Timestamp or other — try pd.Timestamp
                     _ed_dt = pd.Timestamp(_ed).date()
                     day_n = (today - _ed_dt).days + 1
             except Exception:
                 day_n = "?"
+
+            # ── Expected duration: use stored est_duration_max, else predict ─
+            _expected = None
+            _est_max = p.get("est_duration_max")
+            if _est_max and int(_est_max) > 0:
+                _expected = int(_est_max)
+            else:
+                # Fall back to predictor (cached per ticker+target+pattern)
+                _pred = _cached_duration_prediction(
+                    p.get("ticker", ""),
+                    float(p.get("entry_price") or 0),
+                    float(p.get("target_price") or 0),
+                    str(p.get("pattern_detected") or "")
+                )
+                if _pred and _pred.get("predicted_days"):
+                    _expected = int(_pred["predicted_days"])
+
+            # ── Format "Day #" cell: D5 / 8d with color/icon based on ratio ─
+            if isinstance(day_n, int) and _expected:
+                _ratio = day_n / _expected
+                if _ratio < 0.5:
+                    _day_icon = "🟢"
+                elif _ratio < 0.8:
+                    _day_icon = "🔵"
+                elif _ratio <= 1.0:
+                    _day_icon = "🟡"
+                elif _ratio <= 1.5:
+                    _day_icon = "🟠 STALE"
+                else:
+                    _day_icon = "🔴 EXPIRED"
+                day_cell = f"{_day_icon} D{day_n}/{_expected}d"
+            elif isinstance(day_n, int):
+                day_cell = f"D{day_n}"
+            else:
+                day_cell = "?"
             tgt = p.get("target_price")
             stp = p.get("stop_loss")
             if tgt and cur >= tgt * 0.95:   status_flag = "🎯 Near Target"
@@ -1739,7 +1783,7 @@ with tab_dash:
                 "Entry $": f"${ep:.2f}",
                 "Current $": f"${cur:.2f}",
                 "P&L %": f"{pct:+.1f}%",
-                "Day #": f"D{day_n}",
+                "Day (act/exp)": day_cell,
                 "Target": f"${tgt:.2f}" if tgt else "—",
                 "Stop": f"${stp:.2f}" if stp else "—",
                 "Pattern": (p.get("pattern_detected") or "—")[:16],

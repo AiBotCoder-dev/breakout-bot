@@ -15,6 +15,20 @@ from datetime import datetime, timedelta
 import numpy as np
 
 # ── AI engine (optional — works without an API key, falls back silently) ──────
+# Streamlit Cloud secrets are accessible via st.secrets, NOT as os.environ vars.
+# Copy them across so ai_engine.py (which reads from os.environ) finds them.
+try:
+    import streamlit as _st_for_secrets
+    for _k in ("GROQ_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY"):
+        try:
+            if _k not in os.environ and _k in _st_for_secrets.secrets:
+                os.environ[_k] = str(_st_for_secrets.secrets[_k])
+        except Exception:
+            # st.secrets raises FileNotFoundError on local dev with no secrets.toml
+            pass
+except Exception:
+    pass
+
 try:
     from ai_engine import AIAnalyst
     _AI = AIAnalyst()

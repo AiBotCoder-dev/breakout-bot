@@ -771,11 +771,14 @@ with st.sidebar:
             except Exception as _e:
                 st.caption(f"Close lookup error: {_e}")
 
+            _n_open_disp = _summ.get("open_positions", _summ.get("n_open", len(_opens)))
+            _max_disp    = _summ.get("max_positions", 5)
             st.markdown(
-                f"💼 **Portfolio:** ${_summ['available_cash']:,.2f} cash  ·  "
-                f"{_summ['n_open']}/{_summ.get('max_positions', 5)} open  ·  "
-                f"Realized ${_summ['realized_pnl']:+,.2f}  ·  "
-                f"Trades made {_summ['trades_made']}"
+                f"💼 **Portfolio:** ${_summ.get('available_cash', 0):,.2f} cash  ·  "
+                f"{_n_open_disp}/{_max_disp} open  ·  "
+                f"Realized ${_summ.get('realized_pnl', 0):+,.2f}  ·  "
+                f"Trades made {_summ.get('trades_made', 0)}  ·  "
+                f"Closed {_summ.get('n_closed', 0)}"
             )
 
             # ── Live position health: how close to stops/targets? ────────────

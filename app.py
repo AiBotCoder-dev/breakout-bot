@@ -846,10 +846,50 @@ with st.sidebar:
             except Exception:
                 pass
 
+            # ── Manual monitor trigger — runs the same close logic GitHub Actions does
+            st.divider()
+            st.markdown("**🔧 Manual Trigger**")
             st.caption(
-                "If your scan is more than 24 h old or no positions are entering, "
-                "the chase guard may be skipping stale signals. Run a fresh scan "
-                "from the sidebar to refresh."
+                "Run the same stop/target check the GitHub Actions monitor runs every 5 min. "
+                "Use this to verify the close logic works and to force any pending closes immediately."
+            )
+            if st.button("🔄 Run Monitor Stop/Target Check Now",
+                         key="manual_monitor_check",
+                         type="primary"):
+                with st.spinner("Running check_stops_and_targets()…"):
+                    try:
+                        _closed_now = _pe_diag.check_stops_and_targets()
+                        if _closed_now:
+                            st.success(
+                                f"✅ Closed {len(_closed_now)} position(s)!",
+                                icon="✅",
+                            )
+                            for _c in _closed_now:
+                                _r = _c.get("exit_reason", "?")
+                                _t = _c.get("ticker", "?")
+                                _p = _c.get("net_pnl", 0) or 0
+                                _e = _c.get("exit_price", 0) or 0
+                                st.markdown(
+                                    f"- **{_t}** — {_r} @ ${_e:.2f}  ·  "
+                                    f"P&L: ${_p:+.2f}"
+                                )
+                            st.info("Refresh the page to see updated P&L in the main view.")
+                        else:
+                            st.info("✓ Check ran successfully. No positions needed closing.",
+                                    icon="ℹ️")
+                    except Exception as _mexc:
+                        st.error(
+                            f"❌ **Bug in check_stops_and_targets():**\n\n```\n{_mexc}\n```",
+                            icon="🐛",
+                        )
+                        import traceback as _tb
+                        with st.expander("Full traceback"):
+                            st.code(_tb.format_exc())
+
+            st.caption(
+                "If the button above closes the position successfully, then the code is fine "
+                "and the issue is GitHub Actions (workflow disabled or failing). "
+                "Check repo → Actions → Position Monitor."
             )
         except Exception as _diag_exc:
             st.error(f"Diagnostic error: {_diag_exc}")

@@ -774,597 +774,33 @@ with st.sidebar:
         _sb_db_mode = f"error: {_db_exc}"
 
     # ══════════════════════════════════════════════════════════════════════════
-    # 🔧 PORTFOLIO HEALTH — diagnostic panel
+    # 🔧 SIDEBAR STATUS (full diagnostics live in the 🎛 Management tab)
     # ══════════════════════════════════════════════════════════════════════════
-    with st.expander("🔧 Portfolio Health", expanded=False):
-        st.caption("Live diagnostic to verify the paper portfolio is updating.")
-        try:
-            if conn is None:
-                raise RuntimeError(f"DB not available: {_sb_db_mode}")
-            _diag_mode = _sb_db_mode
-            _pe_diag = ts.PaperTradingEngine(conn)
-            _summ    = _pe_diag.get_summary()
-            _opens   = _pe_diag.open_positions
-
-            st.caption(f"DB mode: `{_diag_mode}`")
-
-            # ── Last scan timestamp ──────────────────────────────────────────
-            try:
-                _last_scan = conn.execute(
-                    "SELECT scan_timestamp, scan_id, COUNT(*) "
-                    "FROM calls WHERE scan_id = "
-                    "(SELECT scan_id FROM calls ORDER BY scan_timestamp DESC LIMIT 1) "
-                    "GROUP BY scan_timestamp, scan_id"
-                ).fetchone()
-                if _last_scan:
-                    _scan_ts = str(_last_scan[0])
-                    _scan_n  = int(_last_scan[2])
-                    try:
-                        _dt = pd.to_datetime(_scan_ts)
-                        _age_h = (pd.Timestamp.utcnow().tz_localize(None) - _dt.tz_localize(None)).total_seconds() / 3600
-                        _age_str = (f"**{_age_h:.1f} h ago**" if _age_h < 48
-                                    else f"**{_age_h/24:.1f} days ago** ⚠️")
-                    except Exception:
-                        _age_str = ""
-                    st.markdown(f"📡 **Last scan:** {_scan_ts}  ·  {_scan_n} tickers  ·  {_age_str}")
-                else:
-                    st.warning("⚠️ No scans found in DB. Run the breakout scanner to populate signals.")
-            except Exception as _e:
-                st.caption(f"Scan lookup error: {_e}")
-
-            # ── Last closed position ─────────────────────────────────────────
-            try:
-                _last_closed = conn.execute(
-                    "SELECT ticker, exit_date, exit_reason, net_pnl FROM paper_portfolio "
-                    "WHERE status='CLOSED' ORDER BY exit_date DESC LIMIT 1"
-                ).fetchone()
-                if _last_closed:
-                    _cd = str(_last_closed[1])
-                    _ct = str(_last_closed[0])
-                    _cr = str(_last_closed[2])
-                    _cp = float(_last_closed[3] or 0)
-                    try:
-                        _dt = pd.to_datetime(_cd)
-                        _age_d = (pd.Timestamp.utcnow().tz_localize(None) - _dt.tz_localize(None)).total_seconds() / 86400
-                        _age_str = (f"{_age_d:.1f}d ago" if _age_d < 30 else f"{_age_d:.0f}d ago ⚠️")
-                    except Exception:
-                        _age_str = ""
-                    st.markdown(
-                        f"📜 **Last close:** {_ct} on {_cd} ({_age_str})  ·  "
-                        f"{_cr}  ·  ${_cp:+.2f}"
-                    )
-                else:
-                    st.markdown("📜 **No closes yet.**")
-            except Exception as _e:
-                st.caption(f"Close lookup error: {_e}")
-
-            _n_open_disp = _summ.get("open_positions", _summ.get("n_open", len(_opens)))
-            _max_disp    = _summ.get("max_positions", 5)
-            st.markdown(
-                f"💼 **Portfolio:** ${_summ.get('available_cash', 0):,.2f} cash  ·  "
-                f"{_n_open_disp}/{_max_disp} open  ·  "
-                f"Realized ${_summ.get('realized_pnl', 0):+,.2f}  ·  "
-                f"Trades made {_summ.get('trades_made', 0)}  ·  "
-                f"Closed {_summ.get('n_closed', 0)}"
-            )
-
-            # ── Live position health: how close to stops/targets? ────────────
-            if _opens:
-                st.markdown("**Open positions — live stop/target distances + unrealized P&L:**")
-
-                # Use the SAME cached price source the Paper Trades tab uses —
-                # _fetch_live_prices() is @st.cache_data(ttl=300) so both views
-                # show identical numbers at any moment in time.
-                _live_tickers = tuple(p["ticker"] for p in _opens)
-                _diag_salt = st.session_state.get("price_refresh_salt", 0)
-                try:
-                    _live_prices_diag = _fetch_live_prices(_live_tickers, _salt=_diag_salt)
-                except Exception:
-                    _live_prices_diag = {}
-
-                _ph_rows   = []
-                _tot_unrl  = 0.0
-                _tot_cost  = 0.0
-                for _p in _opens:
-                    _tk     = _p.get("ticker", "?")
-                    _entry  = float(_p.get("entry_price")    or 0)
-                    _stop   = float(_p.get("stop_loss")      or 0)
-                    _tgt    = float(_p.get("target_price")   or 0)
-                    _shares = float(_p.get("shares")         or 0)
-                    _gross  = float(_p.get("gross_invested") or 0)   # includes buy fee
-                    _entry_date = str(_p.get("entry_date", ""))
-
-                    # ── Live price from cached source (matches Paper Trades) ──
-                    _cur = float(_live_prices_diag.get(_tk) or 0)
-                    _has_live = _cur > 0
-                    if _has_live and _gross > 0:
-                        _cur_val = _shares * _cur
-                        _unrl_d  = _cur_val - _gross          # nets buy fee (gross includes it)
-                        _unrl_p  = _unrl_d / _gross * 100
-                        _tot_unrl += _unrl_d
-                        _tot_cost += _gross
-                    else:
-                        _unrl_d = None   # honest "no data"
-                        _unrl_p = None
-
-                    # ── Days held ────────────────────────────────────────────
-                    _days = "?"
-                    try:
-                        if _entry_date:
-                            _d  = pd.Timestamp(_entry_date).normalize()
-                            _bd = max(0, len(pd.bdate_range(_d, pd.Timestamp.utcnow().normalize())) - 1)
-                            _days = f"{_bd}d"
-                    except Exception:
-                        pass
-
-                    if _cur > 0:
-                        # STRICT breach check — must have actually crossed the level
-                        _flag = ""
-                        if _stop > 0 and _cur <= _stop:
-                            _flag = "🛑 STOP BREACHED"
-                        elif _tgt > 0 and _cur >= _tgt:
-                            _flag = "🎯 TARGET HIT"
-                        _d_stop = (_cur - _stop) / _cur * 100 if _stop > 0 else 0
-                        _d_tgt  = (_tgt - _cur) / _cur * 100 if _tgt > 0 else 0
-                        _ph_rows.append({
-                            "Ticker":    _tk,
-                            "Entry":     f"${_entry:.2f}",
-                            "Current":   f"${_cur:.2f}",
-                            "Stop":      f"${_stop:.2f}",
-                            "Target":    f"${_tgt:.2f}",
-                            "Unrl P&L":  f"${_unrl_d:+.2f} ({_unrl_p:+.1f}%)",
-                            "To Stop":   f"{_d_stop:+.1f}%",
-                            "To Tgt":    f"{_d_tgt:+.1f}%",
-                            "Days":      _days,
-                            "Status":    _flag,
-                        })
-                    else:
-                        _ph_rows.append({
-                            "Ticker": _tk, "Entry": f"${_entry:.2f}",
-                            "Current": "?", "Stop": f"${_stop:.2f}",
-                            "Target": f"${_tgt:.2f}", "Unrl P&L": "—",
-                            "To Stop": "—", "To Tgt": "—", "Days": _days,
-                            "Status": "no live price",
-                        })
-
-                st.dataframe(pd.DataFrame(_ph_rows), hide_index=True,
-                             use_container_width=True)
-
-                # ── No-prices warning ────────────────────────────────────────
-                _diag_live_count = sum(1 for r in _ph_rows if r.get("Current", "?") != "?")
-                if _diag_live_count == 0 and len(_ph_rows) > 0:
-                    st.error(
-                        "🚨 **yfinance failed for all positions.** "
-                        "Streamlit Cloud is likely being rate-limited by Yahoo Finance. "
-                        "Click 🔄 Refresh in 30-60 seconds to retry.",
-                        icon="🚨",
-                    )
-                elif _diag_live_count < len(_ph_rows):
-                    st.warning(
-                        f"⚠️ Live prices fetched for only {_diag_live_count}/{len(_ph_rows)} positions.",
-                        icon="⚠️",
-                    )
-
-                # ── Unrealized P&L total (uses same cached price source) ────
-                if _tot_cost > 0:
-                    _tot_pct = _tot_unrl / _tot_cost * 100
-                    _c = "#3fb950" if _tot_unrl >= 0 else "#f85149"
-                    _ut1, _ut2 = st.columns([3, 1])
-                    with _ut1:
-                        st.markdown(
-                            f"<div style='font-size:1.05em'>"
-                            f"📊 <b>Total unrealized P&L:</b> "
-                            f"<span style='color:{_c}'>${_tot_unrl:+.2f} "
-                            f"({_tot_pct:+.2f}%)</span>"
-                            f"</div>",
-                            unsafe_allow_html=True,
-                        )
-                    with _ut2:
-                        if st.button("🔄 Refresh", key="diag_refresh_prices",
-                                     help="Force fresh prices"):
-                            st.session_state["price_refresh_salt"] = (
-                                st.session_state.get("price_refresh_salt", 0) + 1
-                            )
-                            try:
-                                _fetch_live_prices.clear()
-                            except Exception:
-                                pass
-                            st.rerun()
-                    st.caption(
-                        "Matches **Paper Trades** tab — 30-second auto-refresh, "
-                        "or click 🔄 above for an instant refresh."
-                    )
-
-                # ── Breach check ─────────────────────────────────────────────
-                _stuck = [r for r in _ph_rows if r["Status"] and "BREACHED" in r["Status"]
-                                                              or "HIT" in (r["Status"] or "")]
-                _stuck = [r for r in _ph_rows
-                          if r["Status"] in ("🛑 STOP BREACHED", "🎯 TARGET HIT")]
-                if _stuck:
-                    st.error(
-                        f"⚠️ {len(_stuck)} position(s) have ACTUALLY breached stops/targets but are still OPEN. "
-                        "Try the 🔄 manual trigger below — if that closes them, the GitHub Actions "
-                        "monitor isn't running. If not, there's a bug we need to fix.",
-                        icon="🛑",
-                    )
-            else:
-                st.info("No open positions. Either monitor hasn't found any signals to enter "
-                        "or all positions have closed already.", icon="📂")
-
-            # ── Risk Engine status ───────────────────────────────────────────
-            try:
-                _diag_risk = ts.get_portfolio_risk_status(_pe_diag)
-                st.markdown(
-                    f"🛡 **Risk Engine:** {_diag_risk['risk_level']}  ·  "
-                    f"Can open: **{'YES' if _diag_risk['can_open_new'] else 'NO'}**  ·  "
-                    f"Sizing {_diag_risk['size_multiplier']:.2f}×"
-                )
-                if not _diag_risk["can_open_new"]:
-                    st.error(_diag_risk["reason"], icon="🛑")
-            except Exception:
-                pass
-
-            # ── Learning Engine status ───────────────────────────────────────
-            st.divider()
-            st.markdown("**🧠 Self-Learning Engine**")
-            try:
-                _le      = ts.LearningEngine(conn)
-                _adj     = _le.get_active_adjustments()
-                _pun     = _le.get_punishment_status()
-                _lessons = _le.get_lesson_history(limit=5)
-
-                _iter = _adj.get("learning_iteration", 0)
-                _ms   = _adj.get("min_master_score", 65)
-                _sec_bl = _adj.get("sector_blacklist", []) or []
-                _pat_bl = _adj.get("pattern_blacklist", []) or []
-                _wy_bl  = _adj.get("wyckoff_blacklist", []) or []
-                _cap    = _adj.get("size_multiplier_cap", 1.0)
-
-                st.markdown(
-                    f"**Iteration:** #{_iter}  ·  "
-                    f"**Min Master Score:** {_ms:.0f}  ·  "
-                    f"**Size Cap:** {_cap:.2f}×"
-                )
-
-                if _sec_bl or _pat_bl:
-                    if _sec_bl:
-                        st.caption(f"🚫 Sector blacklist: {', '.join(_sec_bl)}")
-                    if _pat_bl:
-                        st.caption(f"🚫 Pattern blacklist: {', '.join(_pat_bl)}")
-                if _wy_bl:
-                    st.caption(f"🚫 Wyckoff blacklist: {', '.join(_wy_bl)}")
-
-                if _pun.get("active"):
-                    _peak  = _pun.get("peak_equity_at_trigger", 0)
-                    _rtgt  = _pun.get("recovery_target", 0)
-                    _curr  = _diag_risk.get("current_equity", 0)
-                    st.error(
-                        f"🛑 **PUNISHMENT MODE ACTIVE**\n\n"
-                        f"Peak: ${_peak:,.2f} → Current: ${_curr:,.2f}\n"
-                        f"Recovery target: ${_rtgt:,.2f}\n"
-                        f"Master Score floor: {_pun.get('master_score_floor', 75):.0f}\n"
-                        f"Size cap: {_pun.get('size_cap', 0.5):.2f}×\n\n"
-                        f"No new trades until equity recovers to within 5% of peak.",
-                        icon="🛑",
-                    )
-
-                if _lessons:
-                    with st.expander(f"📚 Lesson History ({len(_lessons)} resets)", expanded=False):
-                        for _l in _lessons:
-                            _ts_l   = str(_l.get("reset_timestamp", "?"))[:19]
-                            _iter_l = _l.get("learning_iteration", "?")
-                            _dd_l   = _l.get("drawdown_pct", 0) or 0
-                            _wr_l   = _l.get("win_rate_pct", 0) or 0
-                            _n_l    = _l.get("n_trades", 0) or 0
-                            st.markdown(
-                                f"**Iteration #{_iter_l}** — {_ts_l}  ·  "
-                                f"DD {_dd_l:.1f}%  ·  WR {_wr_l:.0f}% over {_n_l} trades"
-                            )
-                            st.caption(_l.get("lessons_summary", ""))
-                            st.divider()
-                else:
-                    st.caption("No resets yet — bot has not hit -50% drawdown.")
-
-                # ── Daily AI improvement suggestion ──────────────────────
-                st.markdown("**💡 Today's Improvement Suggestion**")
-                _latest = _le.get_latest_suggestion()
-                _today_iso = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
-                _has_today = (_latest and str(_latest.get("suggestion_date","")).startswith(_today_iso))
-
-                if _has_today and _latest.get("suggestion"):
-                    _applied = bool(_latest.get("applied", 0))
-                    _border = "#3fb950" if _applied else "#58a6ff"
-                    _tag    = "✅ Applied" if _applied else "🆕 New"
-                    st.markdown(
-                        f"<div style='background:#161b22;border-left:4px solid {_border};"
-                        f"border-radius:6px;padding:10px 14px;margin:4px 0'>"
-                        f"<div style='font-size:0.7em;color:#8b949e'>"
-                        f"{_latest.get('suggestion_date','?')}  ·  "
-                        f"{_tag}  ·  category: <b>{_latest.get('category','?')}</b></div>"
-                        f"<div style='font-weight:bold;color:#e6edf3;margin-top:4px'>"
-                        f"{_latest.get('suggestion','—')}</div>"
-                        f"<div style='font-size:0.85em;color:#c9d1d9;margin-top:6px'>"
-                        f"<b>Why:</b> {_latest.get('rationale','—')}</div>"
-                        f"<div style='font-size:0.85em;color:#c9d1d9;margin-top:6px;"
-                        f"background:#0d1117;padding:6px 8px;border-radius:4px'>"
-                        f"<b>Action:</b> <code>{_latest.get('action','—')}</code></div>"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
-                    if not _applied:
-                        _ab1, _ab2 = st.columns(2)
-                        with _ab1:
-                            if st.button("⚡ Apply Now",
-                                         key=f"apply_now_{_latest.get('id')}",
-                                         type="primary",
-                                         help="Auto-parse the Action and apply the change to the DB"):
-                                try:
-                                    _res = _le.apply_suggestion(_latest.get("id"))
-                                    if _res.get("ok"):
-                                        st.success(f"✅ {_res['message']}", icon="✅")
-                                        st.balloons()
-                                        st.rerun()
-                                    else:
-                                        st.warning(_res.get("message", "Couldn't auto-apply"),
-                                                   icon="⚠️")
-                                except Exception as _ae:
-                                    st.error(f"Apply failed: {_ae}", icon="❌")
-                        with _ab2:
-                            if st.button("✓ Mark as Applied (no change)",
-                                         key=f"mark_applied_{_latest.get('id')}",
-                                         help="Mark without applying — for suggestions you implemented manually"):
-                                try:
-                                    _le.mark_suggestion_applied(_latest.get("id"))
-                                    st.rerun()
-                                except Exception:
-                                    pass
-                else:
-                    st.caption("No suggestion yet for today.")
-                    if st.button("🪄 Generate Now", key="gen_suggestion_now",
-                                 help="Manually trigger today's suggestion (runs daily at 8:30 AM ET via GitHub Actions)"):
-                        try:
-                            from ai_engine import AIAnalyst as _AIA
-                            _ai_inst = _AIA()
-                            with st.spinner("Analysing engine state and generating suggestion…"):
-                                _new = _le.generate_improvement_suggestion(_ai_inst, _pe_diag)
-                            if _new.get("suggestion"):
-                                st.success(f"💡 {_new['suggestion']}", icon="💡")
-                                st.rerun()
-                            else:
-                                st.warning("Could not generate a suggestion.")
-                        except Exception as _ge:
-                            st.error(f"Generation failed: {_ge}", icon="❌")
-
-                # ── Suggestion history ────────────────────────────────────
-                _sug_hist = _le.get_suggestion_history(limit=15)
-                if _sug_hist:
-                    with st.expander(f"🗂  Suggestion History ({len(_sug_hist)})",
-                                     expanded=False):
-                        for _s in _sug_hist:
-                            _sd  = str(_s.get("suggestion_date", "?"))
-                            _ap  = "✅" if _s.get("applied") else "⬜"
-                            _cat = _s.get("category", "—")
-                            st.markdown(f"{_ap} **{_sd}** · _{_cat}_ · "
-                                       f"{_s.get('suggestion', '—')}")
-                            st.caption(_s.get("rationale", ""))
-            except Exception as _le_exc:
-                st.caption(f"Learning engine unavailable: {_le_exc}")
-
-            # ── Options Paper Engine diagnostic ──────────────────────────────
-            st.divider()
-            st.markdown("**💰 Options Paper Engine — Why aren't trades happening?**")
-            try:
-                _ops_diag    = ts.OptionsPaperEngine(conn)
-                _ops_summary = _ops_diag.get_summary()
-                _ops_open    = _ops_diag.get_positions("OPEN")
-                _ops_closed  = _ops_diag.get_positions("CLOSED")
-
-                st.markdown(
-                    f"💰 ${_ops_summary['available_cash']:,.2f} cash  ·  "
-                    f"{_ops_summary['n_open']}/∞ open  ·  "
-                    f"{len(_ops_closed)} closed  ·  "
-                    f"Realized ${_ops_summary['realized_pnl']:+,.2f}  ·  "
-                    f"Trades made {_ops_summary['trades_made']}"
-                )
-
-                if _ops_summary["trades_made"] == 0:
-                    # ── Run a live diagnostic to figure out the bottleneck ───
-                    if st.button("🩺 Diagnose Why Options Hasn't Traded",
-                                 key="diag_options_btn",
-                                 type="primary"):
-                        with st.spinner("Inspecting every gate the options auto-entry passes through…"):
-                            _ops_report = []
-
-                            # Gate 1: cash
-                            _cash_ok = _ops_summary["available_cash"] >= 50
-                            _ops_report.append(
-                                ("Cash ≥ $50", _cash_ok,
-                                 f"${_ops_summary['available_cash']:.2f} available")
-                            )
-
-                            # Gate 2: VIX
-                            try:
-                                _vix_diag = ts.get_vix_level()
-                                _vix_regime = (_vix_diag or {}).get("regime", "?")
-                                _vix_ok = _vix_regime != "EXTREME"
-                                _ops_report.append(
-                                    ("VIX not EXTREME", _vix_ok,
-                                     f"{_vix_regime} ({(_vix_diag or {}).get('vix', '?')})")
-                                )
-                            except Exception:
-                                _ops_report.append(("VIX not EXTREME", True, "(check failed)"))
-
-                            # Gate 3: scan picks exist
-                            try:
-                                _plays = ts.get_scan_options_plays(conn, top_n=10)
-                                _plays_ok = len(_plays) > 0
-                                _ops_report.append(
-                                    (f"Scan picks exist (≥1)", _plays_ok,
-                                     f"{len(_plays)} candidate(s) from latest scan")
-                                )
-                            except Exception as _pe:
-                                _plays = []
-                                _ops_report.append((f"Scan picks exist (≥1)", False,
-                                                     f"ERROR: {_pe}"))
-
-                            # Gate 4: which plays pass score/prob filter
-                            from monitor import OPTIONS_MIN_SCORE, OPTIONS_MIN_PROB
-                            passing = [
-                                p for p in _plays
-                                if float(p.get("explosive_score", 0)) >= OPTIONS_MIN_SCORE
-                                and float(p.get("breakout_prob", 0)) >= OPTIONS_MIN_PROB
-                            ]
-                            _ops_report.append(
-                                (f"Plays pass score≥{OPTIONS_MIN_SCORE} & prob≥{OPTIONS_MIN_PROB}%",
-                                 len(passing) > 0,
-                                 f"{len(passing)} of {len(_plays)} pass the filter")
-                            )
-
-                            # Per-play breakdown
-                            for p in _plays:
-                                tk    = p.get("ticker", "?")
-                                escore = float(p.get("explosive_score", 0))
-                                prob   = float(p.get("breakout_prob", 0))
-                                n_sug  = len(p.get("suggestions", []) or [])
-                                _flag = ("✓" if (escore >= OPTIONS_MIN_SCORE
-                                                  and prob >= OPTIONS_MIN_PROB) else "✗")
-                                _ops_report.append(
-                                    (f"  {tk} — score {escore:.0f} prob {prob:.0f}%", True,
-                                     f"{_flag} ({n_sug} strategy suggestion(s) generated)")
-                                )
-
-                            # Render report
-                            for label, ok, detail in _ops_report:
-                                _icon = "✅" if ok else "🛑"
-                                st.markdown(f"{_icon}  **{label}** — {detail}")
-
-                            # Verdict
-                            st.divider()
-                            if not _cash_ok:
-                                st.error("**Bottleneck: insufficient cash.** Reset or wait.", icon="💰")
-                            elif _vix_regime == "EXTREME":
-                                st.warning("**Bottleneck: VIX is EXTREME** — options auto-entry "
-                                           "is intentionally disabled during fear spikes.",
-                                           icon="⚡")
-                            elif len(_plays) == 0:
-                                st.warning(
-                                    "**Bottleneck: no scan picks have weekly (5-7 DTE) options data.** "
-                                    "Run a fresh scan, or the candidates may lack listed weeklies. "
-                                    "Most major tickers (SPY, QQQ, AAPL, NVDA, TSLA) do.",
-                                    icon="📭",
-                                )
-                            elif len(passing) == 0:
-                                st.error(
-                                    f"**Bottleneck: pre-filter is too strict.** "
-                                    f"Your candidates have scores below {OPTIONS_MIN_SCORE} or "
-                                    f"probabilities below {OPTIONS_MIN_PROB}%. "
-                                    f"Click **Lower Pre-Filter** below to relax it.",
-                                    icon="🎚",
-                                )
-                            else:
-                                st.info(
-                                    "Pre-filter is passing candidates — the gate must be at the "
-                                    "Master Score level (≥ 55). Click **Test Options Auto-Entry** "
-                                    "below to dry-run the full path and see which Master Score "
-                                    "values each candidate has.",
-                                    icon="🎯",
-                                )
-
-                    # ── Quick action buttons ─────────────────────────────────
-                    _dc1, _dc2 = st.columns(2)
-                    with _dc1:
-                        if st.button("🎚 Lower Pre-Filter",
-                                     key="lower_opts_filter_btn",
-                                     help="Drop OPTIONS_MIN_SCORE/PROB to make more candidates eligible"):
-                            # We can't edit monitor.py at runtime, but we can write
-                            # a session override the next monitor cycle will respect
-                            # via the learning_adjustments table.
-                            st.info(
-                                "ℹ️ The OPTIONS_MIN_SCORE constant is in monitor.py "
-                                "(currently 70). I'll lower it to 60 in the next commit.",
-                                icon="💡",
-                            )
-                    with _dc2:
-                        if st.button("🧪 Test Options Auto-Entry",
-                                     key="test_opts_entry_btn",
-                                     help="Dry-run the auto-entry to see what gets through and what doesn't"):
-                            with st.spinner("Running options auto-entry dry-run…"):
-                                import io as _io
-                                import contextlib as _cl
-                                _buf = _io.StringIO()
-                                try:
-                                    import monitor as _mo
-                                    _vix_now = ts.get_vix_level()
-                                    _session_diag = ts.MarketClock.get_session()
-                                    with _cl.redirect_stdout(_buf):
-                                        _mo.auto_enter_options(
-                                            conn, _vix_now, _session_diag,
-                                            _session_diag.get("quality", "NORMAL"),
-                                            risk_mult=1.0,
-                                            market_regime=None,
-                                            learning_adjustments=_le.get_active_adjustments(),
-                                        )
-                                    _logs = _buf.getvalue()
-                                    st.code(_logs or "(no output)", language="text")
-                                except Exception as _de:
-                                    st.error(f"Dry-run error: {_de}")
-                else:
-                    st.success(
-                        f"✅ Options engine is functional — has made {_ops_summary['trades_made']} trades.",
-                        icon="✅",
-                    )
-
-            except Exception as _ops_exc:
-                st.error(f"Options engine diagnostic failed: {_ops_exc}")
-
-            # ── Manual monitor trigger — runs the same close logic GitHub Actions does
-            st.divider()
-            st.markdown("**🔧 Manual Trigger**")
-            st.caption(
-                "Run the same stop/target check the GitHub Actions monitor runs every 5 min. "
-                "Use this to verify the close logic works and to force any pending closes immediately."
-            )
-            if st.button("🔄 Run Monitor Stop/Target Check Now",
-                         key="manual_monitor_check",
-                         type="primary"):
-                with st.spinner("Running check_stops_and_targets()…"):
-                    try:
-                        _closed_now = _pe_diag.check_stops_and_targets()
-                        if _closed_now:
-                            st.success(
-                                f"✅ Closed {len(_closed_now)} position(s)!",
-                                icon="✅",
-                            )
-                            for _c in _closed_now:
-                                _r = _c.get("exit_reason", "?")
-                                _t = _c.get("ticker", "?")
-                                _p = _c.get("net_pnl", 0) or 0
-                                _e = _c.get("exit_price", 0) or 0
-                                st.markdown(
-                                    f"- **{_t}** — {_r} @ ${_e:.2f}  ·  "
-                                    f"P&L: ${_p:+.2f}"
-                                )
-                            st.info("Refresh the page to see updated P&L in the main view.")
-                        else:
-                            st.info("✓ Check ran successfully. No positions needed closing.",
-                                    icon="ℹ️")
-                    except Exception as _mexc:
-                        st.error(
-                            f"❌ **Bug in check_stops_and_targets():**\n\n```\n{_mexc}\n```",
-                            icon="🐛",
-                        )
-                        import traceback as _tb
-                        with st.expander("Full traceback"):
-                            st.code(_tb.format_exc())
-
-            st.caption(
-                "If the button above closes the position successfully, then the code is fine "
-                "and the issue is GitHub Actions (workflow disabled or failing). "
-                "Check repo → Actions → Position Monitor."
-            )
-        except Exception as _diag_exc:
-            st.error(f"Diagnostic error: {_diag_exc}")
-
+    try:
+        _sb_pe   = ts.PaperTradingEngine(conn)
+        _sb_risk = ts.get_portfolio_risk_status(_sb_pe)
+        _sb_le   = ts.LearningEngine(conn)
+        _sb_adj  = _sb_le.get_active_adjustments()
+        _sb_pun  = _sb_le.get_punishment_status()
+        _sb_lvl  = _sb_risk.get("risk_level", "NORMAL")
+        _icon_map = {"NORMAL": "🟢", "CAUTION": "🟡", "HALT": "🛑", "EMERGENCY_HALT": "🚨"}
+        _sb_icon = _icon_map.get(_sb_lvl, "⚪")
+        _pun_tag = "  ·  🛑 PUNISH" if _sb_pun.get("active") else ""
+        _line = (
+            f"{_sb_icon} <b>{_sb_lvl}</b>  ·  "
+            f"DD {_sb_risk.get('drawdown_pct', 0):.1f}%  ·  "
+            f"Learn #{_sb_adj.get('learning_iteration', 0)}"
+            f"{_pun_tag}"
+        )
+        st.markdown(
+            "<div style='background:#161b22;border-radius:6px;"
+            "padding:8px 12px;margin-bottom:6px;font-size:0.85em'>"
+            + _line + "</div>",
+            unsafe_allow_html=True,
+        )
+    except Exception:
+        pass
+    st.caption("💡 Full diagnostics live in the **🎛 Management** tab.")
     st.divider()
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1528,160 +964,7 @@ with st.sidebar:
                 st.session_state.ai_chat_history = []
                 st.rerun()
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # 📰 NEWS TRACKER — Live market news classified by AI
-    # ══════════════════════════════════════════════════════════════════════════
-    with st.expander("📰 News Tracker", expanded=False):
-        st.caption(
-            "Pulls live headlines from MarketWatch, CNBC, Investing.com, "
-            "Federal Reserve, and Yahoo — categorizes each as "
-            "Health / War / Tariffs / Negotiations / Earnings / Regulatory / "
-            "Macro / Product / Legal, and rates impact + sentiment. Feeds "
-            "into your Master Score and the auto-entry decision."
-        )
-
-        if conn is None:
-            st.info("Database unavailable.")
-        else:
-            try:
-                from news_agent import NewsAgent
-                _na = NewsAgent(conn, ai_analyst=_AI)
-
-                # ── Pull / refresh controls ──────────────────────────────────
-                _nc1, _nc2 = st.columns([3, 1])
-                with _nc1:
-                    _hours = st.slider("Lookback window (hours)", 1, 72, 24,
-                                       key="news_hours_slider")
-                with _nc2:
-                    if st.button("🔄 Pull Latest",
-                                 key="news_refresh_btn",
-                                 type="primary",
-                                 help="Fetch + classify new headlines (uses AI if configured)"):
-                        with st.spinner("Pulling news from all sources & classifying…"):
-                            try:
-                                _r = _na.run_cycle(max_per_source=15, max_new=20)
-                                st.success(
-                                    f"✓ Pulled {_r['fetched']}  ·  "
-                                    f"new {_r['new']}  ·  "
-                                    f"high-impact {_r['high_imp']}",
-                                    icon="📰",
-                                )
-                            except Exception as _re:
-                                st.error(f"Fetch failed: {_re}")
-
-                # ── Market pulse ────────────────────────────────────────────
-                try:
-                    _pulse = _na.get_market_pulse(hours=_hours)
-                    _mood = _pulse.get("mood", "NEUTRAL")
-                    _mood_colors = {
-                        "BULLISH":         ("#3fb950", "🟢"),
-                        "MILDLY_BULLISH":  ("#58a6ff", "🔵"),
-                        "NEUTRAL":         ("#8b949e", "⚪"),
-                        "MILDLY_BEARISH":  ("#e3b341", "🟡"),
-                        "BEARISH":         ("#f85149", "🔴"),
-                    }
-                    _mc, _me = _mood_colors.get(_mood, ("#8b949e", "⚪"))
-                    st.markdown(
-                        f"<div style='background:#161b22;border-left:4px solid {_mc};"
-                        f"border-radius:6px;padding:8px 12px;margin:6px 0'>"
-                        f"<b>{_me} Market Pulse: <span style='color:{_mc}'>{_mood.replace('_',' ')}</span></b>"
-                        f"  ·  net sentiment {_pulse.get('net_sentiment', 0):+.2f}"
-                        f"  ·  {_pulse.get('n_events', 0)} events in last {_hours}h"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
-
-                    # Category counts
-                    _cat_counts = _pulse.get("category_counts", {})
-                    if _cat_counts:
-                        _cat_str = "  ·  ".join(
-                            f"{k}: {v}" for k, v in sorted(
-                                _cat_counts.items(), key=lambda x: -x[1])[:5]
-                        )
-                        st.caption(f"📊 By category: {_cat_str}")
-                except Exception:
-                    pass
-
-                # ── Recent high-impact headlines ─────────────────────────────
-                _market_news = _na.get_recent_market_news(hours=_hours,
-                                                            min_impact=4,
-                                                            limit=15)
-                if _market_news:
-                    st.markdown(f"**🗞 Top {len(_market_news)} headlines (impact ≥ 4):**")
-                    for _ev in _market_news[:10]:
-                        _sent = (_ev.get("sentiment") or "NEUTRAL").upper()
-                        _cat  = _ev.get("category", "OTHER")
-                        _imp  = int(_ev.get("impact_score") or 0)
-                        _hl   = (_ev.get("headline") or "")[:160]
-                        _src  = _ev.get("source", "")
-                        _url  = _ev.get("url", "")
-                        _tickers_str = _ev.get("affected_tickers", "") or ""
-                        _emoji = {
-                            "POSITIVE": "✅",
-                            "NEGATIVE": "🛑",
-                            "NEUTRAL":  "⚪",
-                        }.get(_sent, "⚪")
-                        _bar_c = ("#3fb950" if _sent == "POSITIVE" else
-                                  "#f85149" if _sent == "NEGATIVE" else "#8b949e")
-                        _line = (
-                            f"<div style='background:#0d1117;border-left:3px solid {_bar_c};"
-                            f"padding:6px 10px;margin:3px 0;border-radius:4px'>"
-                            f"<div style='font-size:0.7em;color:#8b949e'>"
-                            f"{_emoji} {_cat}  ·  impact {_imp}/10  ·  "
-                            f"{_src}"
-                            + (f"  ·  affects: <b>{_tickers_str}</b>" if _tickers_str else "")
-                            + f"</div>"
-                            f"<div style='font-size:0.88em;color:#e6edf3;margin-top:2px'>"
-                        )
-                        if _url:
-                            _line += f"<a href='{_url}' target='_blank' style='color:#e6edf3;text-decoration:none'>{_hl}</a>"
-                        else:
-                            _line += _hl
-                        _line += "</div></div>"
-                        st.markdown(_line, unsafe_allow_html=True)
-                else:
-                    st.info("No news events in lookback window. Click 🔄 Pull Latest to fetch.",
-                            icon="📭")
-
-                # ── Per-position news impact ─────────────────────────────────
-                try:
-                    _p_eng_news = ts.PaperTradingEngine(conn)
-                    _open_for_news = _p_eng_news.open_positions
-                    if _open_for_news:
-                        st.markdown("**📊 News impact on your open positions:**")
-                        _pos_rows = []
-                        for _p in _open_for_news[:10]:
-                            _tk = _p.get("ticker", "?")
-                            try:
-                                _ni = _na.get_news_impact(_tk, hours=_hours)
-                                _flag = "🛑 SKIP" if _ni.get("should_skip") else (
-                                    "✅" if _ni.get("net_sentiment", 0) > 0.1 else
-                                    "⚪" if abs(_ni.get("net_sentiment", 0)) < 0.1 else
-                                    "🟡"
-                                )
-                                _pos_rows.append({
-                                    "Ticker":     _tk,
-                                    "Events":     _ni.get("n_events", 0),
-                                    "Net":        f"{_ni.get('net_sentiment', 0):+.2f}",
-                                    "Max Impact": _ni.get("max_impact", 0),
-                                    "Category":   _ni.get("dominant_category", "—"),
-                                    "Modifier":   f"{_ni.get('score_modifier', 1.0):.2f}×",
-                                    "Status":     _flag,
-                                })
-                            except Exception:
-                                _pos_rows.append({
-                                    "Ticker": _tk, "Events": "?", "Net": "—",
-                                    "Max Impact": "—", "Category": "—",
-                                    "Modifier": "—", "Status": "err"
-                                })
-                        st.dataframe(pd.DataFrame(_pos_rows), hide_index=True,
-                                     use_container_width=True)
-                except Exception:
-                    pass
-
-            except Exception as _ne:
-                st.error(f"News Tracker error: {_ne}")
-
+    # 📰 News Tracker moved to 🎛 Management tab
     st.divider()
 
     universe = st.selectbox(
@@ -1857,7 +1140,9 @@ if run_btn:
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
-tab_dash, tab_results, tab_chart, tab_analytics, tab_paper, tab_fees, tab_options = st.tabs([
+(tab_mgmt, tab_dash, tab_results, tab_chart, tab_analytics,
+ tab_paper, tab_fees, tab_options) = st.tabs([
+    "🎛  Management",
     "📊  Dashboard",
     "🔍  Scan Results",
     "📈  Stock Chart",
@@ -1866,6 +1151,435 @@ tab_dash, tab_results, tab_chart, tab_analytics, tab_paper, tab_fees, tab_option
     "💰  Fees Tracker",
     "⚡  Options",
 ])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 0 — BOT MANAGEMENT DASHBOARD
+#   Consolidated control panel — system status, engine diagnostics,
+#   learning controls, news flow, configuration. Replaces sidebar clutter.
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_mgmt:
+    conn, _mgmt_mode = get_db()
+
+    st.markdown('<div class="section-hdr">🎛 Bot Management Dashboard</div>',
+                unsafe_allow_html=True)
+    st.caption(
+        "Single-pane-of-glass view: every engine status, all controls, "
+        "and pipeline diagnostics in one place."
+    )
+
+    _mgmt_paper = ts.PaperTradingEngine(conn)
+    _mgmt_ops   = ts.OptionsPaperEngine(conn)
+    _mgmt_le    = ts.LearningEngine(conn)
+
+    # ── SECTION 1 — SYSTEM STATUS OVERVIEW ───────────────────────────────────
+    st.markdown("### 🚦 System Status Overview")
+    _stat_cols = st.columns(6)
+
+    with _stat_cols[0]:
+        st.metric("Database", "🟢 ONLINE" if conn is not None else "🔴 OFFLINE",
+                  delta=_mgmt_mode, delta_color="off")
+    with _stat_cols[1]:
+        _ai_ok = _AI is not None and _AI.available
+        st.metric("AI Analyst",
+                  "🟢 " + _AI.provider.upper() if _ai_ok else "⚪ OFF",
+                  delta=None if _ai_ok else "optional", delta_color="off")
+    with _stat_cols[2]:
+        try:
+            from data_providers import alpaca_available, tradingview_ta_available
+            _alpaca_on = alpaca_available()
+            _tv_on     = tradingview_ta_available()
+        except Exception:
+            _alpaca_on = False
+            _tv_on     = False
+        st.metric("Live Prices",
+                  "🟢 ALPACA" if _alpaca_on else "🟡 YFINANCE",
+                  delta=None if _alpaca_on else "add ALPACA_API_KEY",
+                  delta_color="off")
+    with _stat_cols[3]:
+        st.metric("TradingView TA", "🟢 ON" if _tv_on else "⚪ OFF",
+                  delta=None if _tv_on else "auto-installs", delta_color="off")
+    with _stat_cols[4]:
+        try:
+            _adj_top = _mgmt_le.get_active_adjustments()
+            _pun_top = _mgmt_le.get_punishment_status()
+            _le_st = "🛑 PUNISH" if _pun_top.get("active") else f"🟢 iter #{_adj_top.get('learning_iteration', 0)}"
+        except Exception:
+            _le_st = "⚪ —"
+        st.metric("Learning Engine", _le_st)
+    with _stat_cols[5]:
+        try:
+            _re_top = ts.get_portfolio_risk_status(_mgmt_paper)
+            _re_lvl = _re_top.get("risk_level", "NORMAL")
+            _re_e = {"NORMAL":"🟢","CAUTION":"🟡","HALT":"🛑","EMERGENCY_HALT":"🚨"}.get(_re_lvl,"⚪")
+            st.metric("Risk Engine", f"{_re_e} {_re_lvl}",
+                      delta=f"DD {_re_top.get('drawdown_pct', 0):.1f}%")
+        except Exception:
+            st.metric("Risk Engine", "⚪ —")
+
+    st.divider()
+
+    # ── SECTION 2 — PORTFOLIO + LEARNING ENGINE (2-column) ───────────────────
+    _mc_a, _mc_b = st.columns(2)
+
+    with _mc_a:
+        st.markdown("### 💼 Portfolio Snapshot")
+        try:
+            _ps = _mgmt_paper.get_summary()
+            _os_ = _mgmt_ops.get_summary()
+            _p_cols = st.columns(2)
+            with _p_cols[0]:
+                st.markdown("**Stocks**")
+                st.markdown(
+                    f"<div style='background:#161b22;border-radius:6px;padding:8px 12px'>"
+                    f"💰 Cash <b>${_ps.get('available_cash', 0):,.2f}</b><br>"
+                    f"📂 Open <b>{_ps.get('open_positions', 0)}/{_ps.get('max_positions', 5)}</b><br>"
+                    f"💹 Realized <b>${_ps.get('realized_pnl', 0):+,.2f}</b><br>"
+                    f"📊 Trades <b>{_ps.get('trades_made', 0)}</b>"
+                    f"</div>", unsafe_allow_html=True)
+            with _p_cols[1]:
+                st.markdown("**Options**")
+                st.markdown(
+                    f"<div style='background:#161b22;border-radius:6px;padding:8px 12px'>"
+                    f"💰 Cash <b>${_os_.get('available_cash', 0):,.2f}</b><br>"
+                    f"📂 Open <b>{_os_.get('n_open', 0)}</b><br>"
+                    f"💹 Realized <b>${_os_.get('realized_pnl', 0):+,.2f}</b><br>"
+                    f"📊 Trades <b>{_os_.get('trades_made', 0)}</b>"
+                    f"</div>", unsafe_allow_html=True)
+        except Exception as _pse:
+            st.error(f"Portfolio error: {_pse}")
+
+        st.markdown("### 🛡 Risk Engine")
+        try:
+            _rs = ts.get_portfolio_risk_status(_mgmt_paper)
+            _lvl = _rs.get("risk_level", "NORMAL")
+            _col = {"NORMAL":"#3fb950","CAUTION":"#e3b341","HALT":"#f85149","EMERGENCY_HALT":"#a371f7"}.get(_lvl,"#8b949e")
+            st.markdown(
+                f"<div style='background:#161b22;border:2px solid {_col};border-radius:8px;padding:10px 14px'>"
+                f"<b style='color:{_col}'>{_lvl}</b>  ·  "
+                f"DD <b>{_rs.get('drawdown_pct', 0):.2f}%</b>  ·  "
+                f"Max sector <b>{_rs.get('max_sector_pct', 0):.0f}%</b>  ·  "
+                f"Sizing <b>{_rs.get('size_multiplier', 1.0):.2f}×</b>"
+                f"<br><small style='color:#8b949e'>{_rs.get('reason', '')}</small>"
+                f"</div>", unsafe_allow_html=True)
+            _sec_exp = _rs.get("sector_exposure", {})
+            if _sec_exp:
+                st.markdown("**Sector exposure**")
+                for _sec, _pct in sorted(_sec_exp.items(), key=lambda x: -x[1])[:6]:
+                    _bc = "#f85149" if _pct > 40 else "#e3b341" if _pct > 25 else "#58a6ff"
+                    st.markdown(
+                        f"<div style='display:flex;gap:8px;align-items:center;margin:2px 0'>"
+                        f"<div style='width:130px;font-size:0.78em'>{_sec}</div>"
+                        f"<div style='flex:1;background:#21262d;border-radius:3px;height:8px'>"
+                        f"<div style='width:{min(100, _pct)}%;background:{_bc};height:8px;border-radius:3px'></div></div>"
+                        f"<div style='width:42px;font-size:0.78em;text-align:right'>{_pct:.0f}%</div>"
+                        f"</div>", unsafe_allow_html=True)
+        except Exception as _rse:
+            st.warning(f"Risk status unavailable: {_rse}")
+
+    with _mc_b:
+        st.markdown("### 🧠 Self-Learning Engine")
+        try:
+            _adj = _mgmt_le.get_active_adjustments()
+            _pun = _mgmt_le.get_punishment_status()
+            st.markdown(
+                f"**Iter #{_adj.get('learning_iteration', 0)}**  ·  "
+                f"Min Master Score <b>{_adj.get('min_master_score', 65):.0f}</b>  ·  "
+                f"Size Cap <b>{_adj.get('size_multiplier_cap', 1.0):.2f}×</b>"
+            )
+            if _pun.get("active"):
+                st.error(
+                    f"🛑 PUNISHMENT MODE — recovery target ${_pun.get('recovery_target', 0):,.2f}, "
+                    f"floor {_pun.get('master_score_floor', 75):.0f}, cap {_pun.get('size_cap', 0.5):.2f}×",
+                    icon="🛑")
+            for _bl_label, _bl in [("Sectors", _adj.get("sector_blacklist")),
+                                    ("Patterns", _adj.get("pattern_blacklist")),
+                                    ("Wyckoff", _adj.get("wyckoff_blacklist"))]:
+                if _bl:
+                    st.caption(f"🚫 {_bl_label}: {', '.join(_bl)}")
+
+            st.markdown("**💡 Today's Improvement Suggestion**")
+            _latest = _mgmt_le.get_latest_suggestion()
+            _today = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+            _has_today = (_latest and str(_latest.get("suggestion_date", "")).startswith(_today))
+            if _has_today and _latest.get("suggestion"):
+                _ap = bool(_latest.get("applied", 0))
+                _bc = "#3fb950" if _ap else "#58a6ff"
+                _tag = "✅ Applied" if _ap else "🆕 New"
+                st.markdown(
+                    f"<div style='background:#161b22;border-left:4px solid {_bc};padding:8px 12px;border-radius:4px;margin:4px 0'>"
+                    f"<small style='color:#8b949e'>{_tag}  ·  <b>{_latest.get('category', '?')}</b></small><br>"
+                    f"<b>{_latest.get('suggestion', '—')}</b><br>"
+                    f"<small style='color:#c9d1d9'>{_latest.get('rationale', '')}</small><br>"
+                    f"<code style='font-size:0.8em'>{_latest.get('action', '')}</code>"
+                    f"</div>", unsafe_allow_html=True)
+                if not _ap:
+                    _abc = st.columns(2)
+                    with _abc[0]:
+                        if st.button("⚡ Apply Now", key=f"mgmt_apply_{_latest.get('id')}",
+                                     type="primary", use_container_width=True):
+                            try:
+                                _r = _mgmt_le.apply_suggestion(_latest.get("id"))
+                                if _r.get("ok"):
+                                    st.success(f"✅ {_r['message']}")
+                                    st.balloons()
+                                    st.rerun()
+                                else:
+                                    st.warning(_r.get("message", "Couldn't apply"))
+                            except Exception as _e:
+                                st.error(f"Apply failed: {_e}")
+                    with _abc[1]:
+                        if st.button("✓ Mark Manual", key=f"mgmt_mark_{_latest.get('id')}",
+                                     use_container_width=True):
+                            _mgmt_le.mark_suggestion_applied(_latest.get("id"))
+                            st.rerun()
+            else:
+                st.caption("No suggestion yet today.")
+                if st.button("🪄 Generate Now", key="mgmt_gen_sug"):
+                    with st.spinner("AI analysing..."):
+                        try:
+                            _new = _mgmt_le.generate_improvement_suggestion(_AI, _mgmt_paper)
+                            if _new.get("suggestion"):
+                                st.success(f"💡 {_new['suggestion']}")
+                                st.rerun()
+                        except Exception as _e:
+                            st.error(f"Generation failed: {_e}")
+        except Exception as _le_e:
+            st.warning(f"Learning engine unavailable: {_le_e}")
+
+    st.divider()
+
+    # ── SECTION 3 — NEWS + POSITIONS HEALTH ──────────────────────────────────
+    _nc_a, _nc_b = st.columns(2)
+
+    with _nc_a:
+        st.markdown("### 📰 News Tracker")
+        try:
+            from news_agent import NewsAgent as _MgmtNA
+            _mna = _MgmtNA(conn, ai_analyst=_AI)
+            _mna_hours = st.slider("Lookback (h)", 1, 72, 24, key="mgmt_news_hours")
+            _nbc1, _nbc2 = st.columns([3, 1])
+            with _nbc1:
+                _pulse = _mna.get_market_pulse(hours=_mna_hours)
+                _mood = _pulse.get("mood", "NEUTRAL")
+                _mood_map = {"BULLISH":("#3fb950","🟢"),"MILDLY_BULLISH":("#58a6ff","🔵"),
+                             "NEUTRAL":("#8b949e","⚪"),"MILDLY_BEARISH":("#e3b341","🟡"),
+                             "BEARISH":("#f85149","🔴")}
+                _mc, _me = _mood_map.get(_mood, ("#8b949e","⚪"))
+                st.markdown(
+                    f"<div style='background:#161b22;border-left:4px solid {_mc};padding:6px 10px;border-radius:4px'>"
+                    f"{_me} <b>{_mood.replace('_', ' ')}</b>  ·  "
+                    f"net {_pulse.get('net_sentiment', 0):+.2f}  ·  "
+                    f"{_pulse.get('n_events', 0)} events"
+                    f"</div>", unsafe_allow_html=True)
+            with _nbc2:
+                if st.button("🔄 Pull", key="mgmt_news_pull", use_container_width=True):
+                    with st.spinner("Fetching..."):
+                        _rr = _mna.run_cycle(max_per_source=15, max_new=20)
+                        st.success(f"+{_rr['new']} new")
+            _news = _mna.get_recent_market_news(hours=_mna_hours, min_impact=5, limit=8)
+            for _ev in _news[:6]:
+                _s = _ev.get("sentiment", "NEUTRAL")
+                _e_emoji = {"POSITIVE":"✅","NEGATIVE":"🛑"}.get(_s, "⚪")
+                _bc = "#3fb950" if _s=="POSITIVE" else "#f85149" if _s=="NEGATIVE" else "#8b949e"
+                st.markdown(
+                    f"<div style='border-left:3px solid {_bc};padding:4px 8px;margin:2px 0;font-size:0.85em'>"
+                    f"{_e_emoji} <span style='color:#8b949e'>{_ev.get('category','?')} · "
+                    f"{int(_ev.get('impact_score') or 0)}/10 · {_ev.get('source', '')}</span><br>"
+                    f"{(_ev.get('headline') or '')[:100]}"
+                    f"</div>", unsafe_allow_html=True)
+        except Exception as _ne:
+            st.warning(f"News tracker unavailable: {_ne}")
+
+    with _nc_b:
+        st.markdown("### 📊 Open Positions")
+        try:
+            _open_stk = _mgmt_paper.open_positions
+            if _open_stk:
+                _live_tk = tuple(p["ticker"] for p in _open_stk)
+                _salt = st.session_state.get("price_refresh_salt", 0)
+                _live_p = _fetch_live_prices(_live_tk, _salt=_salt)
+                _ph = []
+                _tot_unrl = 0.0
+                _tot_cost = 0.0
+                for _p in _open_stk:
+                    _tk = _p.get("ticker", "?")
+                    _ep = float(_p.get("entry_price") or 0)
+                    _sh = float(_p.get("shares") or 0)
+                    _gi = float(_p.get("gross_invested") or 0)
+                    _st_p = float(_p.get("stop_loss") or 0)
+                    _tg = float(_p.get("target_price") or 0)
+                    _cur = float(_live_p.get(_tk, 0))
+                    if _cur > 0 and _gi > 0:
+                        _cv = _sh * _cur
+                        _u = _cv - _gi
+                        _up = _u / _gi * 100
+                        _tot_unrl += _u
+                        _tot_cost += _gi
+                        _flag = ""
+                        if _st_p > 0 and _cur <= _st_p:
+                            _flag = "🛑"
+                        elif _tg > 0 and _cur >= _tg:
+                            _flag = "🎯"
+                        _ph.append({"Ticker": _tk, "Cur": f"${_cur:.2f}",
+                                    "P&L": f"${_u:+.1f}({_up:+.1f}%)",
+                                    "Stop": f"${_st_p:.2f}", "Tgt": f"${_tg:.2f}",
+                                    "Flag": _flag})
+                    else:
+                        _ph.append({"Ticker": _tk, "Cur": "?", "P&L": "—",
+                                    "Stop": f"${_st_p:.2f}", "Tgt": f"${_tg:.2f}", "Flag": "—"})
+                st.dataframe(pd.DataFrame(_ph), hide_index=True, use_container_width=True)
+                if _tot_cost > 0:
+                    _c = "#3fb950" if _tot_unrl >= 0 else "#f85149"
+                    st.markdown(
+                        f"<b>Total unrealized:</b> "
+                        f"<span style='color:{_c}'>${_tot_unrl:+.2f} ({_tot_unrl/_tot_cost*100:+.2f}%)</span>",
+                        unsafe_allow_html=True)
+                if st.button("🔄 Refresh Prices", key="mgmt_refresh_p"):
+                    st.session_state["price_refresh_salt"] = st.session_state.get("price_refresh_salt", 0) + 1
+                    try:
+                        _fetch_live_prices.clear()
+                    except Exception:
+                        pass
+                    st.rerun()
+            else:
+                st.info("No open stock positions.", icon="📂")
+        except Exception as _pe:
+            st.warning(f"Positions error: {_pe}")
+
+    st.divider()
+
+    # ── SECTION 4 — DIAGNOSTICS & MANUAL TRIGGERS ────────────────────────────
+    st.markdown("### 🩺 Engine Diagnostics & Manual Triggers")
+    _diag_cols = st.columns(4)
+
+    with _diag_cols[0]:
+        st.markdown("**Stops/Targets**")
+        st.caption("Manual check_stops_and_targets")
+        if st.button("🔄 Check Now", key="mgmt_stops", use_container_width=True):
+            with st.spinner("..."):
+                try:
+                    _closed = _mgmt_paper.check_stops_and_targets()
+                    st.success(f"Closed {len(_closed)}" if _closed else "None breached")
+                except Exception as _x:
+                    st.error(f"{_x}")
+
+    with _diag_cols[1]:
+        st.markdown("**Options Expiry**")
+        st.caption("Close expired worthless contracts")
+        if st.button("⏰ Run", key="mgmt_exp", use_container_width=True):
+            try:
+                _ex = _mgmt_ops.expire_check()
+                st.success(f"Expired {len(_ex)}")
+            except Exception as _x:
+                st.error(f"{_x}")
+
+    with _diag_cols[2]:
+        st.markdown("**News Pull**")
+        st.caption("Fetch + classify headlines")
+        if st.button("📰 Pull", key="mgmt_npull", use_container_width=True):
+            try:
+                from news_agent import NewsAgent as _NA2
+                with st.spinner("..."):
+                    _r = _NA2(conn, ai_analyst=_AI).run_cycle()
+                    st.success(f"+{_r['new']} new")
+            except Exception as _x:
+                st.error(f"{_x}")
+
+    with _diag_cols[3]:
+        st.markdown("**Pipeline Test**")
+        st.caption("End-to-end dry-run on SPY")
+        if st.button("🧪 Test", key="mgmt_pipe", use_container_width=True):
+            with st.spinner("Running pipeline on SPY..."):
+                import time as _tm
+                _rep = []
+                _tk = "SPY"
+                _t = _tm.time()
+                try:
+                    _p_test = _fetch_live_prices((_tk,))
+                    _rep.append(("Live price", bool(_p_test.get(_tk, 0) > 0),
+                                 f"${_p_test.get(_tk, 0):.2f}", _tm.time()-_t))
+                except Exception as _e:
+                    _rep.append(("Live price", False, str(_e), 0))
+                _t = _tm.time()
+                try:
+                    _w = ts.detect_wyckoff_phase(_tk)
+                    _rep.append(("Wyckoff", True,
+                                 f"{_w.get('phase','?')} ({_w.get('confidence',0)}%)", _tm.time()-_t))
+                except Exception as _e:
+                    _rep.append(("Wyckoff", False, str(_e), 0))
+                _t = _tm.time()
+                try:
+                    _mtf = ts.confirm_multi_timeframe(_tk, "bullish")
+                    _rep.append(("Multi-TF", True,
+                                 f"{_mtf.get('aligned',0)}/3 ({_mtf.get('grade','?')})", _tm.time()-_t))
+                except Exception as _e:
+                    _rep.append(("Multi-TF", False, str(_e), 0))
+                _t = _tm.time()
+                try:
+                    _m = ts.compute_master_score(_tk, None, "bullish", conn, skip_slow_checks=False)
+                    _rep.append(("Master Score", True,
+                                 f"{_m.get('score',0)}/100 ({_m.get('grade','?')}) {_m.get('decision','?')}",
+                                 _tm.time()-_t))
+                except Exception as _e:
+                    _rep.append(("Master Score", False, str(_e), 0))
+                _t = _tm.time()
+                try:
+                    _sugs = ts.OptionsStrategyEngine().suggest(_tk, "bullish")
+                    _rep.append(("Options strat", len(_sugs) > 0,
+                                 f"{len(_sugs)} suggestions", _tm.time()-_t))
+                except Exception as _e:
+                    _rep.append(("Options strat", False, str(_e), 0))
+
+                for label, ok, detail, elapsed in _rep:
+                    icon = "✅" if ok else "🛑"
+                    st.markdown(f"{icon} **{label}** — {detail}  "
+                               f"<span style='color:#8b949e;font-size:0.8em'>({elapsed*1000:.0f}ms)</span>",
+                               unsafe_allow_html=True)
+                if all(r[1] for r in _rep):
+                    st.success("✅ All pipeline stages functional", icon="✅")
+
+    st.divider()
+
+    # ── SECTION 5 — CONFIGURATION ────────────────────────────────────────────
+    with st.expander("⚙️ Configuration & Tunable Parameters", expanded=False):
+        _cfg = st.columns(2)
+        with _cfg[0]:
+            st.markdown("**Learning-controlled (DB)**")
+            try:
+                _ac = _mgmt_le.get_active_adjustments()
+                st.markdown(
+                    f"- Min Master Score: <b>{_ac['min_master_score']:.0f}</b><br>"
+                    f"- Size Cap: <b>{_ac['size_multiplier_cap']:.2f}×</b><br>"
+                    f"- Sector Blacklist: <b>{len(_ac['sector_blacklist'])}</b><br>"
+                    f"- Pattern Blacklist: <b>{len(_ac['pattern_blacklist'])}</b><br>"
+                    f"- Wyckoff Blacklist: <b>{len(_ac['wyckoff_blacklist'])}</b><br>"
+                    f"- Iteration: <b>#{_ac['learning_iteration']}</b>",
+                    unsafe_allow_html=True)
+            except Exception:
+                pass
+        with _cfg[1]:
+            st.markdown("**Hard-coded (monitor.py)**")
+            try:
+                from monitor import (STOCK_MIN_SCORE, STOCK_MIN_PROB,
+                                     OPTIONS_MIN_SCORE, OPTIONS_MIN_PROB,
+                                     AUTO_MAX_ENTRIES_PER_RUN, STOCK_CHASE_LIMIT_PCT)
+                st.markdown(
+                    f"- Stock pre-filter score: <b>{STOCK_MIN_SCORE}</b><br>"
+                    f"- Stock pre-filter prob: <b>{STOCK_MIN_PROB}%</b><br>"
+                    f"- Options pre-filter score: <b>{OPTIONS_MIN_SCORE}</b><br>"
+                    f"- Options pre-filter prob: <b>{OPTIONS_MIN_PROB}%</b><br>"
+                    f"- Max new entries/cycle: <b>{AUTO_MAX_ENTRIES_PER_RUN}</b><br>"
+                    f"- Chase limit: <b>{STOCK_CHASE_LIMIT_PCT}%</b>",
+                    unsafe_allow_html=True)
+            except Exception:
+                pass
+        st.markdown("**Drawdown thresholds (LearningEngine)**")
+        st.markdown(
+            f"- Punishment Mode: <b>≥ {ts.LearningEngine.PUNISHMENT_THRESHOLD}%</b><br>"
+            f"- Hard Reset: <b>≥ {ts.LearningEngine.RESET_THRESHOLD}%</b><br>"
+            f"- Recovery band: within <b>{ts.LearningEngine.RECOVERY_BAND_PCT}%</b> of peak",
+            unsafe_allow_html=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

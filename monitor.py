@@ -475,6 +475,17 @@ def auto_enter_stocks(conn, paper, session, quality,
         prob    = float(r.get("breakout_prob")   or 0)
         pattern = str(r.get("pattern_detected")  or "")
 
+        # ── Resolve sector for portfolio risk + learning engine ────────────
+        # Without this, the bot can't enforce sector-concentration limits
+        # and the Learning Engine can't blacklist losing sectors.
+        sector = ""
+        try:
+            import yfinance as _yf_sec
+            info = _yf_sec.Ticker(ticker).info or {}
+            sector = str(info.get("sector", "") or "")
+        except Exception:
+            pass
+
         signal = {
             "price":           live_price,
             "stop_price":      stop,
@@ -482,6 +493,7 @@ def auto_enter_stocks(conn, paper, session, quality,
             "explosive_score": score,
             "probability":     prob,
             "pattern":         pattern,
+            "sector":          sector,
         }
         result = paper.open_position(ticker, signal)
 

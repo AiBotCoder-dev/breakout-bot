@@ -7715,3 +7715,486 @@ def get_position_sizing(account_cash, mid_price, vix_data=None,
         "sizing_method": sizing_method,
         "advice":        advice,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SMART MONEY ANALYSIS — Wyckoff · Institutional Volume · Gamma Walls · Squeeze
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_wyckoff_phase(ticker, lookback_days=60):
+    """
+    Identify which Wyckoff market phase the stock is currently in.
+
+    Uses daily OHLCV data to score six structural conditions:
+      ACCUMULATION   — price near lows, volume building, tight range
+      SPRING         — shakeout below prior range low + recovery (best long entry)
+      MARKUP         — breakout above range on strong volume (trend started)
+      REACCUMULATION — mid-range pause with decreasing volume (continuation)
+      DISTRIBUTION   — price at highs, volume expanding, closes weak
+      MARKDOWN       — falling prices, no institutional buying support
+
+    Returns dict:
+      phase, confidence (0-100), description, spring_detected,
+      price_position_pct, volume_trend, period_high, period_low,
+      is_tradeable (True for ACCUMULATION / SPRING / MARKUP / REACCUMULATION)
+      action  — plain-English trading implication
+    """
+    try:
+        hist = yf.download(ticker, period="3mo", interval="1d",
+                           progress=False, auto_adjust=True)
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist.columns = hist.columns.get_level_values(0)
+        hist = hist.dropna(subset=["Close"])
+        if len(hist) < 20:
+            return {"phase": "INSUFFICIENT_DATA", "confidence": 0,
+                    "description": "Not enough history", "is_tradeable": False,
+                    "action": "Skip — insufficient data"}
+
+        recent = hist.tail(lookback_days)
+
+        period_high  = float(recent["High"].max())
+        period_low   = float(recent["Low"].min())
+        period_range = max(period_high - period_low, 0.01)
+        current      = float(recent["Close"].iloc[-1])
+        price_pos    = (current - period_low) / period_range   # 0 = bottom, 1 = top
+
+        # Volume trend: recent 5-bar avg vs lookback avg
+        avg_vol    = float(recent["Volume"].mean())
+        recent_vol = float(recent["Volume"].tail(5).mean())
+        vol_trend  = recent_vol / avg_vol if avg_vol > 0 else 1.0
+
+        # Range contraction: last 10-bar range vs full period range
+        r10          = float(recent["High"].tail(10).max() - recent["Low"].tail(10).min())
+        range_ratio  = r10 / period_range
+
+        # Close position within each bar (strength): 0 = close at low, 1 = close at high
+        bar_range    = (recent["High"] - recent["Low"]).replace(0, np.nan)
+        close_pct    = ((recent["Close"] - recent["Low"]) / bar_range).tail(5).mean()
+        if pd.isna(close_pct):
+            close_pct = 0.5
+
+        # Spring: recent 5-bar low dips below the period low, then recovers above it
+        recent_5_low    = float(recent["Low"].tail(5).min())
+        spring_detected = (recent_5_low < period_low * 1.002) and (current > period_low)
+
+        # ── Phase logic ───────────────────────────────────────────────────────
+        if spring_detected and price_pos < 0.40:
+            phase      = "SPRING"
+            confidence = 85
+            desc       = ("Shakeout below prior range low followed by recovery — "
+                          "institutions engineered a final flush. Classic Wyckoff Spring: "
+                          "the best long entry in the entire cycle.")
+            action     = "STRONG BUY — enter on recovery above spring low with tight stop"
+            tradeable  = True
+
+        elif price_pos < 0.30 and range_ratio < 0.35 and vol_trend >= 1.0:
+            phase      = "ACCUMULATION"
+            confidence = 75
+            desc       = ("Price consolidating near lows with building volume and tight range. "
+                          "Institutions are quietly absorbing supply — retail doesn't notice yet.")
+            action     = "BUY — accumulate near range lows, stop below range"
+            tradeable  = True
+
+        elif price_pos > 0.65 and vol_trend > 1.2 and close_pct > 0.55:
+            phase      = "MARKUP"
+            confidence = 70
+            desc       = ("Price breaking above the accumulation range on strong volume "
+                          "and closing near highs — institutional demand is driving the trend.")
+            action     = "BUY — momentum entry, trail stop at VWAP"
+            tradeable  = True
+
+        elif 0.30 <= price_pos <= 0.65 and range_ratio < 0.30 and vol_trend < 0.9:
+            phase      = "REACCUMULATION"
+            confidence = 60
+            desc       = ("Mid-range pause with declining volume and tight price action — "
+                          "a healthy rest before the next leg up.")
+            action     = "BUY — wait for range break with volume confirmation"
+            tradeable  = True
+
+        elif price_pos > 0.70 and close_pct < 0.40 and vol_trend > 1.1:
+            phase      = "DISTRIBUTION"
+            confidence = 65
+            desc       = ("Price near highs but closing in the lower half of bars on "
+                          "high volume — institutions are selling into retail strength.")
+            action     = "AVOID / SHORT — distribution in progress; do not buy"
+            tradeable  = False
+
+        elif price_pos < 0.35 and vol_trend < 0.8 and close_pct < 0.45:
+            phase      = "MARKDOWN"
+            confidence = 60
+            desc       = ("Price falling on declining volume with weak closes — "
+                          "no institutional demand is stepping in.")
+            action     = "AVOID — no institutional support; wait for selling climax"
+            tradeable  = False
+
+        else:
+            phase      = "UNDEFINED"
+            confidence = 30
+            desc       = "No clear Wyckoff phase. Price is in a mixed structure."
+            action     = "NEUTRAL — wait for clearer setup"
+            tradeable  = False
+
+        return {
+            "phase":              phase,
+            "confidence":         confidence,
+            "description":        desc,
+            "action":             action,
+            "spring_detected":    spring_detected,
+            "price_position_pct": round(price_pos * 100, 1),
+            "volume_trend":       round(vol_trend, 2),
+            "range_ratio":        round(range_ratio, 2),
+            "period_high":        round(period_high, 2),
+            "period_low":         round(period_low, 2),
+            "current_price":      round(current, 2),
+            "is_tradeable":       tradeable,
+        }
+    except Exception:
+        return {"phase": "ERROR", "confidence": 0,
+                "description": "Analysis failed", "is_tradeable": False,
+                "action": "Skip — data error"}
+
+
+def analyze_institutional_volume(ticker, lookback_days=20):
+    """
+    Detect institutional footprints in the daily volume/price relationship.
+
+    Patterns detected:
+      ABSORPTION        — high volume + narrow range (supply being soaked up)
+      SELLING_CLIMAX    — extreme down-volume bar that closes upper half (buyers win)
+      VOLUME_DRY_UP     — declining volume on a pullback (healthy, institutions not selling)
+      EFFORT_NO_RESULT  — huge volume, tiny price move (war between buyers/sellers)
+      DISTRIBUTION_SIGN — high volume at highs closing in lower half (institutions selling)
+      BREAKOUT_CONFIRM  — high volume bar closing at/near session high above prior range
+      NORMAL            — no unusual institutional signal detected
+
+    Returns dict:
+      primary_pattern, all_patterns, bullish_score (0-100),
+      vol_ratio, close_pct, description, implication
+    """
+    try:
+        hist = yf.download(ticker, period="2mo", interval="1d",
+                           progress=False, auto_adjust=True)
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist.columns = hist.columns.get_level_values(0)
+        hist = hist.dropna(subset=["Close"])
+        if len(hist) < 10:
+            return {"primary_pattern": "INSUFFICIENT_DATA", "bullish_score": 50,
+                    "description": "Not enough data", "vol_ratio": 1.0}
+
+        avg_vol  = float(hist["Volume"].tail(lookback_days).mean())
+        last     = hist.iloc[-1]
+        bar_rng  = float(last["High"] - last["Low"])
+        avg_rng  = float((hist["High"] - hist["Low"]).tail(lookback_days).mean())
+
+        vol_ratio   = float(last["Volume"]) / avg_vol if avg_vol > 0 else 1.0
+        range_ratio = bar_rng / avg_rng if avg_rng > 0 else 1.0
+        close_pct   = ((float(last["Close"]) - float(last["Low"])) / bar_rng
+                       if bar_rng > 0 else 0.5)
+        is_up_bar   = float(last["Close"]) >= float(last["Open"])
+
+        patterns     = []
+        bullish_score = 50  # neutral
+
+        # ── Breakout confirm: high vol, close near high, above 20-bar high ──
+        prior_high = float(hist["High"].tail(lookback_days + 1).iloc[:-1].max())
+        if vol_ratio > 1.8 and close_pct > 0.70 and float(last["Close"]) > prior_high:
+            patterns.append("BREAKOUT_CONFIRM")
+            bullish_score += 30
+
+        # ── Absorption: high vol, narrow range, close mid-bar ───────────────
+        if vol_ratio > 2.0 and range_ratio < 0.60 and 0.35 < close_pct < 0.65:
+            patterns.append("ABSORPTION")
+            bullish_score += 15
+
+        # ── Selling climax: huge down-vol bar but closes upper half ──────────
+        if vol_ratio > 2.5 and not is_up_bar and close_pct > 0.60:
+            patterns.append("SELLING_CLIMAX")
+            bullish_score += 25
+
+        # ── Effort no result: huge vol, tiny range ────────────────────────────
+        if vol_ratio > 3.0 and range_ratio < 0.40:
+            patterns.append("EFFORT_NO_RESULT")
+            # Neutral — need direction confirmation
+
+        # ── Distribution sign: high vol at multi-day high, weak close ────────
+        at_highs = float(last["High"]) >= float(hist["High"].tail(10).max()) * 0.99
+        if vol_ratio > 1.8 and at_highs and close_pct < 0.40:
+            patterns.append("DISTRIBUTION_SIGN")
+            bullish_score -= 25
+
+        # ── Volume dry-up on pullback: last 3 bars declining vol + price ─────
+        if len(hist) >= 4:
+            last3_vol   = hist["Volume"].tail(3).tolist()
+            last3_close = hist["Close"].tail(3).tolist()
+            vol_decline   = all(last3_vol[i] > last3_vol[i+1]  for i in range(2))
+            price_decline = last3_close[-1] < last3_close[0]
+            if vol_decline and price_decline and float(last["Volume"]) < avg_vol:
+                patterns.append("VOLUME_DRY_UP")
+                bullish_score += 12
+
+        if not patterns:
+            patterns.append("NORMAL")
+
+        bullish_score = min(100, max(0, bullish_score))
+        primary       = patterns[0]
+
+        _descs = {
+            "BREAKOUT_CONFIRM":  "High-volume breakout above prior range — institutional participation confirmed",
+            "ABSORPTION":        "High volume + narrow range — institutions absorbing overhead supply",
+            "SELLING_CLIMAX":    "Huge selling volume but price closed strong — buyers overwhelmed sellers",
+            "EFFORT_NO_RESULT":  "Enormous volume, tiny move — supply and demand in balance; watch next bar",
+            "DISTRIBUTION_SIGN": "High volume at highs with weak close — institutions may be distributing",
+            "VOLUME_DRY_UP":     "Volume drying up on pullback — institutions not selling; healthy correction",
+            "NORMAL":            "No unusual institutional volume pattern detected",
+        }
+        _impl = {
+            "BREAKOUT_CONFIRM":  "✅ BULLISH — strong institutional buy signal; momentum entry valid",
+            "ABSORPTION":        "✅ BULLISH — supply being removed; move up likely after consolidation",
+            "SELLING_CLIMAX":    "✅ BULLISH — exhaustion of sellers; potential reversal point",
+            "EFFORT_NO_RESULT":  "⚠️ NEUTRAL — wait for next bar direction to confirm bias",
+            "DISTRIBUTION_SIGN": "🛑 BEARISH — smart money selling; avoid new longs",
+            "VOLUME_DRY_UP":     "✅ BULLISH — pullback is healthy; continuation likely",
+            "NORMAL":            "⚪ NEUTRAL — no edge from volume analysis",
+        }
+
+        return {
+            "primary_pattern": primary,
+            "all_patterns":    patterns,
+            "bullish_score":   bullish_score,
+            "vol_ratio":       round(vol_ratio, 2),
+            "range_ratio":     round(range_ratio, 2),
+            "close_pct":       round(close_pct, 2),
+            "description":     _descs.get(primary, ""),
+            "implication":     _impl.get(primary, ""),
+        }
+    except Exception:
+        return {"primary_pattern": "ERROR", "bullish_score": 50,
+                "description": "Analysis failed", "vol_ratio": 1.0}
+
+
+def get_gamma_walls(ticker, expiry=None):
+    """
+    Identify gamma wall levels from the options chain open interest.
+
+    Call walls (high OI above spot) = resistance — market makers sell stock as
+    price approaches, creating a ceiling.
+
+    Put walls (high OI below spot) = support — market makers buy stock as price
+    falls toward the strike, creating a floor.
+
+    Also returns Max Pain (the strike where the most options expire worthless) and
+    the gravitational direction it implies for price into expiry.
+
+    Returns dict:
+      spot, expiry, call_walls, put_walls,
+      nearest_resistance, nearest_support,
+      max_pain, max_pain_distance_pct, gravity ('UP'/'DOWN'/'NEUTRAL'),
+      is_opex_week, days_to_expiry,
+      squeeze_zone (True if dominant OTM call wall is within 5% of spot)
+    """
+    try:
+        analyzer = OptionsChainAnalyzer(ticker)
+        exps     = analyzer.expirations()
+        spot     = analyzer._get_spot()
+        if not exps or spot <= 0:
+            return None
+
+        # Use nearest weekly expiry if none specified
+        if not expiry:
+            today = datetime.utcnow().date()
+            for exp in exps:
+                try:
+                    dte = (datetime.strptime(exp, "%Y-%m-%d").date() - today).days
+                    if 0 < dte <= 7:
+                        expiry = exp
+                        break
+                except ValueError:
+                    pass
+            if not expiry:
+                expiry = exps[0]
+
+        chain = analyzer.get_chain(expiry)
+        if not chain:
+            return None
+
+        calls_df = chain["calls"]
+        puts_df  = chain["puts"]
+
+        # Average OI across all strikes
+        all_oi  = pd.concat([calls_df["openInterest"].fillna(0),
+                              puts_df["openInterest"].fillna(0)])
+        avg_oi  = float(all_oi.mean()) if not all_oi.empty else 1.0
+
+        # ── Call walls (above spot — resistance) ──────────────────────────────
+        call_walls = []
+        for _, row in calls_df.iterrows():
+            oi = float(row.get("openInterest") or 0)
+            sk = float(row.get("strike")       or 0)
+            if oi > avg_oi * 1.8 and sk > spot:
+                call_walls.append({
+                    "strike":       sk,
+                    "oi":           int(oi),
+                    "strength":     round(oi / avg_oi, 1),
+                    "distance_pct": round((sk - spot) / spot * 100, 2),
+                    "type":         "RESISTANCE",
+                    "note":         "MMs sell stock as price approaches — ceiling",
+                })
+        call_walls.sort(key=lambda x: x["strike"])
+
+        # ── Put walls (below spot — support) ──────────────────────────────────
+        put_walls = []
+        for _, row in puts_df.iterrows():
+            oi = float(row.get("openInterest") or 0)
+            sk = float(row.get("strike")       or 0)
+            if oi > avg_oi * 1.8 and sk < spot:
+                put_walls.append({
+                    "strike":       sk,
+                    "oi":           int(oi),
+                    "strength":     round(oi / avg_oi, 1),
+                    "distance_pct": round((spot - sk) / spot * 100, 2),
+                    "type":         "SUPPORT",
+                    "note":         "MMs buy stock as price falls here — floor",
+                })
+        put_walls.sort(key=lambda x: x["strike"], reverse=True)
+
+        # ── Max pain ──────────────────────────────────────────────────────────
+        mp_data        = analyzer.max_pain(expiry)
+        max_pain_price = float(mp_data.get("max_pain", spot)) if mp_data else spot
+        max_pain_dist  = (spot - max_pain_price) / spot * 100 if spot > 0 else 0.0
+
+        if abs(max_pain_dist) <= 1.0:
+            gravity = "NEUTRAL"
+        elif max_pain_dist > 0:
+            gravity = "DOWN"   # price above max pain → MMs profit from dip
+        else:
+            gravity = "UP"     # price below max pain → MMs profit from rally
+
+        # ── OpEx status ───────────────────────────────────────────────────────
+        today          = datetime.utcnow().date()
+        exp_date       = datetime.strptime(expiry, "%Y-%m-%d").date()
+        days_to_expiry = max(0, (exp_date - today).days)
+        is_opex_week   = days_to_expiry <= 5
+
+        # ── Squeeze zone: nearest call wall within 3% above spot ─────────────
+        squeeze_zone = (
+            bool(call_walls)
+            and call_walls[0]["distance_pct"] <= 3.0
+        )
+
+        return {
+            "spot":                  round(spot, 2),
+            "expiry":                expiry,
+            "call_walls":            call_walls[:6],
+            "put_walls":             put_walls[:6],
+            "nearest_resistance":    call_walls[0]["strike"] if call_walls else None,
+            "nearest_support":       put_walls[0]["strike"]  if put_walls else None,
+            "max_pain":              round(max_pain_price, 2),
+            "max_pain_distance_pct": round(max_pain_dist, 2),
+            "gravity":               gravity,
+            "is_opex_week":          is_opex_week,
+            "days_to_expiry":        days_to_expiry,
+            "squeeze_zone":          squeeze_zone,
+        }
+    except Exception:
+        return None
+
+
+def detect_gamma_squeeze_setup(ticker):
+    """
+    Detect whether the options market is set up for a gamma squeeze.
+
+    A gamma squeeze occurs when:
+    1. Large OTM call open interest builds at strikes just above current price
+    2. Market makers must buy shares to delta-hedge as price rises
+    3. Buying begets more buying in a self-reinforcing loop
+
+    Checks the nearest 3 expiries.
+
+    Returns dict:
+      squeeze_potential ('HIGH' / 'MODERATE' / 'LOW'),
+      otm_call_dominance_pct, dominant_strike,
+      total_call_oi, total_put_oi, cp_ratio,
+      nearest_otm_wall_pct (distance from spot to dominant strike %),
+      description, what_happens_if_price_rises
+    """
+    try:
+        analyzer = OptionsChainAnalyzer(ticker)
+        exps     = analyzer.expirations()
+        spot     = analyzer._get_spot()
+        if not exps or spot <= 0:
+            return {"squeeze_potential": "LOW",
+                    "description": "No options data available"}
+
+        total_call_oi = 0
+        total_put_oi  = 0
+        otm_call_oi   = 0
+        dominant_strike   = None
+        max_otm_strike_oi = 0
+
+        for exp in exps[:3]:
+            chain = analyzer.get_chain(exp)
+            if not chain:
+                continue
+            calls_df = chain["calls"]
+            puts_df  = chain["puts"]
+
+            c_oi = int(calls_df["openInterest"].fillna(0).sum())
+            p_oi = int(puts_df["openInterest"].fillna(0).sum())
+            total_call_oi += c_oi
+            total_put_oi  += p_oi
+
+            # OTM calls: strikes > 1% above spot
+            otm_calls = calls_df[calls_df["strike"] > spot * 1.01]
+            for _, row in otm_calls.iterrows():
+                oi = int(row.get("openInterest") or 0)
+                otm_call_oi += oi
+                if oi > max_otm_strike_oi:
+                    max_otm_strike_oi = oi
+                    dominant_strike   = float(row["strike"])
+
+        if total_call_oi == 0 and total_put_oi == 0:
+            return {"squeeze_potential": "LOW", "description": "No open interest data"}
+
+        otm_dominance = (otm_call_oi / total_call_oi * 100
+                         if total_call_oi > 0 else 0.0)
+        cp_ratio      = (total_call_oi / total_put_oi
+                         if total_put_oi > 0 else 99.0)
+        wall_pct      = ((dominant_strike - spot) / spot * 100
+                         if dominant_strike else 99.0)
+
+        if otm_dominance > 60 and cp_ratio > 1.5:
+            potential = "HIGH"
+            desc      = (f"Heavy OTM call build — {otm_dominance:.0f}% of all calls are OTM. "
+                         f"C/P ratio {cp_ratio:.1f}. Dominant strike ${dominant_strike:.0f} "
+                         f"({wall_pct:.1f}% above spot). "
+                         "MMs must buy more shares if price rises — squeeze risk is real.")
+            what_if   = (f"If {ticker} pushes toward ${dominant_strike:.0f}, "
+                         "MMs are forced to buy ~100 shares per contract to stay delta-neutral. "
+                         "This buying accelerates the move — feedback loop.")
+        elif otm_dominance > 40 and cp_ratio > 1.0:
+            potential = "MODERATE"
+            desc      = (f"Moderate OTM call positioning ({otm_dominance:.0f}%). "
+                         f"C/P {cp_ratio:.1f}. Watch for squeeze if catalyst appears.")
+            what_if   = ("A strong catalyst could trigger forced MM hedging. "
+                         "Not a full squeeze setup but worth monitoring.")
+        else:
+            potential = "LOW"
+            desc      = (f"Balanced options positioning — OTM calls only "
+                         f"{otm_dominance:.0f}% of total calls. C/P {cp_ratio:.1f}. "
+                         "No significant gamma squeeze pressure.")
+            what_if   = "No meaningful forced buying expected from current positioning."
+
+        return {
+            "squeeze_potential":       potential,
+            "otm_call_dominance_pct":  round(otm_dominance, 1),
+            "dominant_strike":         dominant_strike,
+            "total_call_oi":           total_call_oi,
+            "total_put_oi":            total_put_oi,
+            "cp_ratio":                round(cp_ratio, 2),
+            "nearest_otm_wall_pct":    round(wall_pct, 2),
+            "description":             desc,
+            "what_happens_if_price_rises": what_if,
+        }
+    except Exception:
+        return {"squeeze_potential": "LOW",
+                "description": "Analysis failed"}

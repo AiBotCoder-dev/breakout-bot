@@ -2030,11 +2030,12 @@ with tab_options:
                                         max_value=50, value=1, step=1,
                                         key="opt_contracts_input")
 
-    ot_chain, ot_unusual, ot_strategy, ot_paper = st.tabs([
+    ot_chain, ot_unusual, ot_strategy, ot_paper, ot_smart = st.tabs([
         "⛓  Chain Viewer",
         "🔥  Unusual Activity",
         "🎯  Strategy Builder",
         "💰  Paper Trades",
+        "🏛  Smart Money",
     ])
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -2818,3 +2819,458 @@ with tab_options:
             ops_engine.reset()
             st.success("Options paper account reset to $500.", icon="🔄")
             st.rerun()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SUB-TAB 5 — SMART MONEY ANALYSIS
+    # ─────────────────────────────────────────────────────────────────────────
+    with ot_smart:
+        st.markdown('<div class="section-hdr">🏛 Smart Money Analysis</div>',
+                    unsafe_allow_html=True)
+        st.caption(
+            "Think like institutions and market makers. "
+            "**Wyckoff Cycle** detects accumulation, springs, and distribution. "
+            "**Institutional Volume** reads absorption, climax, and dry-up patterns. "
+            "**Gamma Walls** reveal MM support/resistance from options OI. "
+            "**Gamma Squeeze** flags runaway hedging setups."
+        )
+
+        _sm_ticker = st.text_input(
+            "Ticker to analyse",
+            value=opt_ticker or "SPY",
+            key="sm_ticker_input",
+            placeholder="e.g. AAPL",
+        ).upper().strip()
+
+        _sm_btn = st.button(
+            "🔍 Run Full Smart Money Analysis",
+            key="sm_run_btn",
+            use_container_width=False,
+        )
+
+        if _sm_btn and _sm_ticker:
+            with st.spinner(f"Running Wyckoff · Volume · Gamma · Squeeze analysis for {_sm_ticker}…"):
+                _smw  = ts.detect_wyckoff_phase(_sm_ticker)
+                _smv  = ts.analyze_institutional_volume(_sm_ticker)
+                _smgw = ts.get_gamma_walls(_sm_ticker)
+                _smgs = ts.detect_gamma_squeeze_setup(_sm_ticker)
+            st.session_state["sm_results"] = {
+                "ticker": _sm_ticker,
+                "wyckoff": _smw, "volume": _smv,
+                "gamma_walls": _smgw, "squeeze": _smgs,
+            }
+
+        if "sm_results" in st.session_state:
+            _sr      = st.session_state["sm_results"]
+            _sm_tk   = _sr["ticker"]
+            _smw     = _sr["wyckoff"]
+            _smv     = _sr["volume"]
+            _smgw    = _sr["gamma_walls"]
+            _smgs    = _sr["squeeze"]
+
+            st.markdown(f"## {_sm_tk}")
+            st.divider()
+
+            # ═══════════════════════════════════════════════════════════════
+            # 1. WYCKOFF PHASE
+            # ═══════════════════════════════════════════════════════════════
+            st.markdown("### 📐 Wyckoff Market Phase")
+
+            _phase = _smw.get("phase", "UNDEFINED")
+            _phase_cfg = {
+                "SPRING":         ("#3fb950", "💎", "Best long entry in the entire cycle"),
+                "ACCUMULATION":   ("#58a6ff", "🔵", "Institutions quietly loading — buy the dip"),
+                "MARKUP":         ("#3fb950", "📈", "Institutional demand driving trend — momentum valid"),
+                "REACCUMULATION": ("#58a6ff", "🔄", "Healthy pause — continuation likely"),
+                "DISTRIBUTION":   ("#e3b341", "⚠️", "Smart money selling into your strength"),
+                "MARKDOWN":       ("#f85149", "📉", "No institutional floor — avoid longs"),
+                "UNDEFINED":      ("#8b949e", "❓", "No clear structure — wait for clarity"),
+                "INSUFFICIENT_DATA": ("#8b949e", "📭", "Not enough history"),
+                "ERROR":          ("#8b949e", "💥", "Data error"),
+            }
+            _pc, _pe, _ptip = _phase_cfg.get(_phase, ("#8b949e", "❓", ""))
+            _conf    = _smw.get("confidence", 0)
+            _tradeable = _smw.get("is_tradeable", False)
+            _spring  = _smw.get("spring_detected", False)
+
+            # Big phase badge
+            st.markdown(
+                f"<div style='background:#161b22;border:2px solid {_pc};"
+                f"border-radius:10px;padding:16px 20px;margin-bottom:8px'>"
+                f"<div style='font-size:2em;font-weight:bold;color:{_pc}'>"
+                f"{_pe} {_phase.replace('_',' ')}"
+                f"</div>"
+                f"<div style='color:#c9d1d9;margin-top:4px'>{_smw.get('description','')}</div>"
+                f"<div style='margin-top:8px;padding:6px 10px;background:#21262d;"
+                f"border-radius:6px;color:{_pc};font-weight:bold'>"
+                f"ACTION: {_smw.get('action','')}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            if _spring:
+                st.success(
+                    "💎 **SPRING DETECTED** — Price dipped below the prior range low and "
+                    "recovered. This is the highest-conviction Wyckoff long entry. "
+                    "Institutions engineered this shakeout to sweep retail stops before markup.",
+                    icon="💎",
+                )
+
+            _wc1, _wc2, _wc3, _wc4, _wc5 = st.columns(5)
+            _wc1.metric("Phase",        _phase.replace("_", " "))
+            _wc2.metric("Confidence",   f"{_conf}%")
+            _wc3.metric("Position %",   f"{_smw.get('price_position_pct', 0):.0f}% of range",
+                        help="0% = at range bottom, 100% = at range top")
+            _wc4.metric("Volume Trend", f"{_smw.get('volume_trend', 1):.2f}×",
+                        help=">1 = expanding volume vs 60-day avg; <1 = contracting")
+            _wc5.metric("Tradeable?",   "✅ YES" if _tradeable else "🚫 NO")
+
+            # Range gauge: show current price position on a horizontal bar
+            _pos_pct = _smw.get("price_position_pct", 50)
+            st.markdown(
+                f"<div style='margin:8px 0 4px 0;font-size:0.8em;color:#8b949e'>"
+                f"Price position within 60-day range "
+                f"(Low ${_smw.get('period_low',0):.2f} → High ${_smw.get('period_high',0):.2f})</div>"
+                f"<div style='background:#21262d;border-radius:6px;height:14px;position:relative'>"
+                f"<div style='width:{_pos_pct}%;background:{_pc};"
+                f"height:14px;border-radius:6px'></div>"
+                f"<div style='position:absolute;top:-1px;left:{min(_pos_pct,97)}%;"
+                f"font-size:0.7em;color:#fff'>▲ {_pos_pct:.0f}%</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+            # Wyckoff education box
+            with st.expander("📚 How to use the Wyckoff Cycle — full guide", expanded=False):
+                st.markdown("""
+**The Wyckoff Cycle has 6 phases:**
+
+| Phase | What's Happening | What To Do |
+|---|---|---|
+| **Accumulation** | Institutions buying quietly near lows — range is tight, volume building | Build long position at range lows |
+| **Spring** | Fake breakdown below support, immediately reverses — a trap to shake out retail | **Best entry in the cycle** — buy the reversal with stop below spring low |
+| **Markup** | Price breaks above the range on strong volume — trend is confirmed | Enter on first pullback to VWAP or 21 EMA |
+| **Reaccumulation** | Mid-trend pause — volume dries up, range tightens | Hold longs; buy dip if volume confirms |
+| **Distribution** | Institutions selling into retail greed at highs — closes are weak | Exit longs; do not buy; consider puts |
+| **Markdown** | Price falls with no institutional support | Avoid; wait for selling climax to restart cycle |
+
+**The Spring is the single most profitable Wyckoff signal:**
+- Price violates a key support level (sweeps stops)
+- Volume spikes as retail stops are triggered and shorts pile in
+- Within 1–3 bars: price closes BACK above the support level
+- This is institutions absorbing all the panic selling and flipping it long
+- Enter on the reclaim with a tight stop below the spring low
+                """)
+
+            st.divider()
+
+            # ═══════════════════════════════════════════════════════════════
+            # 2. INSTITUTIONAL VOLUME
+            # ═══════════════════════════════════════════════════════════════
+            st.markdown("### 📊 Institutional Volume Footprint")
+
+            _vpat  = _smv.get("primary_pattern", "NORMAL")
+            _vscore = _smv.get("bullish_score", 50)
+            _vpat_colors = {
+                "BREAKOUT_CONFIRM":  "#3fb950",
+                "ABSORPTION":        "#58a6ff",
+                "SELLING_CLIMAX":    "#3fb950",
+                "VOLUME_DRY_UP":     "#58a6ff",
+                "EFFORT_NO_RESULT":  "#e3b341",
+                "DISTRIBUTION_SIGN": "#f85149",
+                "NORMAL":            "#8b949e",
+            }
+            _vc = _vpat_colors.get(_vpat, "#8b949e")
+
+            _vv1, _vv2, _vv3, _vv4 = st.columns(4)
+            _vv1.metric("Pattern",       _vpat.replace("_", " ").title())
+            _vv2.metric("Bullish Score", f"{_vscore}/100")
+            _vv3.metric("Volume Ratio",  f"{_smv.get('vol_ratio', 1):.2f}×",
+                        help="Today's volume vs 20-day average")
+            _vv4.metric("Close Strength",
+                        f"{_smv.get('close_pct', 0.5)*100:.0f}%",
+                        help="Where price closed within today's high-low range. >60% = bullish bar")
+
+            # Pattern box
+            st.markdown(
+                f"<div style='background:#161b22;border-left:4px solid {_vc};"
+                f"border-radius:6px;padding:12px 16px;margin:8px 0'>"
+                f"<b style='color:{_vc}'>{_vpat.replace('_',' ')}</b><br>"
+                f"{_smv.get('description','')}<br>"
+                f"<span style='color:{_vc}'>{_smv.get('implication','')}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+            # Show all detected patterns
+            _all_pats = _smv.get("all_patterns", [])
+            if len(_all_pats) > 1:
+                st.caption(f"All patterns detected: {' · '.join(p.replace('_',' ') for p in _all_pats)}")
+
+            with st.expander("📚 Institutional Volume Pattern Guide", expanded=False):
+                st.markdown("""
+**How to read what institutions are doing from volume:**
+
+| Pattern | Volume | Bar Shape | Meaning |
+|---|---|---|---|
+| **Breakout Confirm** | 2×+ avg | Large up bar, closes at high | Institutions are IN — real breakout |
+| **Absorption** | 2×+ avg | Narrow range, mid close | Supply being soaked up — move coming |
+| **Selling Climax** | 3×+ avg | Big down bar closes upper ½ | Sellers exhausted, buyers won — reversal likely |
+| **Volume Dry-Up** | Below avg | Small bars on pullback | Institutions NOT selling — healthy correction |
+| **Effort No Result** | 3×+ avg | Very narrow range | War between buyers/sellers — next bar decides |
+| **Distribution Sign** | 2×+ avg | At highs, closes lower ½ | Institutions selling into you — get out |
+
+**The key insight:** Institutions move billions — they **cannot** hide volume. Every time smart money loads or exits a position, volume spikes. The bar's shape tells you WHO won.
+                """)
+
+            st.divider()
+
+            # ═══════════════════════════════════════════════════════════════
+            # 3. GAMMA WALLS (Market Maker Levels)
+            # ═══════════════════════════════════════════════════════════════
+            st.markdown("### 🧱 Gamma Walls — Market Maker Support & Resistance")
+
+            if _smgw:
+                _spot     = _smgw.get("spot", 0)
+                _mp       = _smgw.get("max_pain", 0)
+                _gravity  = _smgw.get("gravity", "NEUTRAL")
+                _mp_dist  = _smgw.get("max_pain_distance_pct", 0)
+                _opex_wk  = _smgw.get("is_opex_week", False)
+                _sqz_zone = _smgw.get("squeeze_zone", False)
+                _nr       = _smgw.get("nearest_resistance")
+                _ns       = _smgw.get("nearest_support")
+
+                _gw1, _gw2, _gw3, _gw4, _gw5 = st.columns(5)
+                _gw1.metric("Current Price", f"${_spot:.2f}")
+                _gw2.metric("Max Pain",      f"${_mp:.2f}",
+                            delta=f"{_mp_dist:+.1f}% from spot",
+                            delta_color="inverse")
+                _grav_emoji = {"UP": "⬆️", "DOWN": "⬇️", "NEUTRAL": "↔️"}.get(_gravity, "↔️")
+                _gw3.metric("MM Gravity",    f"{_grav_emoji} {_gravity}",
+                            help="Direction MMs profit from — price tends to drift this way into expiry")
+                _gw4.metric("Nearest Resistance", f"${_nr:.2f}" if _nr else "—")
+                _gw5.metric("Nearest Support",    f"${_ns:.2f}" if _ns else "—")
+
+                if _opex_wk:
+                    st.warning(
+                        f"⚡ **OpEx Week** — {_smgw.get('days_to_expiry')}d to expiry. "
+                        "Max Pain gravity is strongest now. Price tends to pin toward "
+                        f"**${_mp:.2f}** into Friday close.",
+                        icon="⚡",
+                    )
+                if _sqz_zone:
+                    st.info(
+                        f"🚀 **Squeeze Zone** — dominant call wall at ${_nr:.2f} is within 3% of spot. "
+                        "If price pushes up, MMs must buy shares to delta-hedge — "
+                        "this can accelerate the move.",
+                        icon="🚀",
+                    )
+                if _gravity == "DOWN":
+                    st.warning(
+                        f"⬇️ Price is **${abs(_mp_dist):.1f}% above Max Pain** (${_mp:.2f}). "
+                        "Market makers profit most if price drifts down into expiry. "
+                        "Do not hold naked calls into this expiry.",
+                        icon="⬇️",
+                    )
+                elif _gravity == "UP":
+                    st.success(
+                        f"⬆️ Price is **${abs(_mp_dist):.1f}% below Max Pain** (${_mp:.2f}). "
+                        "Market makers profit most if price rises. "
+                        "MM hedging flow supports longs into expiry.",
+                        icon="⬆️",
+                    )
+
+                # Gamma wall chart — horizontal levels around spot
+                _cw = _smgw.get("call_walls", [])
+                _pw = _smgw.get("put_walls",  [])
+
+                if _cw or _pw:
+                    _strikes, _ois, _colors_gw, _labels_gw = [], [], [], []
+                    for w in _pw[:5]:
+                        _strikes.append(w["strike"])
+                        _ois.append(w["oi"])
+                        _colors_gw.append("#58a6ff")
+                        _labels_gw.append(f"PUT WALL {w['strength']:.1f}×")
+                    # Spot marker
+                    _strikes.append(_spot)
+                    _ois.append(0)
+                    _colors_gw.append("#ffffff")
+                    _labels_gw.append("SPOT")
+                    # Max pain
+                    _strikes.append(_mp)
+                    _ois.append(0)
+                    _colors_gw.append("#e3b341")
+                    _labels_gw.append("MAX PAIN")
+                    for w in _cw[:5]:
+                        _strikes.append(w["strike"])
+                        _ois.append(w["oi"])
+                        _colors_gw.append("#f85149")
+                        _labels_gw.append(f"CALL WALL {w['strength']:.1f}×")
+
+                    _gw_df = pd.DataFrame({
+                        "Strike": _strikes,
+                        "OI":     _ois,
+                        "Type":   _labels_gw,
+                    }).sort_values("Strike")
+
+                    _fig_gw = go.Figure()
+                    for _, _row in _gw_df.iterrows():
+                        _lc = ("#58a6ff" if "PUT" in _row["Type"]
+                               else "#f85149" if "CALL" in _row["Type"]
+                               else "#e3b341" if "PAIN" in _row["Type"]
+                               else "#ffffff")
+                        _fig_gw.add_shape(type="line",
+                            x0=0, x1=max(_ois) * 1.1 if max(_ois) > 0 else 1,
+                            y0=_row["Strike"], y1=_row["Strike"],
+                            line=dict(color=_lc, width=2,
+                                      dash="dot" if _row["OI"] == 0 else "solid"))
+                        _fig_gw.add_annotation(
+                            x=max(_ois) * 1.05 if max(_ois) > 0 else 0.5,
+                            y=_row["Strike"],
+                            text=f"${_row['Strike']:.0f} — {_row['Type']}",
+                            showarrow=False, font=dict(color=_lc, size=11),
+                            xanchor="right",
+                        )
+                    _fig_gw.update_layout(
+                        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                        font=dict(color="#c9d1d9"),
+                        height=max(300, len(_strikes) * 45),
+                        xaxis=dict(visible=False),
+                        yaxis=dict(title="Strike Price ($)", gridcolor="#21262d"),
+                        margin=dict(l=10, r=200, t=10, b=10),
+                        showlegend=False,
+                    )
+                    st.plotly_chart(_fig_gw, use_container_width=True)
+
+                # Call and Put wall tables
+                _gwt1, _gwt2 = st.columns(2)
+                with _gwt1:
+                    st.markdown("**🔴 Call Walls — Resistance**")
+                    if _cw:
+                        st.dataframe(pd.DataFrame([{
+                            "Strike":    f"${w['strike']:.2f}",
+                            "OI":        f"{w['oi']:,}",
+                            "Strength":  f"{w['strength']:.1f}× avg",
+                            "Distance":  f"+{w['distance_pct']:.1f}%",
+                        } for w in _cw]), hide_index=True, use_container_width=True)
+                        st.caption("MMs sell stock as price approaches → ceiling effect")
+                    else:
+                        st.info("No significant call walls above spot.")
+
+                with _gwt2:
+                    st.markdown("**🔵 Put Walls — Support**")
+                    if _pw:
+                        st.dataframe(pd.DataFrame([{
+                            "Strike":    f"${w['strike']:.2f}",
+                            "OI":        f"{w['oi']:,}",
+                            "Strength":  f"{w['strength']:.1f}× avg",
+                            "Distance":  f"-{w['distance_pct']:.1f}%",
+                        } for w in _pw]), hide_index=True, use_container_width=True)
+                        st.caption("MMs buy stock as price falls here → floor effect")
+                    else:
+                        st.info("No significant put walls below spot.")
+
+                with st.expander("📚 How Gamma Walls Work — Market Maker Mechanics", expanded=False):
+                    st.markdown("""
+**Market Makers (MMs) must stay delta-neutral.** When you buy a call:
+1. The MM sells it to you and immediately **buys shares** to hedge (delta hedging)
+2. As the stock rises toward a strike with huge call OI, each contract's delta **increases**
+3. The MM must buy **even more shares** to stay neutral — this buying lifts the price further
+4. Near the strike, this becomes self-reinforcing → **gamma wall magnet effect**
+
+**Call Wall** (red) = resistance ceiling:
+- MMs sold these calls and hedged with shares
+- As price approaches, they sell shares (delta decreases as they go deep ITM)
+- Net effect: selling pressure that caps the stock near that strike
+
+**Put Wall** (blue) = support floor:
+- MMs sold these puts and shorted shares to hedge
+- As price falls toward the strike, delta increases → they must buy shares to re-hedge
+- Net effect: buying pressure that cushions the stock near that strike
+
+**Max Pain** = the strike price where the maximum number of options expire worthless.
+MMs are net short options, so they profit most when options expire worthless.
+Into expiry, price is **magnetically pulled toward Max Pain** as MMs adjust hedges.
+This effect is strongest in the **final 2 days** before expiry (OpEx).
+                    """)
+
+            else:
+                st.info("No options data available — gamma walls require active options chain.", icon="📭")
+
+            st.divider()
+
+            # ═══════════════════════════════════════════════════════════════
+            # 4. GAMMA SQUEEZE DETECTOR
+            # ═══════════════════════════════════════════════════════════════
+            st.markdown("### 🚀 Gamma Squeeze Detector")
+
+            _sq_pot = _smgs.get("squeeze_potential", "LOW")
+            _sq_cfg = {
+                "HIGH":     ("#f85149", "🔥", "HIGH RISK — forced MM buying loop possible"),
+                "MODERATE": ("#e3b341", "⚡", "MODERATE — watch for catalyst"),
+                "LOW":      ("#3fb950", "✅", "LOW — no squeeze setup"),
+            }
+            _sqc, _sqe, _sqt = _sq_cfg.get(_sq_pot, ("#8b949e", "❓", ""))
+
+            st.markdown(
+                f"<div style='background:#161b22;border:2px solid {_sqc};"
+                f"border-radius:10px;padding:14px 18px'>"
+                f"<span style='font-size:1.5em;font-weight:bold;color:{_sqc}'>"
+                f"{_sqe} Squeeze Potential: {_sq_pot}</span><br>"
+                f"<span style='color:#c9d1d9'>{_smgs.get('description','')}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+            _sq1, _sq2, _sq3, _sq4 = st.columns(4)
+            _sq1.metric("OTM Call Dominance",
+                        f"{_smgs.get('otm_call_dominance_pct', 0):.0f}%",
+                        help="% of total call OI that is OTM — higher = more squeeze fuel")
+            _sq2.metric("Call/Put Ratio",
+                        f"{_smgs.get('cp_ratio', 1):.2f}",
+                        help=">1.5 = calls dominating; squeeze setups typically have C/P > 1.5")
+            _dom_strike = _smgs.get("dominant_strike")
+            _sq3.metric("Dominant Strike",
+                        f"${_dom_strike:.0f}" if _dom_strike else "—",
+                        help="The OTM call strike with the most open interest")
+            _sq4.metric("Distance to Wall",
+                        f"{_smgs.get('nearest_otm_wall_pct', 0):.1f}%",
+                        help="How far the dominant OTM strike is from current price")
+
+            if _smgs.get("what_happens_if_price_rises"):
+                st.info(_smgs["what_happens_if_price_rises"], icon="🔁")
+
+            with st.expander("📚 The Gamma Squeeze — How It Works", expanded=False):
+                st.markdown("""
+**The Gamma Squeeze is the most violent move in modern markets.**
+
+The 2021 GME / AMC squeeze was NOT just a short squeeze — it was primarily a **gamma squeeze**:
+
+**Step-by-step:**
+1. Retail traders buy large quantities of **OTM call options** (cheap lottery tickets)
+2. Market makers sell those calls and must **buy shares to delta-hedge**
+3. Buying pressure pushes the stock price **up toward the OTM strike**
+4. As price rises, the calls' delta **increases** (gamma effect)
+5. MMs must buy **more shares** to stay neutral — more buying = more price increase
+6. This feedback loop **accelerates** until the strike is reached
+7. At the strike, all the OTM calls become ITM — MMs must buy a huge amount of stock
+8. Result: **exponential move** in a matter of hours or days
+
+**How to spot it before it happens:**
+- OTM call open interest building rapidly (>60% of all calls are OTM)
+- Call/Put ratio > 1.5 (calls dominating puts)
+- Dominant OTM strike within 5% of current price
+- Unusually high options volume relative to stock volume
+
+**The risk:** Gamma squeezes unwind just as violently. Once MMs have hedged and the
+catalyst is gone, the stock can collapse 50%+ in hours as delta unwinds.
+**Trade the squeeze early or not at all.**
+                """)
+
+        else:
+            st.info(
+                "Enter a ticker and click **🔍 Run Full Smart Money Analysis** to see:\n\n"
+                "- 📐 **Wyckoff Phase** — Are institutions accumulating, marking up, or distributing?\n"
+                "- 📊 **Volume Footprint** — What does today's volume tell us about smart money activity?\n"
+                "- 🧱 **Gamma Walls** — Where are the MM support/resistance levels hiding in plain sight?\n"
+                "- 🚀 **Gamma Squeeze** — Is the options positioning set up for a runaway move?",
+                icon="🏛",
+            )

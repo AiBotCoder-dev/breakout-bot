@@ -364,6 +364,30 @@ def auto_enter_stocks(conn, paper, session, quality):
                 print(f"    {ticker:8s} — price drifted +{drift_pct:.1f}% above scan entry, skip (chasing)")
                 continue
 
+        # ── Wyckoff phase guard ───────────────────────────────────────────
+        # Skip DISTRIBUTION and MARKDOWN — institutions are exiting, not entering
+        wyckoff_phase = "UNDEFINED"
+        try:
+            _wy = ts.detect_wyckoff_phase(ticker)
+            wyckoff_phase = _wy.get("phase", "UNDEFINED")
+            if wyckoff_phase in ("DISTRIBUTION", "MARKDOWN"):
+                print(f"    {ticker:8s} — Wyckoff phase is {wyckoff_phase} (smart money exiting), skip")
+                continue
+            print(f"    {ticker:8s} — Wyckoff: {wyckoff_phase}  ({'✓ tradeable' if _wy.get('is_tradeable') else '~ neutral'})")
+        except Exception:
+            pass
+
+        # ── Institutional volume guard ────────────────────────────────────
+        inst_pattern = "NORMAL"
+        try:
+            _iv = ts.analyze_institutional_volume(ticker)
+            inst_pattern = _iv.get("primary_pattern", "NORMAL")
+            if inst_pattern == "DISTRIBUTION_SIGN":
+                print(f"    {ticker:8s} — institutional volume shows DISTRIBUTION_SIGN, skip")
+                continue
+        except Exception:
+            pass
+
         stop    = float(r.get("stop_loss")    or live_price * 0.95)
         tgt     = float(r.get("target_price") or live_price * 1.10)
         score   = float(r.get("explosive_score") or 0)
@@ -385,14 +409,18 @@ def auto_enter_stocks(conn, paper, session, quality):
             held_tickers.add(ticker)
             gross   = result.get("gross", 0)
             shares  = result.get("shares", 0)
+            spring_flag = " 💎SPRING" if wyckoff_phase == "SPRING" else ""
             print(f"    ✅ AUTO-BUY {ticker:8s}  "
                   f"price=${live_price:.2f}  stop=${stop:.2f}  tgt=${tgt:.2f}  "
-                  f"shares={shares:.1f}  cost=${gross:.2f}")
+                  f"shares={shares:.1f}  cost=${gross:.2f}  "
+                  f"wyckoff={wyckoff_phase}{spring_flag}")
             summ_now = paper.get_summary()
             send_telegram(
-                f"🤖 <b>AUTO-BUY: {ticker}</b>\n"
+                f"🤖 <b>AUTO-BUY: {ticker}</b>"
+                + (" 💎" if wyckoff_phase == "SPRING" else "") + "\n"
                 f"Score   : {score:.0f}  |  Prob: {prob:.0f}%\n"
                 f"Pattern : {pattern or '—'}\n"
+                f"Wyckoff : {wyckoff_phase}  |  Vol: {inst_pattern}\n"
                 f"Entry   : ${live_price:.2f}\n"
                 f"Stop    : ${stop:.2f}  |  Target: ${tgt:.2f}\n"
                 f"Shares  : {shares:.1f}  |  Cost: ${gross:.2f}\n"
@@ -515,6 +543,26 @@ def auto_enter_options(conn, vix_data, session, quality):
                 continue
             contracts = 1
 
+        # ── Wyckoff check for options too ─────────────────────────────────
+        wy_phase    = "UNDEFINED"
+        squeeze_str = ""
+        try:
+            _wy2 = ts.detect_wyckoff_phase(ticker)
+            wy_phase = _wy2.get("phase", "UNDEFINED")
+            if wy_phase in ("DISTRIBUTION", "MARKDOWN") and opt_type == "call":
+                print(f"    {ticker:8s} — Wyckoff {wy_phase} conflicts with call bias, skip")
+                continue
+        except Exception:
+            pass
+
+        # ── Gamma squeeze bonus flag ───────────────────────────────────────
+        try:
+            _gs2 = ts.detect_gamma_squeeze_setup(ticker)
+            if _gs2.get("squeeze_potential") == "HIGH":
+                squeeze_str = " 🚀SQUEEZE"
+        except Exception:
+            pass
+
         result = ops_engine.buy(
             ticker          = ticker,
             contract_symbol = f"{ticker}_{expiry}_{opt_type}_{strike:.0f}",
@@ -540,14 +588,18 @@ def auto_enter_options(conn, vix_data, session, quality):
 
             print(f"    ✅ AUTO-OPTIONS {ticker:8s}  {strategy}  "
                   f"${strike:.0f}{opt_type[0].upper()} {expiry} ({dte}DTE)  "
-                  f"mid=${mid:.2f}  {contracts}×  cost=${cost_total:.2f}  PoP={pop_s}")
+                  f"mid=${mid:.2f}  {contracts}×  cost=${cost_total:.2f}  "
+                  f"PoP={pop_s}  wyckoff={wy_phase}{squeeze_str}")
 
             send_telegram(
-                f"🤖 <b>AUTO-OPTIONS: {ticker}</b>\n"
+                f"🤖 <b>AUTO-OPTIONS: {ticker}</b>"
+                + (" 🚀" if squeeze_str else "") + "\n"
                 f"Strategy : {strategy}  ({dte} DTE)\n"
                 f"Contract : ${strike:.0f} {opt_type.upper()}  exp {expiry}\n"
                 f"Score    : {score:.0f}  |  Prob: {prob:.0f}%\n"
                 f"PoP      : {pop_s}  |  B/E move: {be:.1f}%\n"
+                f"Wyckoff  : {wy_phase}"
+                + (f"  |  🚀 SQUEEZE SETUP" if squeeze_str else "") + "\n"
                 f"Premium  : ${mid:.2f} × {contracts}× = ${cost_total:.2f}\n"
                 f"VIX mult : {vix_m:.1f}×  ({vix_data['regime'] if vix_data else 'N/A'})\n"
                 f"Cash     : ${result.get('cash_remaining', 0):,.2f}\n"

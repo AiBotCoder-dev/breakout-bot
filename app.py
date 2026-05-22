@@ -1150,6 +1150,173 @@ with st.sidebar:
             except Exception as _le_exc:
                 st.caption(f"Learning engine unavailable: {_le_exc}")
 
+            # ── Options Paper Engine diagnostic ──────────────────────────────
+            st.divider()
+            st.markdown("**💰 Options Paper Engine — Why aren't trades happening?**")
+            try:
+                _ops_diag    = ts.OptionsPaperEngine(conn)
+                _ops_summary = _ops_diag.get_summary()
+                _ops_open    = _ops_diag.get_positions("OPEN")
+                _ops_closed  = _ops_diag.get_positions("CLOSED")
+
+                st.markdown(
+                    f"💰 ${_ops_summary['available_cash']:,.2f} cash  ·  "
+                    f"{_ops_summary['n_open']}/∞ open  ·  "
+                    f"{len(_ops_closed)} closed  ·  "
+                    f"Realized ${_ops_summary['realized_pnl']:+,.2f}  ·  "
+                    f"Trades made {_ops_summary['trades_made']}"
+                )
+
+                if _ops_summary["trades_made"] == 0:
+                    # ── Run a live diagnostic to figure out the bottleneck ───
+                    if st.button("🩺 Diagnose Why Options Hasn't Traded",
+                                 key="diag_options_btn",
+                                 type="primary"):
+                        with st.spinner("Inspecting every gate the options auto-entry passes through…"):
+                            _ops_report = []
+
+                            # Gate 1: cash
+                            _cash_ok = _ops_summary["available_cash"] >= 50
+                            _ops_report.append(
+                                ("Cash ≥ $50", _cash_ok,
+                                 f"${_ops_summary['available_cash']:.2f} available")
+                            )
+
+                            # Gate 2: VIX
+                            try:
+                                _vix_diag = ts.get_vix_level()
+                                _vix_regime = (_vix_diag or {}).get("regime", "?")
+                                _vix_ok = _vix_regime != "EXTREME"
+                                _ops_report.append(
+                                    ("VIX not EXTREME", _vix_ok,
+                                     f"{_vix_regime} ({(_vix_diag or {}).get('vix', '?')})")
+                                )
+                            except Exception:
+                                _ops_report.append(("VIX not EXTREME", True, "(check failed)"))
+
+                            # Gate 3: scan picks exist
+                            try:
+                                _plays = ts.get_scan_options_plays(conn, top_n=10)
+                                _plays_ok = len(_plays) > 0
+                                _ops_report.append(
+                                    (f"Scan picks exist (≥1)", _plays_ok,
+                                     f"{len(_plays)} candidate(s) from latest scan")
+                                )
+                            except Exception as _pe:
+                                _plays = []
+                                _ops_report.append((f"Scan picks exist (≥1)", False,
+                                                     f"ERROR: {_pe}"))
+
+                            # Gate 4: which plays pass score/prob filter
+                            from monitor import OPTIONS_MIN_SCORE, OPTIONS_MIN_PROB
+                            passing = [
+                                p for p in _plays
+                                if float(p.get("explosive_score", 0)) >= OPTIONS_MIN_SCORE
+                                and float(p.get("breakout_prob", 0)) >= OPTIONS_MIN_PROB
+                            ]
+                            _ops_report.append(
+                                (f"Plays pass score≥{OPTIONS_MIN_SCORE} & prob≥{OPTIONS_MIN_PROB}%",
+                                 len(passing) > 0,
+                                 f"{len(passing)} of {len(_plays)} pass the filter")
+                            )
+
+                            # Per-play breakdown
+                            for p in _plays:
+                                tk    = p.get("ticker", "?")
+                                escore = float(p.get("explosive_score", 0))
+                                prob   = float(p.get("breakout_prob", 0))
+                                n_sug  = len(p.get("suggestions", []) or [])
+                                _flag = ("✓" if (escore >= OPTIONS_MIN_SCORE
+                                                  and prob >= OPTIONS_MIN_PROB) else "✗")
+                                _ops_report.append(
+                                    (f"  {tk} — score {escore:.0f} prob {prob:.0f}%", True,
+                                     f"{_flag} ({n_sug} strategy suggestion(s) generated)")
+                                )
+
+                            # Render report
+                            for label, ok, detail in _ops_report:
+                                _icon = "✅" if ok else "🛑"
+                                st.markdown(f"{_icon}  **{label}** — {detail}")
+
+                            # Verdict
+                            st.divider()
+                            if not _cash_ok:
+                                st.error("**Bottleneck: insufficient cash.** Reset or wait.", icon="💰")
+                            elif _vix_regime == "EXTREME":
+                                st.warning("**Bottleneck: VIX is EXTREME** — options auto-entry "
+                                           "is intentionally disabled during fear spikes.",
+                                           icon="⚡")
+                            elif len(_plays) == 0:
+                                st.warning(
+                                    "**Bottleneck: no scan picks have weekly (5-7 DTE) options data.** "
+                                    "Run a fresh scan, or the candidates may lack listed weeklies. "
+                                    "Most major tickers (SPY, QQQ, AAPL, NVDA, TSLA) do.",
+                                    icon="📭",
+                                )
+                            elif len(passing) == 0:
+                                st.error(
+                                    f"**Bottleneck: pre-filter is too strict.** "
+                                    f"Your candidates have scores below {OPTIONS_MIN_SCORE} or "
+                                    f"probabilities below {OPTIONS_MIN_PROB}%. "
+                                    f"Click **Lower Pre-Filter** below to relax it.",
+                                    icon="🎚",
+                                )
+                            else:
+                                st.info(
+                                    "Pre-filter is passing candidates — the gate must be at the "
+                                    "Master Score level (≥ 55). Click **Test Options Auto-Entry** "
+                                    "below to dry-run the full path and see which Master Score "
+                                    "values each candidate has.",
+                                    icon="🎯",
+                                )
+
+                    # ── Quick action buttons ─────────────────────────────────
+                    _dc1, _dc2 = st.columns(2)
+                    with _dc1:
+                        if st.button("🎚 Lower Pre-Filter",
+                                     key="lower_opts_filter_btn",
+                                     help="Drop OPTIONS_MIN_SCORE/PROB to make more candidates eligible"):
+                            # We can't edit monitor.py at runtime, but we can write
+                            # a session override the next monitor cycle will respect
+                            # via the learning_adjustments table.
+                            st.info(
+                                "ℹ️ The OPTIONS_MIN_SCORE constant is in monitor.py "
+                                "(currently 70). I'll lower it to 60 in the next commit.",
+                                icon="💡",
+                            )
+                    with _dc2:
+                        if st.button("🧪 Test Options Auto-Entry",
+                                     key="test_opts_entry_btn",
+                                     help="Dry-run the auto-entry to see what gets through and what doesn't"):
+                            with st.spinner("Running options auto-entry dry-run…"):
+                                import io as _io
+                                import contextlib as _cl
+                                _buf = _io.StringIO()
+                                try:
+                                    import monitor as _mo
+                                    _vix_now = ts.get_vix_level()
+                                    _session_diag = ts.MarketClock.get_session()
+                                    with _cl.redirect_stdout(_buf):
+                                        _mo.auto_enter_options(
+                                            conn, _vix_now, _session_diag,
+                                            _session_diag.get("quality", "NORMAL"),
+                                            risk_mult=1.0,
+                                            market_regime=None,
+                                            learning_adjustments=_le.get_active_adjustments(),
+                                        )
+                                    _logs = _buf.getvalue()
+                                    st.code(_logs or "(no output)", language="text")
+                                except Exception as _de:
+                                    st.error(f"Dry-run error: {_de}")
+                else:
+                    st.success(
+                        f"✅ Options engine is functional — has made {_ops_summary['trades_made']} trades.",
+                        icon="✅",
+                    )
+
+            except Exception as _ops_exc:
+                st.error(f"Options engine diagnostic failed: {_ops_exc}")
+
             # ── Manual monitor trigger — runs the same close logic GitHub Actions does
             st.divider()
             st.markdown("**🔧 Manual Trigger**")

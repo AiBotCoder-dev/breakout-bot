@@ -56,10 +56,10 @@ def _ai_rationale(label: str, payload: dict, max_tokens: int = 160) -> str:
 
 # ── Auto-entry configuration ──────────────────────────────────────────────────
 # Raise these thresholds to be more selective; lower them to trade more often.
-STOCK_MIN_SCORE          = 75    # explosive_score threshold for stock auto-entry
-STOCK_MIN_PROB           = 70    # breakout_prob (%) threshold for stock auto-entry
-OPTIONS_MIN_SCORE        = 70    # explosive_score threshold for options auto-entry
-OPTIONS_MIN_PROB         = 65    # breakout_prob (%) threshold for options auto-entry
+STOCK_MIN_SCORE          = 60    # explosive_score threshold for stock auto-entry
+STOCK_MIN_PROB           = 60    # breakout_prob (%) threshold for stock auto-entry
+OPTIONS_MIN_SCORE        = 55    # explosive_score threshold for options auto-entry
+OPTIONS_MIN_PROB         = 55    # breakout_prob (%) threshold for options auto-entry
 AUTO_MAX_ENTRIES_PER_RUN = 2     # max NEW entries per monitor run (each category)
 STOCK_CHASE_LIMIT_PCT    = 3.0   # skip stock entry if price > scan entry by this %
 

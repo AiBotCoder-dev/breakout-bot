@@ -17,17 +17,39 @@ import numpy as np
 # ── AI engine (optional — works without an API key, falls back silently) ──────
 # Streamlit Cloud secrets are accessible via st.secrets, NOT as os.environ vars.
 # Copy them across so ai_engine.py (which reads from os.environ) finds them.
-try:
-    import streamlit as _st_for_secrets
-    for _k in ("GROQ_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY"):
+# Also walks nested TOML sections in case the key was put inside [database] etc.
+def _hoist_ai_secrets():
+    try:
+        import streamlit as _st_for_secrets
+        _wanted = {"GROQ_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY"}
+
+        def _walk(obj, depth=0):
+            if depth > 3:
+                return
+            try:
+                for _k in obj:
+                    try:
+                        _v = obj[_k]
+                    except Exception:
+                        continue
+                    # Top-level match
+                    if _k in _wanted and isinstance(_v, str) and _v.strip():
+                        if _k not in os.environ:
+                            os.environ[_k] = _v.strip()
+                    # Recurse into nested sections (dict-like)
+                    elif hasattr(_v, "__iter__") and not isinstance(_v, (str, bytes)):
+                        _walk(_v, depth + 1)
+            except Exception:
+                pass
+
         try:
-            if _k not in os.environ and _k in _st_for_secrets.secrets:
-                os.environ[_k] = str(_st_for_secrets.secrets[_k])
+            _walk(_st_for_secrets.secrets)
         except Exception:
-            # st.secrets raises FileNotFoundError on local dev with no secrets.toml
             pass
-except Exception:
-    pass
+    except Exception:
+        pass
+
+_hoist_ai_secrets()
 
 try:
     from ai_engine import AIAnalyst

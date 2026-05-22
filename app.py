@@ -354,10 +354,15 @@ def badge(text: str, colour: str = "blue"):
 
 
 @st.cache_data(ttl=30)  # cache live prices for 30 seconds — fresh-ish + cheap
-def _fetch_live_prices(tickers: tuple) -> dict:
+def _fetch_live_prices(tickers: tuple, _salt: int = 0) -> dict:
     """Return {ticker: last_price} for all tickers.  Cached 30 s to avoid
-    hammering yfinance while still feeling near-real-time.  Cache can be
-    cleared manually via st.cache_data.clear() (the refresh buttons do this)."""
+    hammering yfinance while still feeling near-real-time.
+
+    The _salt arg is a cache-buster used by the Refresh buttons — when its
+    value changes, Streamlit treats the call as a new cache key and forces
+    a fresh fetch.  This is more reliable than .clear() across Streamlit
+    versions and prevents stale data when the user wants a true refresh."""
+    _ = _salt   # intentionally unused — purely a cache-key differentiator
     if not tickers:
         return {}
     prices = {}
@@ -791,8 +796,9 @@ with st.sidebar:
                 # _fetch_live_prices() is @st.cache_data(ttl=300) so both views
                 # show identical numbers at any moment in time.
                 _live_tickers = tuple(p["ticker"] for p in _opens)
+                _diag_salt = st.session_state.get("price_refresh_salt", 0)
                 try:
-                    _live_prices_diag = _fetch_live_prices(_live_tickers)
+                    _live_prices_diag = _fetch_live_prices(_live_tickers, _salt=_diag_salt)
                 except Exception:
                     _live_prices_diag = {}
 
@@ -880,7 +886,13 @@ with st.sidebar:
                     with _ut2:
                         if st.button("🔄 Refresh", key="diag_refresh_prices",
                                      help="Force fresh prices"):
-                            _fetch_live_prices.clear()
+                            st.session_state["price_refresh_salt"] = (
+                                st.session_state.get("price_refresh_salt", 0) + 1
+                            )
+                            try:
+                                _fetch_live_prices.clear()
+                            except Exception:
+                                pass
                             st.rerun()
                     st.caption(
                         "Matches **Paper Trades** tab — 30-second auto-refresh, "
@@ -1982,12 +1994,13 @@ with tab_paper:
     st.markdown("<hr style='border-color:#21262d;margin:4px 0 12px 0'>",
                 unsafe_allow_html=True)
 
-    # ── Fetch live prices (cached 5 min) ─────────────────────────────────────
+    # ── Fetch live prices (cached 30 s) ──────────────────────────────────────
     live_prices: dict = {}
     if positions:
         tickers_tuple = tuple(p["ticker"] for p in positions)
+        _price_salt = st.session_state.get("price_refresh_salt", 0)
         with st.spinner("Fetching live prices…"):
-            live_prices = _fetch_live_prices(tickers_tuple)
+            live_prices = _fetch_live_prices(tickers_tuple, _salt=_price_salt)
 
     # Build per-position live data
     live_pos_map: dict = {}
@@ -2076,8 +2089,14 @@ with tab_paper:
                 st.caption("⚠️ Live prices unavailable — showing cost basis (unrealized P&L = $0)")
         with _pl2:
             if st.button("🔄 Refresh now", key="paper_refresh_prices",
-                         help="Force a fresh price fetch (clears 30 s cache)"):
-                _fetch_live_prices.clear()
+                         help="Force a fresh price fetch (bypasses cache)"):
+                st.session_state["price_refresh_salt"] = (
+                    st.session_state.get("price_refresh_salt", 0) + 1
+                )
+                try:
+                    _fetch_live_prices.clear()
+                except Exception:
+                    pass
                 st.rerun()
 
     st.markdown("<br>", unsafe_allow_html=True)

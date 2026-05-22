@@ -279,17 +279,19 @@ def _get_live_price(ticker: str):
 
 # ── Auto-entry: stocks ────────────────────────────────────────────────────────
 
-def auto_enter_stocks(conn, paper, session, quality):
+def auto_enter_stocks(conn, paper, session, quality,
+                      risk_mult=1.0, market_regime=None):
     """
     Automatically open paper stock positions for tickers in the latest breakout
-    scan that meet the score/probability thresholds.
+    scan that PASS the Master Score gate.
 
     Rules:
       - Only runs during PRIME / NORMAL sessions (caller's responsibility).
-      - Skips tickers already held or that have gapped > STOCK_CHASE_LIMIT_PCT above
-        the scan entry price (avoids chasing extended moves).
+      - Skips tickers already held or that have gapped > STOCK_CHASE_LIMIT_PCT
+        above the scan entry price (avoids chasing extended moves).
+      - Master Score must be ≥ 65 (BUY decision) — single unified gate.
+      - Position size scaled by Master Score's size_multiplier × portfolio risk_mult.
       - At most AUTO_MAX_ENTRIES_PER_RUN new positions per call.
-      - PaperTradingEngine.open_position() handles position-limit + cash checks.
     """
     print(f"\n  {'─'*50}")
     print(f"  AUTO-ENTRY — Stocks")
@@ -364,29 +366,35 @@ def auto_enter_stocks(conn, paper, session, quality):
                 print(f"    {ticker:8s} — price drifted +{drift_pct:.1f}% above scan entry, skip (chasing)")
                 continue
 
-        # ── Wyckoff phase guard ───────────────────────────────────────────
-        # Skip DISTRIBUTION and MARKDOWN — institutions are exiting, not entering
-        wyckoff_phase = "UNDEFINED"
+        # ── MASTER SCORE GATE ─────────────────────────────────────────────
+        # Single unified check that replaces individual Wyckoff/volume/MTF gates.
+        # Threshold = 65 (BUY).  Score < 65 → skip.  Score ≥ 65 → size by mult.
         try:
-            _wy = ts.detect_wyckoff_phase(ticker)
-            wyckoff_phase = _wy.get("phase", "UNDEFINED")
-            if wyckoff_phase in ("DISTRIBUTION", "MARKDOWN"):
-                print(f"    {ticker:8s} — Wyckoff phase is {wyckoff_phase} (smart money exiting), skip")
-                continue
-            print(f"    {ticker:8s} — Wyckoff: {wyckoff_phase}  ({'✓ tradeable' if _wy.get('is_tradeable') else '~ neutral'})")
-        except Exception:
-            pass
+            master = ts.compute_master_score(
+                ticker, expiry=None, bias="bullish", conn=conn,
+                market_regime=market_regime,
+            )
+        except Exception as _mse:
+            print(f"    {ticker:8s} — master score failed: {_mse}, skip")
+            continue
 
-        # ── Institutional volume guard ────────────────────────────────────
-        inst_pattern = "NORMAL"
-        try:
-            _iv = ts.analyze_institutional_volume(ticker)
-            inst_pattern = _iv.get("primary_pattern", "NORMAL")
-            if inst_pattern == "DISTRIBUTION_SIGN":
-                print(f"    {ticker:8s} — institutional volume shows DISTRIBUTION_SIGN, skip")
-                continue
-        except Exception:
-            pass
+        m_score    = master.get("score", 0)
+        m_grade    = master.get("grade", "?")
+        m_decision = master.get("decision", "SKIP")
+        m_mult     = master.get("size_multiplier", 0)
+        wy_label = master["components"].get("wyckoff", {}).get("label", "")
+        mtf_label = master["components"].get("multi_tf", {}).get("label", "")
+        print(f"    {ticker:8s} — Master {m_score}/100 ({m_grade}) {m_decision} | "
+              f"{wy_label} | {mtf_label}")
+
+        if m_decision == "SKIP":
+            continue
+
+        # ── Sizing: master multiplier × portfolio risk multiplier ─────────
+        effective_mult = m_mult * risk_mult
+        if effective_mult <= 0.05:
+            print(f"    {ticker:8s} — effective sizing too low ({effective_mult:.2f}×), skip")
+            continue
 
         stop    = float(r.get("stop_loss")    or live_price * 0.95)
         tgt     = float(r.get("target_price") or live_price * 1.10)
@@ -409,23 +417,27 @@ def auto_enter_stocks(conn, paper, session, quality):
             held_tickers.add(ticker)
             gross   = result.get("gross", 0)
             shares  = result.get("shares", 0)
-            spring_flag = " 💎SPRING" if wyckoff_phase == "SPRING" else ""
-            print(f"    ✅ AUTO-BUY {ticker:8s}  "
+            wy_phase = master["components"].get("wyckoff", {}).get("label", "—")
+            spring_flag = " 💎SPRING" if "SPRING" in wy_phase.upper() else ""
+            squeeze_flag = " 🚀" if m_grade in ("A+", "A") else ""
+            print(f"    ✅ AUTO-BUY {ticker:8s}  Master={m_score}/100 ({m_grade})  "
                   f"price=${live_price:.2f}  stop=${stop:.2f}  tgt=${tgt:.2f}  "
-                  f"shares={shares:.1f}  cost=${gross:.2f}  "
-                  f"wyckoff={wyckoff_phase}{spring_flag}")
+                  f"shares={shares:.1f}  cost=${gross:.2f}{spring_flag}")
             summ_now = paper.get_summary()
             send_telegram(
-                f"🤖 <b>AUTO-BUY: {ticker}</b>"
-                + (" 💎" if wyckoff_phase == "SPRING" else "") + "\n"
-                f"Score   : {score:.0f}  |  Prob: {prob:.0f}%\n"
-                f"Pattern : {pattern or '—'}\n"
-                f"Wyckoff : {wyckoff_phase}  |  Vol: {inst_pattern}\n"
-                f"Entry   : ${live_price:.2f}\n"
-                f"Stop    : ${stop:.2f}  |  Target: ${tgt:.2f}\n"
-                f"Shares  : {shares:.1f}  |  Cost: ${gross:.2f}\n"
-                f"Cash    : ${summ_now.get('available_cash',0):,.2f}\n"
-                f"Session : {quality}  ({session.get('name','')})"
+                f"🤖 <b>AUTO-BUY: {ticker}</b>{spring_flag}{squeeze_flag}\n"
+                f"Master   : <b>{m_score}/100 ({m_grade})</b>  {m_decision}\n"
+                f"Pattern  : {pattern or '—'}\n"
+                f"{wy_phase}\n"
+                f"{master['components'].get('multi_tf', {}).get('label','')}\n"
+                f"{master['components'].get('inst_volume', {}).get('label','')}\n"
+                f"Entry    : ${live_price:.2f}\n"
+                f"Stop     : ${stop:.2f}  |  Target: ${tgt:.2f}\n"
+                f"Shares   : {shares:.1f}  |  Cost: ${gross:.2f}\n"
+                f"Sizing   : {effective_mult:.2f}× "
+                f"(master {m_mult:.1f} × risk {risk_mult:.2f})\n"
+                f"Cash     : ${summ_now.get('available_cash',0):,.2f}\n"
+                f"Session  : {quality}  ({session.get('name','')})"
             )
         else:
             print(f"    ✗ {ticker:8s} — {result.get('reason', 'failed')}")
@@ -438,15 +450,16 @@ def auto_enter_stocks(conn, paper, session, quality):
 
 # ── Auto-entry: options ───────────────────────────────────────────────────────
 
-def auto_enter_options(conn, vix_data, session, quality):
+def auto_enter_options(conn, vix_data, session, quality,
+                       risk_mult=1.0, market_regime=None):
     """
     Automatically open paper options positions using Weekly ATM strategy (5–7 DTE)
-    for tickers in the latest breakout scan that meet the thresholds.
+    for tickers that PASS the Master Score gate.
 
     Rules:
       - Skips entirely when VIX regime is EXTREME (options too expensive).
-      - Uses ts.get_position_sizing() to choose contract count.
-      - Falls back to 1 contract if sizing recommends 0.
+      - Master Score must be ≥ 65 (BUY).  Score < 65 → skip.
+      - Position size = ts.get_position_sizing() × master mult × portfolio risk_mult.
       - Skips tickers already held in open options positions.
       - At most AUTO_MAX_ENTRIES_PER_RUN new entries per call.
     """
@@ -543,25 +556,51 @@ def auto_enter_options(conn, vix_data, session, quality):
                 continue
             contracts = 1
 
-        # ── Wyckoff check for options too ─────────────────────────────────
-        wy_phase    = "UNDEFINED"
-        squeeze_str = ""
+        # ── MASTER SCORE GATE (replaces individual Wyckoff/MTF checks) ────
+        bias_for_score = "bullish" if opt_type == "call" else "bearish"
         try:
-            _wy2 = ts.detect_wyckoff_phase(ticker)
-            wy_phase = _wy2.get("phase", "UNDEFINED")
-            if wy_phase in ("DISTRIBUTION", "MARKDOWN") and opt_type == "call":
-                print(f"    {ticker:8s} — Wyckoff {wy_phase} conflicts with call bias, skip")
-                continue
-        except Exception:
-            pass
+            master = ts.compute_master_score(
+                ticker, expiry=expiry, bias=bias_for_score, conn=conn,
+                vix_data=vix_data, market_regime=market_regime,
+            )
+        except Exception as _mse:
+            print(f"    {ticker:8s} — master score failed: {_mse}, skip")
+            continue
+
+        m_score    = master.get("score", 0)
+        m_grade    = master.get("grade", "?")
+        m_decision = master.get("decision", "SKIP")
+        m_mult     = master.get("size_multiplier", 0)
+        wy_label  = master["components"].get("wyckoff", {}).get("label", "")
+        mtf_label = master["components"].get("multi_tf", {}).get("label", "")
+        print(f"    {ticker:8s} — Master {m_score}/100 ({m_grade}) {m_decision} | "
+              f"{wy_label} | {mtf_label}")
+
+        if m_decision == "SKIP":
+            continue
 
         # ── Gamma squeeze bonus flag ───────────────────────────────────────
+        squeeze_str = ""
         try:
             _gs2 = ts.detect_gamma_squeeze_setup(ticker)
             if _gs2.get("squeeze_potential") == "HIGH":
                 squeeze_str = " 🚀SQUEEZE"
         except Exception:
             pass
+
+        # ── Apply master + portfolio multipliers to contracts ──────────────
+        effective_mult = m_mult * risk_mult
+        if effective_mult <= 0.05:
+            print(f"    {ticker:8s} — effective sizing too low ({effective_mult:.2f}×), skip")
+            continue
+        contracts = max(1, int(round(contracts * effective_mult)))
+        cost_total = round(mid * 100 * contracts, 2)
+        if cost_total > cash_avail:
+            cost_total = round(mid * 100, 2)
+            if cost_total > cash_avail:
+                print(f"    {ticker:8s} — 1 contract costs ${cost_total:.2f}, cash=${cash_avail:.2f} — skip")
+                continue
+            contracts = 1
 
         result = ops_engine.buy(
             ticker          = ticker,
@@ -586,22 +625,23 @@ def auto_enter_options(conn, vix_data, session, quality):
             pop_s = f"{pop:.0f}%" if pop is not None else "—"
             vix_m = sizing.get("vix_mult", 1.0)
 
-            print(f"    ✅ AUTO-OPTIONS {ticker:8s}  {strategy}  "
+            print(f"    ✅ AUTO-OPTIONS {ticker:8s}  Master={m_score}/100 ({m_grade}) {strategy}  "
                   f"${strike:.0f}{opt_type[0].upper()} {expiry} ({dte}DTE)  "
-                  f"mid=${mid:.2f}  {contracts}×  cost=${cost_total:.2f}  "
-                  f"PoP={pop_s}  wyckoff={wy_phase}{squeeze_str}")
+                  f"mid=${mid:.2f}  {contracts}×  cost=${cost_total:.2f}  PoP={pop_s}{squeeze_str}")
 
             send_telegram(
                 f"🤖 <b>AUTO-OPTIONS: {ticker}</b>"
                 + (" 🚀" if squeeze_str else "") + "\n"
+                f"Master   : <b>{m_score}/100 ({m_grade})</b>  {m_decision}\n"
                 f"Strategy : {strategy}  ({dte} DTE)\n"
                 f"Contract : ${strike:.0f} {opt_type.upper()}  exp {expiry}\n"
-                f"Score    : {score:.0f}  |  Prob: {prob:.0f}%\n"
                 f"PoP      : {pop_s}  |  B/E move: {be:.1f}%\n"
-                f"Wyckoff  : {wy_phase}"
-                + (f"  |  🚀 SQUEEZE SETUP" if squeeze_str else "") + "\n"
+                f"{master['components'].get('wyckoff', {}).get('label','')}"
+                + (f"  |  🚀 SQUEEZE" if squeeze_str else "") + "\n"
+                f"{master['components'].get('multi_tf', {}).get('label','')}\n"
                 f"Premium  : ${mid:.2f} × {contracts}× = ${cost_total:.2f}\n"
-                f"VIX mult : {vix_m:.1f}×  ({vix_data['regime'] if vix_data else 'N/A'})\n"
+                f"Sizing   : {effective_mult:.2f}× "
+                f"(master {m_mult:.1f} × risk {risk_mult:.2f}) · VIX {vix_m:.1f}×\n"
                 f"Cash     : ${result.get('cash_remaining', 0):,.2f}\n"
                 f"Session  : {quality}  ({session.get('name','')})"
             )
@@ -739,9 +779,75 @@ def main():
         print("\n  Done.\n")
         return
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # PORTFOLIO-LEVEL RISK GATES
+    #   These run BEFORE any auto-entry to halt trading on drawdown / regime risk
+    # ══════════════════════════════════════════════════════════════════════════
+    print(f"\n  {'─'*50}")
+    print(f"  RISK ENGINE — Portfolio & Market Gates")
+
+    # ── Gate 1: Portfolio drawdown ────────────────────────────────────────────
+    portfolio_size_mult = 1.0
+    try:
+        risk = ts.get_portfolio_risk_status(paper)
+        print(f"  Portfolio status: {risk['risk_level']}")
+        print(f"    Drawdown      : {risk['drawdown_pct']:.1f}%  "
+              f"(peak ${risk['peak_equity']:,.2f} → now ${risk['current_equity']:,.2f})")
+        print(f"    Max sector    : {risk['max_sector_pct']:.0f}%")
+        print(f"    {risk['reason']}")
+        portfolio_size_mult = risk.get("size_multiplier", 1.0)
+
+        if not risk.get("can_open_new", True):
+            print(f"\n  🛑 RISK ENGINE HALTED NEW ENTRIES")
+            print(f"     Reason: {risk['reason']}")
+            send_telegram(
+                f"🛑 <b>Risk Engine HALT</b>\n"
+                f"Level    : {risk['risk_level']}\n"
+                f"Drawdown : {risk['drawdown_pct']:.1f}%\n"
+                f"Reason   : {risk['reason']}\n"
+                f"Session  : {quality}"
+            )
+            print(f"\n  Done (session={quality}, gate=HALT).\n")
+            conn.close()
+            return
+    except Exception as exc:
+        print(f"  WARN risk status check failed: {exc}")
+
+    # ── Gate 2: Market regime ─────────────────────────────────────────────────
+    market_regime = None
+    regime_size_mult = 1.0
+    try:
+        import yfinance as _yf
+        spy_hist = _yf.download("SPY", period="1y", interval="1d",
+                                progress=False, auto_adjust=True)
+        if not spy_hist.empty:
+            import pandas as _pd
+            if isinstance(spy_hist.columns, _pd.MultiIndex):
+                spy_hist.columns = spy_hist.columns.get_level_values(0)
+            market_regime = ts.MarketRegimeDetector.detect(spy_hist)
+            print(f"  Market regime : {market_regime['label']}  "
+                  f"(score {market_regime['score']:+d})")
+            print(f"    {market_regime['advice']}")
+
+            # Adjust size based on regime
+            if market_regime["regime"] == "BEAR":
+                regime_size_mult = 0.4
+                print(f"  ⚠️ BEAR regime — reducing new position sizes by 60 %")
+            elif market_regime["regime"] in ("NEUTRAL", "RECOVERING"):
+                regime_size_mult = 0.7
+                print(f"  ⚠️ {market_regime['regime']} regime — reducing new sizes by 30 %")
+    except Exception as exc:
+        print(f"  WARN market regime check failed: {exc}")
+
+    # ── Combined size multiplier passed downstream ────────────────────────────
+    combined_mult = portfolio_size_mult * regime_size_mult
+    print(f"  Combined sizing multiplier: {combined_mult:.2f}× "
+          f"(portfolio {portfolio_size_mult:.2f} × regime {regime_size_mult:.2f})")
+
     # ── Auto-entry: stocks ────────────────────────────────────────────────────
     try:
-        auto_enter_stocks(conn, paper, session, quality)
+        auto_enter_stocks(conn, paper, session, quality,
+                          risk_mult=combined_mult, market_regime=market_regime)
     except Exception as exc:
         print(f"\n  ERROR in auto_enter_stocks: {exc}")
         traceback.print_exc()
@@ -754,7 +860,8 @@ def main():
     except Exception:
         pass
     try:
-        auto_enter_options(conn, vix_for_opts, session, quality)
+        auto_enter_options(conn, vix_for_opts, session, quality,
+                           risk_mult=combined_mult, market_regime=market_regime)
     except Exception as exc:
         print(f"\n  ERROR in auto_enter_options: {exc}")
         traceback.print_exc()

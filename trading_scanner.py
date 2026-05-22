@@ -8198,3 +8198,563 @@ def detect_gamma_squeeze_setup(ticker):
     except Exception:
         return {"squeeze_potential": "LOW",
                 "description": "Analysis failed"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INSTITUTIONAL RISK ENGINE
+#   The five things that separate top 0.0001% trading desks from everyone else:
+#     1. Multi-timeframe confirmation (1h × daily × weekly alignment)
+#     2. Portfolio-level drawdown circuit breaker (auto-pause on losses)
+#     3. Correlation-aware sizing (avoid stacking into same trade)
+#     4. Sector concentration limits (no over-exposure)
+#     5. Master Score — ONE unified 0-100 number that gates every trade
+# ══════════════════════════════════════════════════════════════════════════════
+
+def confirm_multi_timeframe(ticker, bias="bullish"):
+    """
+    Check trend alignment across three timeframes — institutional gold standard.
+    A signal is high-conviction only when 1H, Daily, and Weekly all agree.
+
+      1-Hour  trend  — price vs 50 EMA on 60-min bars (intraday momentum)
+      Daily   trend  — price vs 50 SMA on daily bars (swing direction)
+      Weekly  trend  — price vs 20 SMA on weekly bars (primary trend)
+
+    Returns dict:
+      aligned          — int 0–3 (how many timeframes agree with bias)
+      score            — int 0-100 (33 per aligned TF + bonus for full stack)
+      grade            — "A+" / "A" / "B" / "C" / "F"
+      htf_trend        — categorical 'STRONG'/'NEUTRAL'/'WEAK'
+      timeframes       — per-TF dict {tf: {trend, aligned, price, sma}}
+      description      — plain-English summary
+    """
+    is_bullish = str(bias).lower() != "bearish"
+    timeframes = {}
+    aligned    = 0
+
+    # ── 1-Hour: 50 EMA on 60-min bars over 60 days ────────────────────────────
+    try:
+        h1 = yf.download(ticker, period="60d", interval="60m",
+                         progress=False, auto_adjust=True)
+        if isinstance(h1.columns, pd.MultiIndex):
+            h1.columns = h1.columns.get_level_values(0)
+        h1 = h1.dropna(subset=["Close"])
+        if len(h1) >= 50:
+            ema50 = h1["Close"].ewm(span=50, adjust=False).mean().iloc[-1]
+            spot  = float(h1["Close"].iloc[-1])
+            is_up = spot > float(ema50)
+            ok    = (is_up and is_bullish) or (not is_up and not is_bullish)
+            timeframes["1H"] = {
+                "trend":   "UP" if is_up else "DOWN",
+                "aligned": ok, "price": round(spot, 2),
+                "sma":     round(float(ema50), 2),
+                "label":   "1H: " + ("✓ aligned" if ok else "✗ against"),
+            }
+            if ok:
+                aligned += 1
+        else:
+            timeframes["1H"] = {"trend": "?", "aligned": False, "label": "1H: no data"}
+    except Exception:
+        timeframes["1H"] = {"trend": "?", "aligned": False, "label": "1H: error"}
+
+    # ── Daily: 50 SMA on daily bars over 6 months ─────────────────────────────
+    try:
+        hd = yf.download(ticker, period="6mo", interval="1d",
+                         progress=False, auto_adjust=True)
+        if isinstance(hd.columns, pd.MultiIndex):
+            hd.columns = hd.columns.get_level_values(0)
+        hd = hd.dropna(subset=["Close"])
+        if len(hd) >= 50:
+            sma50d = float(hd["Close"].tail(50).mean())
+            spotd  = float(hd["Close"].iloc[-1])
+            is_up  = spotd > sma50d
+            ok     = (is_up and is_bullish) or (not is_up and not is_bullish)
+            timeframes["Daily"] = {
+                "trend": "UP" if is_up else "DOWN",
+                "aligned": ok, "price": round(spotd, 2),
+                "sma":     round(sma50d, 2),
+                "label":   "D: " + ("✓ aligned" if ok else "✗ against"),
+            }
+            if ok:
+                aligned += 1
+        else:
+            timeframes["Daily"] = {"trend": "?", "aligned": False, "label": "D: no data"}
+    except Exception:
+        timeframes["Daily"] = {"trend": "?", "aligned": False, "label": "D: error"}
+
+    # ── Weekly: 20 SMA on weekly bars over 2 years ────────────────────────────
+    try:
+        hw = yf.download(ticker, period="2y", interval="1wk",
+                         progress=False, auto_adjust=True)
+        if isinstance(hw.columns, pd.MultiIndex):
+            hw.columns = hw.columns.get_level_values(0)
+        hw = hw.dropna(subset=["Close"])
+        if len(hw) >= 20:
+            sma20w = float(hw["Close"].tail(20).mean())
+            spotw  = float(hw["Close"].iloc[-1])
+            is_up  = spotw > sma20w
+            ok     = (is_up and is_bullish) or (not is_up and not is_bullish)
+            timeframes["Weekly"] = {
+                "trend": "UP" if is_up else "DOWN",
+                "aligned": ok, "price": round(spotw, 2),
+                "sma":     round(sma20w, 2),
+                "label":   "W: " + ("✓ aligned" if ok else "✗ against"),
+            }
+            if ok:
+                aligned += 1
+        else:
+            timeframes["Weekly"] = {"trend": "?", "aligned": False, "label": "W: no data"}
+    except Exception:
+        timeframes["Weekly"] = {"trend": "?", "aligned": False, "label": "W: error"}
+
+    # ── Score & grade ─────────────────────────────────────────────────────────
+    base_score = aligned * 33   # 0/33/66/99
+    bonus      = 1 if aligned == 3 else 0
+    score      = min(100, base_score + bonus)
+
+    if aligned == 3:
+        grade, htf = "A+", "STRONG"
+        desc       = "All three timeframes aligned — institutional-grade trend signal"
+    elif aligned == 2:
+        grade, htf = "B",  "NEUTRAL"
+        desc       = "Two of three timeframes aligned — proceed with reduced size"
+    elif aligned == 1:
+        grade, htf = "C",  "WEAK"
+        desc       = "Only one timeframe agrees — counter-trend trade, high risk"
+    else:
+        grade, htf = "F",  "WEAK"
+        desc       = "No timeframe alignment — do not trade"
+
+    return {
+        "aligned":     aligned,
+        "score":       score,
+        "grade":       grade,
+        "htf_trend":   htf,
+        "timeframes":  timeframes,
+        "description": desc,
+        "bias":        "bullish" if is_bullish else "bearish",
+    }
+
+
+def correlation_with_holdings(ticker, held_tickers, lookback_days=30):
+    """
+    Compute the maximum pairwise return correlation between *ticker* and the
+    list of currently-held tickers.  Used to avoid stacking into the same trade.
+
+    Two stocks with > 0.85 correlation are basically the same position — buying
+    both is concentrating risk, not diversifying.
+
+    Returns dict:
+      max_corr        — highest correlation found (−1 to +1)
+      avg_corr        — average correlation across all holdings
+      most_correlated — ticker of the highest-correlated holding
+      risk_level      — 'LOW' (<0.5) / 'MEDIUM' (0.5-0.75) / 'HIGH' (>0.75)
+      size_multiplier — 1.0 / 0.7 / 0.3 (downsize based on overlap)
+      advice          — plain-English recommendation
+    """
+    if not held_tickers:
+        return {"max_corr": 0.0, "avg_corr": 0.0, "most_correlated": None,
+                "risk_level": "LOW", "size_multiplier": 1.0,
+                "advice": "No existing holdings — no correlation risk."}
+
+    held_unique = sorted({str(t).upper() for t in held_tickers
+                          if str(t).upper() != str(ticker).upper()})
+    if not held_unique:
+        return {"max_corr": 0.0, "avg_corr": 0.0, "most_correlated": None,
+                "risk_level": "LOW", "size_multiplier": 1.0,
+                "advice": "Only holding the same ticker — no correlation calc needed."}
+
+    try:
+        tickers_all = [str(ticker).upper()] + held_unique
+        df = yf.download(tickers_all, period=f"{lookback_days * 2}d",
+                         interval="1d", progress=False, auto_adjust=True)
+        if df is None or df.empty:
+            return {"max_corr": 0.0, "avg_corr": 0.0, "most_correlated": None,
+                    "risk_level": "LOW", "size_multiplier": 1.0,
+                    "advice": "No price data — correlation skipped."}
+
+        if isinstance(df.columns, pd.MultiIndex):
+            close = df.xs("Close", axis=1, level=0)
+        else:
+            close = df[["Close"]].rename(columns={"Close": tickers_all[0]})
+
+        rets = close.pct_change().dropna().tail(lookback_days)
+        if len(rets) < 10:
+            return {"max_corr": 0.0, "avg_corr": 0.0, "most_correlated": None,
+                    "risk_level": "LOW", "size_multiplier": 1.0,
+                    "advice": "Not enough history — correlation skipped."}
+
+        tk_up = str(ticker).upper()
+        if tk_up not in rets.columns:
+            return {"max_corr": 0.0, "avg_corr": 0.0, "most_correlated": None,
+                    "risk_level": "LOW", "size_multiplier": 1.0,
+                    "advice": "Ticker not in returns — correlation skipped."}
+
+        corrs = {}
+        for t in held_unique:
+            if t in rets.columns:
+                c = rets[tk_up].corr(rets[t])
+                if not pd.isna(c):
+                    corrs[t] = float(c)
+
+        if not corrs:
+            return {"max_corr": 0.0, "avg_corr": 0.0, "most_correlated": None,
+                    "risk_level": "LOW", "size_multiplier": 1.0,
+                    "advice": "No valid pairs — correlation skipped."}
+
+        max_t       = max(corrs, key=lambda k: corrs[k])
+        max_c       = corrs[max_t]
+        avg_c       = sum(corrs.values()) / len(corrs)
+
+        if max_c < 0.5:
+            risk, mult = "LOW", 1.0
+            advice = f"Low correlation (max {max_c:.2f} with {max_t}) — full size OK"
+        elif max_c < 0.75:
+            risk, mult = "MEDIUM", 0.7
+            advice = f"Moderate overlap with {max_t} (corr {max_c:.2f}) — reduce size 30 %"
+        else:
+            risk, mult = "HIGH", 0.3
+            advice = f"High overlap with {max_t} (corr {max_c:.2f}) — same trade, cut size 70 %"
+
+        return {
+            "max_corr":         round(max_c, 3),
+            "avg_corr":         round(avg_c, 3),
+            "most_correlated":  max_t,
+            "risk_level":       risk,
+            "size_multiplier":  mult,
+            "advice":           advice,
+            "all_correlations": {k: round(v, 3) for k, v in corrs.items()},
+        }
+    except Exception:
+        return {"max_corr": 0.0, "avg_corr": 0.0, "most_correlated": None,
+                "risk_level": "LOW", "size_multiplier": 1.0,
+                "advice": "Correlation calc failed (data error) — assuming low."}
+
+
+def get_portfolio_risk_status(paper_engine):
+    """
+    Portfolio-level circuit breaker — measures drawdown and concentration.
+    The reason top funds outlast everyone else is they STOP TRADING when down.
+
+    Inputs:
+      paper_engine — a PaperTradingEngine instance
+
+    Returns dict:
+      drawdown_pct      — current drawdown from peak equity (positive number)
+      peak_equity       — highest equity recorded
+      current_equity    — cash + invested value
+      sector_exposure   — {sector: %_of_capital}
+      max_sector_pct    — % in most-concentrated sector
+      risk_level        — 'NORMAL' / 'CAUTION' / 'HALT' / 'EMERGENCY_HALT'
+      can_open_new      — bool — whether the bot should be opening new trades
+      size_multiplier   — 1.0 / 0.5 / 0.0 (apply to new entries)
+      reason            — why the gate is open or closed
+    """
+    try:
+        summary = paper_engine.get_summary()
+        cash    = float(summary.get("available_cash", 0))
+        real    = float(summary.get("realized_pnl",   0))
+        start   = float(summary.get("starting_capital", 1000))
+    except Exception:
+        return {"risk_level": "NORMAL", "can_open_new": True,
+                "size_multiplier": 1.0, "drawdown_pct": 0.0,
+                "reason": "Could not load portfolio state."}
+
+    # ── Current equity = cash + invested (mark to market via gross_invested) ──
+    try:
+        positions     = paper_engine.open_positions
+        invested      = sum(float(p.get("gross_invested") or 0) for p in positions)
+    except Exception:
+        positions     = []
+        invested      = 0.0
+
+    current_equity = cash + invested
+    # Peak equity = starting capital + cumulative realized P&L if positive;
+    # otherwise just the starting capital — drawdown is measured from there.
+    peak_equity    = max(start, start + max(0, real))
+
+    drawdown_pct   = (peak_equity - current_equity) / peak_equity * 100 \
+                     if peak_equity > 0 else 0.0
+    drawdown_pct   = max(0.0, round(drawdown_pct, 2))
+
+    # ── Sector exposure ───────────────────────────────────────────────────────
+    sector_exp = {}
+    if invested > 0 and current_equity > 0:
+        for p in positions:
+            sec = str(p.get("sector") or "Unknown") or "Unknown"
+            sector_exp[sec] = sector_exp.get(sec, 0.0) + float(p.get("gross_invested") or 0)
+        sector_exp = {k: round(v / current_equity * 100, 1)
+                      for k, v in sector_exp.items()}
+    max_sector_pct = max(sector_exp.values()) if sector_exp else 0.0
+
+    # ── Decision gates ────────────────────────────────────────────────────────
+    if drawdown_pct >= 25:
+        risk_level     = "EMERGENCY_HALT"
+        can_open       = False
+        size_mult      = 0.0
+        reason         = (f"🚨 EMERGENCY: drawdown {drawdown_pct:.1f}% ≥ 25 %. "
+                          "All new entries halted. Close losing positions, review strategy.")
+    elif drawdown_pct >= 15:
+        risk_level     = "HALT"
+        can_open       = False
+        size_mult      = 0.0
+        reason         = (f"🛑 HALT: drawdown {drawdown_pct:.1f}% ≥ 15 %. "
+                          "No new positions until equity recovers above peak − 10 %.")
+    elif drawdown_pct >= 8:
+        risk_level     = "CAUTION"
+        can_open       = True
+        size_mult      = 0.5
+        reason         = (f"⚠️ CAUTION: drawdown {drawdown_pct:.1f}% — "
+                          "reduce new position sizes by 50 %.")
+    elif max_sector_pct > 40:
+        risk_level     = "CAUTION"
+        can_open       = True
+        size_mult      = 0.7
+        reason         = (f"⚠️ Sector concentration {max_sector_pct:.0f}% — "
+                          "diversify; reduce new same-sector entries.")
+    else:
+        risk_level     = "NORMAL"
+        can_open       = True
+        size_mult      = 1.0
+        reason         = (f"✓ Normal operating range. Drawdown {drawdown_pct:.1f} %, "
+                          f"max sector exposure {max_sector_pct:.0f} %.")
+
+    return {
+        "drawdown_pct":    drawdown_pct,
+        "peak_equity":     round(peak_equity, 2),
+        "current_equity":  round(current_equity, 2),
+        "sector_exposure": sector_exp,
+        "max_sector_pct":  round(max_sector_pct, 1),
+        "risk_level":      risk_level,
+        "can_open_new":    can_open,
+        "size_multiplier": size_mult,
+        "reason":          reason,
+    }
+
+
+def compute_master_score(ticker, expiry, bias, conn,
+                         vix_data=None, market_regime=None,
+                         entry_quality=None, wyckoff=None,
+                         inst_volume=None, multi_tf=None,
+                         skip_slow_checks=False):
+    """
+    THE one number that decides every trade.
+
+    Weighted composite of every smart-money signal the bot computes — designed
+    so that *one* clean threshold replaces the scattered checks in monitor.py
+    and gives the user a clear "should I take this trade" answer.
+
+    Component weights (sum = 100):
+      Breakout scan score ........ 15
+      Entry quality .............. 15
+      Wyckoff phase .............. 15
+      Institutional volume ....... 10
+      Multi-timeframe alignment .. 15
+      Market regime (SPY) ........ 15
+      VIX environment ............ 10
+      Earnings safety ............ 5
+
+    Returns dict:
+      score           — 0-100 final composite
+      grade           — A+ / A / B / C / D / F
+      decision        — 'BUY' / 'WATCH' / 'SKIP'
+      size_multiplier — 1.2 / 1.0 / 0.6 / 0.3 / 0.0
+      components      — per-signal breakdown (max points, earned points, label)
+      summary         — plain-English headline
+    """
+    components = {}
+    total      = 0
+
+    # ── 1. Breakout scan (15 pts) ─────────────────────────────────────────────
+    try:
+        row = conn.execute(
+            "SELECT explosive_score, breakout_prob FROM calls "
+            "WHERE ticker=? ORDER BY scan_timestamp DESC LIMIT 1",
+            (str(ticker).upper(),)
+        ).fetchone()
+        if row:
+            exp_score = float(row.get("explosive_score") or row[0] or 0)
+            prob_     = float(row.get("breakout_prob")   or row[1] or 0)
+            blended   = (exp_score + prob_) / 2
+            pts       = round(blended / 100 * 15, 1)
+            label     = f"Breakout scan {exp_score:.0f}/100 × prob {prob_:.0f}%"
+        else:
+            pts, label = 5, "Not in latest scan — neutral 5/15"
+    except Exception:
+        pts, label = 5, "Scan unavailable — neutral 5/15"
+    total += pts
+    components["breakout_scan"] = {"max": 15, "pts": pts, "label": label}
+
+    # ── 2. Entry quality (15 pts) ─────────────────────────────────────────────
+    if entry_quality is None and not skip_slow_checks:
+        try:
+            entry_quality = get_entry_quality(ticker, bias)
+        except Exception:
+            entry_quality = None
+    if entry_quality:
+        eq_s = entry_quality.get("score", 50)
+        pts  = round(eq_s / 100 * 15, 1)
+        label = f"Entry quality {eq_s}/100 ({entry_quality.get('grade','?')})"
+    else:
+        pts, label = 7.5, "Entry quality unknown — neutral"
+    total += pts
+    components["entry_quality"] = {"max": 15, "pts": pts, "label": label}
+
+    # ── 3. Wyckoff phase (15 pts) ─────────────────────────────────────────────
+    if wyckoff is None and not skip_slow_checks:
+        try:
+            wyckoff = detect_wyckoff_phase(ticker)
+        except Exception:
+            wyckoff = None
+    _wy_map = {
+        "SPRING":         15, "ACCUMULATION":   12, "MARKUP":         11,
+        "REACCUMULATION": 9,  "UNDEFINED":      6,  "INSUFFICIENT_DATA": 6,
+        "DISTRIBUTION":   2,  "MARKDOWN":       0,  "ERROR":          6,
+    }
+    if wyckoff:
+        wp  = wyckoff.get("phase", "UNDEFINED")
+        pts = _wy_map.get(wp, 6)
+        label = f"Wyckoff: {wp.replace('_',' ')}"
+    else:
+        pts, label = 6, "Wyckoff unknown — neutral"
+    total += pts
+    components["wyckoff"] = {"max": 15, "pts": pts, "label": label}
+
+    # ── 4. Institutional volume (10 pts) ──────────────────────────────────────
+    if inst_volume is None and not skip_slow_checks:
+        try:
+            inst_volume = analyze_institutional_volume(ticker)
+        except Exception:
+            inst_volume = None
+    if inst_volume:
+        bs = inst_volume.get("bullish_score", 50)
+        # Map for bearish bias: invert score
+        if str(bias).lower() == "bearish":
+            bs = 100 - bs
+        pts = round(bs / 100 * 10, 1)
+        label = f"Vol pattern: {inst_volume.get('primary_pattern','NORMAL').replace('_',' ')}"
+    else:
+        pts, label = 5, "Volume pattern unknown — neutral"
+    total += pts
+    components["inst_volume"] = {"max": 10, "pts": pts, "label": label}
+
+    # ── 5. Multi-timeframe alignment (15 pts) ─────────────────────────────────
+    if multi_tf is None and not skip_slow_checks:
+        try:
+            multi_tf = confirm_multi_timeframe(ticker, bias)
+        except Exception:
+            multi_tf = None
+    if multi_tf:
+        a   = multi_tf.get("aligned", 0)
+        pts = a * 5    # 0/5/10/15
+        label = f"Multi-TF: {a}/3 timeframes aligned ({multi_tf.get('grade','?')})"
+    else:
+        pts, label = 7, "Multi-TF unknown — neutral"
+    total += pts
+    components["multi_tf"] = {"max": 15, "pts": pts, "label": label}
+
+    # ── 6. Market regime (15 pts) ─────────────────────────────────────────────
+    _reg_map = {
+        "STRONG BULL": 15, "BULL": 12, "NEUTRAL": 8,
+        "RECOVERING": 5,   "BEAR": 0,  "UNKNOWN": 7,
+    }
+    if market_regime:
+        reg = market_regime.get("regime", "UNKNOWN")
+        pts = _reg_map.get(reg, 7)
+        label = f"SPY regime: {market_regime.get('label', reg)}"
+    else:
+        pts, label = 7, "Market regime unknown — neutral"
+    total += pts
+    components["market_regime"] = {"max": 15, "pts": pts, "label": label}
+
+    # ── 7. VIX environment (10 pts) ───────────────────────────────────────────
+    vix = vix_data or get_vix_level()
+    if vix:
+        regime = vix.get("regime", "NORMAL")
+        pts    = {"LOW": 10, "NORMAL": 8, "ELEVATED": 4, "EXTREME": 0}.get(regime, 5)
+        label  = f"VIX {vix.get('vix',0):.1f} — {regime}"
+    else:
+        pts, label = 5, "VIX unknown — neutral"
+    total += pts
+    components["vix"] = {"max": 10, "pts": pts, "label": label}
+
+    # ── 8. Earnings safety (5 pts) ────────────────────────────────────────────
+    try:
+        if expiry:
+            ew = check_earnings_in_window(ticker, expiry)
+            if not ew.get("has_earnings"):
+                pts, label = 5, "No earnings in window"
+            else:
+                days = ew.get("days_away", 0)
+                pts   = 2 if days >= 5 else 0
+                label = f"Earnings in {days}d — risky"
+        else:
+            pts, label = 4, "No expiry checked"
+    except Exception:
+        pts, label = 3, "Earnings check failed"
+    total += pts
+    components["earnings_safety"] = {"max": 5, "pts": pts, "label": label}
+
+    score = round(min(100, max(0, total)), 1)
+
+    # ── Grade + decision ──────────────────────────────────────────────────────
+    if score >= 85:
+        grade, decision, mult = "A+", "BUY", 1.2
+        summary = "EXCEPTIONAL setup — institutional-grade alignment. Size up."
+    elif score >= 75:
+        grade, decision, mult = "A",  "BUY", 1.0
+        summary = "Strong setup — multiple signals confirm. Standard size."
+    elif score >= 65:
+        grade, decision, mult = "B",  "BUY", 0.6
+        summary = "Decent setup — proceed with reduced size."
+    elif score >= 50:
+        grade, decision, mult = "C",  "WATCH", 0.3
+        summary = "Marginal setup — watch only; paper trade size."
+    elif score >= 35:
+        grade, decision, mult = "D",  "SKIP", 0.0
+        summary = "Weak setup — skip this trade."
+    else:
+        grade, decision, mult = "F",  "SKIP", 0.0
+        summary = "Failed setup — do not trade."
+
+    return {
+        "score":           score,
+        "grade":           grade,
+        "decision":        decision,
+        "size_multiplier": mult,
+        "components":      components,
+        "summary":         summary,
+    }
+
+
+def get_market_context_full():
+    """
+    Single call that returns everything needed for the risk dashboard.
+    Bundles VIX, Fear & Greed, market regime, sector rotation, economic events.
+    Returns dict (any sub-key may be None if its call failed).
+    """
+    ctx = {}
+    try:
+        ctx["vix"] = get_vix_level()
+    except Exception:
+        ctx["vix"] = None
+    try:
+        ctx["fg"] = get_fear_greed()
+    except Exception:
+        ctx["fg"] = None
+    try:
+        spy = yf.download("SPY", period="1y", interval="1d",
+                          progress=False, auto_adjust=True)
+        if isinstance(spy.columns, pd.MultiIndex):
+            spy.columns = spy.columns.get_level_values(0)
+        ctx["regime"] = MarketRegimeDetector.detect(spy)
+    except Exception:
+        ctx["regime"] = None
+    try:
+        ctx["sectors"] = SectorRotationDetector.get()
+    except Exception:
+        ctx["sectors"] = None
+    try:
+        ctx["events"] = get_economic_events(7)
+    except Exception:
+        ctx["events"] = []
+    return ctx

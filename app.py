@@ -1958,21 +1958,34 @@ with tab_options:
         unsafe_allow_html=True,
     )
 
-    # ── Market context bar (VIX · Fear & Greed · Economic events) ────────────
+    # ── Market context bar (VIX · F&G · SPY regime · events · risk engine) ───
     @st.cache_data(ttl=300, show_spinner=False)
     def _get_market_context():
+        import yfinance as _yf_l
+        _reg = None
+        try:
+            _spy = _yf_l.download("SPY", period="1y", interval="1d",
+                                  progress=False, auto_adjust=True)
+            if not _spy.empty:
+                if isinstance(_spy.columns, pd.MultiIndex):
+                    _spy.columns = _spy.columns.get_level_values(0)
+                _reg = ts.MarketRegimeDetector.detect(_spy)
+        except Exception:
+            pass
         return {
             "vix":    ts.get_vix_level(),
             "fg":     ts.get_fear_greed(),
             "events": ts.get_economic_events(days_ahead=7),
+            "regime": _reg,
         }
 
-    _ctx = _get_market_context()
-    _vix = _ctx["vix"]
-    _fg  = _ctx["fg"]
-    _eco = _ctx["events"]
+    _ctx    = _get_market_context()
+    _vix    = _ctx["vix"]
+    _fg     = _ctx["fg"]
+    _eco    = _ctx["events"]
+    _regime = _ctx.get("regime")
 
-    _mc1, _mc2, _mc3 = st.columns([1, 1, 2])
+    _mc1, _mc2, _mc3, _mc4 = st.columns([1, 1, 1, 2])
 
     with _mc1:
         if _vix:
@@ -1992,26 +2005,64 @@ with tab_options:
                 label=f"{_fg['emoji']} Fear & Greed",
                 value=f"{_fg['score']:.0f} / 100",
                 delta=_fg["rating"],
-                help=(
-                    "0–25 Extreme Fear · 26–45 Fear · 46–55 Neutral · "
-                    "56–75 Greed · 76–100 Extreme Greed"
-                ),
+                help="0–25 Extreme Fear · 26–45 Fear · 46–55 Neutral · 56–75 Greed · 76–100 Extreme Greed",
             )
         else:
             st.metric("Fear & Greed", "—", help="Could not fetch index")
 
     with _mc3:
-        if _eco:
-            _eco_lines = "  |  ".join(
-                f"**{e['title']}** {e['date']} {e['time']}" for e in _eco[:4]
-            )
-            st.warning(
-                f"🗓 **High-impact events this week:** {_eco_lines}  "
-                "— IV can spike or crush around these. Check before entering.",
-                icon="🗓",
+        if _regime:
+            _reg_icons = {"STRONG BULL": "🟢", "BULL": "🔵", "NEUTRAL": "🟡",
+                          "RECOVERING": "🟠", "BEAR": "🔴", "UNKNOWN": "⚪"}
+            _ri = _reg_icons.get(_regime["regime"], "⚪")
+            st.metric(
+                label=f"{_ri} SPY Regime",
+                value=_regime["label"],
+                delta=f"vs 200d {_regime['dist_200_pct']:+.1f}%",
+                help=_regime["advice"],
             )
         else:
-            st.info("No high-impact USD events in the next 7 days.", icon="🗓")
+            st.metric("SPY Regime", "—", help="Could not fetch SPY data")
+
+    with _mc4:
+        # ── Portfolio Risk Engine ─────────────────────────────────────────────
+        try:
+            _re_paper = ts.PaperTradingEngine(conn)
+            _re_risk  = ts.get_portfolio_risk_status(_re_paper)
+            _re_level = _re_risk["risk_level"]
+            _re_colors = {
+                "NORMAL":         ("#3fb950", "✅"),
+                "CAUTION":        ("#e3b341", "⚠️"),
+                "HALT":           ("#f85149", "🛑"),
+                "EMERGENCY_HALT": ("#a371f7", "🚨"),
+            }
+            _re_c, _re_e = _re_colors.get(_re_level, ("#8b949e", "❔"))
+            st.markdown(
+                f"<div style='background:#161b22;border:2px solid {_re_c};"
+                f"border-radius:8px;padding:8px 12px;height:100%'>"
+                f"<div style='color:{_re_c};font-weight:bold;font-size:0.95em'>"
+                f"{_re_e} Risk Engine: {_re_level}</div>"
+                f"<div style='font-size:0.8em;color:#c9d1d9;margin-top:2px'>"
+                f"Drawdown <b>{_re_risk['drawdown_pct']:.1f}%</b>  ·  "
+                f"Sector cap <b>{_re_risk['max_sector_pct']:.0f}%</b>  ·  "
+                f"Sizing <b>{_re_risk['size_multiplier']:.2f}×</b></div>"
+                f"<div style='font-size:0.75em;color:#8b949e;margin-top:4px'>"
+                f"{_re_risk['reason']}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        except Exception as _re_exc:
+            st.info(f"Risk engine unavailable: {_re_exc}", icon="🛡")
+
+    if _eco:
+        _eco_lines = "  |  ".join(
+            f"**{e['title']}** {e['date']} {e['time']}" for e in _eco[:4]
+        )
+        st.warning(
+            f"🗓 **High-impact events this week:** {_eco_lines}  "
+            "— IV can spike or crush around these. Check before entering.",
+            icon="🗓",
+        )
 
     st.divider()
 
@@ -2429,108 +2480,127 @@ with tab_options:
                     else:
                         _rec_contracts = opt_contracts
 
-                    # ── On-demand Analysis: Entry Quality + Conviction ─────────
+                    # ── On-demand Analysis: MASTER SCORE (unified) ──────────
                     _ana_key = (
                         f"analysis_{ticker}_{sg['strategy'].replace(' ','_')}"
                         f"_{sg.get('expiry','')}"
                     )
                     _ana_btn_key = f"analyze_btn_{_ana_key}"
-                    if st.button("🔍 Analyse Entry Quality & Conviction",
+                    if st.button("🎯 Compute MASTER SCORE",
                                  key=_ana_btn_key,
-                                 help="Runs live VWAP, volume, IV rank, and flow checks (~5 s)"):
-                        with st.spinner(f"Scoring {ticker} entry quality & conviction…"):
+                                 help="Unified 0-100 score: scan + entry quality + Wyckoff + "
+                                      "volume + multi-timeframe + market regime + VIX + earnings"):
+                        with st.spinner(f"Running full Master Score analysis on {ticker}…"):
                             try:
-                                _eq   = ts.get_entry_quality(ticker, opt_bias.lower())
-                                _conv = ts.get_conviction_score(
-                                    ticker, sg.get("expiry", ""), opt_bias.lower(),
-                                    conn, _vix_data, _eq
+                                _eq    = ts.get_entry_quality(ticker, opt_bias.lower())
+                                _master = ts.compute_master_score(
+                                    ticker, expiry=sg.get("expiry", ""),
+                                    bias=opt_bias.lower(), conn=conn,
+                                    vix_data=_vix_data,
+                                    market_regime=_regime,
+                                    entry_quality=_eq,
                                 )
-                                st.session_state[_ana_key] = {"eq": _eq, "conv": _conv}
+                                st.session_state[_ana_key] = {
+                                    "eq": _eq, "master": _master,
+                                }
                             except Exception as _ae:
                                 st.warning(f"Analysis error: {_ae}", icon="⚠️")
 
                     if _ana_key in st.session_state:
-                        _ana  = st.session_state[_ana_key]
-                        _eq   = _ana.get("eq",   {})
-                        _conv = _ana.get("conv", {})
+                        _ana    = st.session_state[_ana_key]
+                        _eq     = _ana.get("eq",     {})
+                        _master = _ana.get("master", {})
 
-                        _ca1, _ca2 = st.columns(2)
+                        # ── MASTER SCORE banner ─────────────────────────────
+                        _ms_score = _master.get("score", 0)
+                        _ms_grade = _master.get("grade", "?")
+                        _ms_dec   = _master.get("decision", "?")
+                        _ms_mult  = _master.get("size_multiplier", 0)
+                        _ms_color = {
+                            "A+": "#3fb950", "A": "#3fb950", "B": "#58a6ff",
+                            "C":  "#e3b341", "D": "#f85149", "F": "#f85149",
+                        }.get(_ms_grade, "#8b949e")
+                        _dec_emoji = {"BUY": "✅", "WATCH": "👁", "SKIP": "🛑"}.get(_ms_dec, "?")
 
-                        # Entry Quality panel
-                        with _ca1:
-                            _eq_score = _eq.get("score", 0)
-                            _eq_grade = _eq.get("grade", "—")
-                            _eq_color = (
-                                "#3fb950" if _eq_grade == "A" else
-                                "#58a6ff" if _eq_grade == "B" else
-                                "#e3b341" if _eq_grade == "C" else "#f85149"
-                            )
+                        st.markdown(
+                            f"<div style='background:linear-gradient(90deg,#161b22,#0d1117);"
+                            f"border:3px solid {_ms_color};border-radius:12px;"
+                            f"padding:16px 22px;margin:8px 0'>"
+                            f"<div style='font-size:0.9em;color:#8b949e'>MASTER SCORE</div>"
+                            f"<div style='font-size:2.5em;font-weight:bold;color:{_ms_color};"
+                            f"line-height:1.1'>"
+                            f"{_ms_score:.0f}<span style='font-size:0.5em;color:#8b949e'>/100</span>  "
+                            f"<span style='font-size:0.6em'>{_ms_grade}</span></div>"
+                            f"<div style='font-size:1.1em;color:{_ms_color};margin-top:4px'>"
+                            f"{_dec_emoji} <b>{_ms_dec}</b>  ·  Size {_ms_mult:.1f}×</div>"
+                            f"<div style='color:#c9d1d9;margin-top:6px'>"
+                            f"{_master.get('summary','')}</div>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                        # ── Component breakdown ─────────────────────────────
+                        st.markdown("**Component breakdown:**")
+                        _comp_names = {
+                            "breakout_scan":   "Breakout Scan",
+                            "entry_quality":   "Entry Quality",
+                            "wyckoff":         "Wyckoff Phase",
+                            "inst_volume":     "Institutional Volume",
+                            "multi_tf":        "Multi-Timeframe",
+                            "market_regime":   "SPY Regime",
+                            "vix":             "VIX Environment",
+                            "earnings_safety": "Earnings Safety",
+                        }
+                        for _ck, _cv in (_master.get("components") or {}).items():
+                            _pts = _cv.get("pts", 0)
+                            _max = _cv.get("max", 1)
+                            _pct = int(_pts / _max * 100) if _max else 0
+                            _bc  = ("#3fb950" if _pct >= 70
+                                    else "#e3b341" if _pct >= 40 else "#f85149")
+                            _nm  = _comp_names.get(_ck, _ck)
                             st.markdown(
-                                f"<div style='background:#161b22;border:1px solid #30363d;"
-                                f"border-radius:6px;padding:10px 14px'>"
-                                f"<b>📊 Entry Quality</b>  "
-                                f"<span style='color:{_eq_color};font-size:1.3em'>"
-                                f"<b>{_eq_score}/100 {_eq_grade}</b></span><br>"
-                                f"<small>{_eq.get('advice','')}</small></div>",
+                                f"<div style='display:flex;align-items:center;gap:8px;margin:2px 0'>"
+                                f"<div style='width:150px;font-size:0.8em;color:#8b949e'>{_nm}</div>"
+                                f"<div style='flex:1;background:#21262d;border-radius:3px;height:9px'>"
+                                f"<div style='width:{_pct}%;background:{_bc};height:9px;border-radius:3px'></div></div>"
+                                f"<div style='width:55px;font-size:0.78em;text-align:right'>{_pts}/{_max}</div>"
+                                f"</div>"
+                                f"<div style='font-size:0.72em;color:#6e7681;margin-left:158px'>{_cv.get('label','')}</div>",
                                 unsafe_allow_html=True,
                             )
-                            for _ck, _cv in (_eq.get("components") or {}).items():
-                                _pts = _cv.get("pts", 0)
-                                _max = {"time_of_day": 30, "vwap": 25,
-                                        "extension": 20, "volume": 15, "iv_rank": 10}.get(_ck, 20)
-                                _pct = int(_pts / _max * 100) if _max else 0
-                                _bar_c = "#3fb950" if _pct >= 70 else "#e3b341" if _pct >= 40 else "#f85149"
-                                st.markdown(
-                                    f"<div style='display:flex;align-items:center;gap:8px;margin:2px 0'>"
-                                    f"<div style='width:90px;font-size:0.75em;color:#8b949e'>{_ck.replace('_',' ').title()}</div>"
-                                    f"<div style='flex:1;background:#21262d;border-radius:3px;height:8px'>"
-                                    f"<div style='width:{_pct}%;background:{_bar_c};height:8px;border-radius:3px'></div></div>"
-                                    f"<div style='width:30px;font-size:0.75em;text-align:right'>{_pts}</div>"
-                                    f"</div>",
-                                    unsafe_allow_html=True,
-                                )
-                                st.caption(f"  {_cv.get('label', '')}")
 
-                        # Conviction panel
-                        with _ca2:
-                            _cv_score = _conv.get("score", 0)
-                            _cv_grade = _conv.get("grade", "—")
-                            _cv_color = (
-                                "#3fb950" if _cv_grade == "A" else
-                                "#58a6ff" if _cv_grade == "B" else
-                                "#e3b341" if _cv_grade == "C" else "#f85149"
-                            )
-                            st.markdown(
-                                f"<div style='background:#161b22;border:1px solid #30363d;"
-                                f"border-radius:6px;padding:10px 14px'>"
-                                f"<b>🎯 Conviction Score</b>  "
-                                f"<span style='color:{_cv_color};font-size:1.3em'>"
-                                f"<b>{_cv_score}/100 {_cv_grade}</b></span><br>"
-                                f"<small>{_conv.get('advice','')}</small></div>",
-                                unsafe_allow_html=True,
-                            )
-                            _sig_names = {
-                                "breakout_scan":   "Breakout Scan",
-                                "unusual_flow":    "Options Flow",
-                                "vix_regime":      "VIX Regime",
-                                "earnings_safety": "Earnings Safety",
-                                "entry_quality":   "Entry Quality",
-                            }
-                            for _sk, _sv in (_conv.get("signals") or {}).items():
-                                _pts = _sv.get("pts", 0)
-                                _pct = int(_pts / 20 * 100)
-                                _bar_c = "#3fb950" if _pct >= 70 else "#e3b341" if _pct >= 40 else "#f85149"
-                                _name  = _sig_names.get(_sk, _sk.replace("_", " ").title())
+                        # ── Entry Quality sub-detail (optional expander) ───
+                        if _eq:
+                            with st.expander("📊 Entry Quality sub-signals (used inside Master Score)", expanded=False):
+                                _eq_score = _eq.get("score", 0)
+                                _eq_grade = _eq.get("grade", "—")
+                                _eq_color = ("#3fb950" if _eq_grade == "A" else
+                                             "#58a6ff" if _eq_grade == "B" else
+                                             "#e3b341" if _eq_grade == "C" else "#f85149")
                                 st.markdown(
-                                    f"<div style='display:flex;align-items:center;gap:8px;margin:2px 0'>"
-                                    f"<div style='width:110px;font-size:0.75em;color:#8b949e'>{_name}</div>"
-                                    f"<div style='flex:1;background:#21262d;border-radius:3px;height:8px'>"
-                                    f"<div style='width:{_pct}%;background:{_bar_c};height:8px;border-radius:3px'></div></div>"
-                                    f"<div style='width:30px;font-size:0.75em;text-align:right'>{_pts}/20</div>"
-                                    f"</div>",
+                                    f"<div style='color:{_eq_color}'><b>Entry Quality {_eq_score}/100 {_eq_grade}</b> — "
+                                    f"{_eq.get('advice','')}</div>",
                                     unsafe_allow_html=True,
                                 )
-                                st.caption(f"  {_sv.get('label', '')}")
+                                _max_map = {"time_of_day": 30, "vwap": 25,
+                                            "extension": 20, "volume": 15, "iv_rank": 10}
+                                for _ck, _cv in (_eq.get("components") or {}).items():
+                                    _pts = _cv.get("pts", 0)
+                                    _max = _max_map.get(_ck, 20)
+                                    _pct = int(_pts / _max * 100) if _max else 0
+                                    _bar_c = ("#3fb950" if _pct >= 70 else
+                                              "#e3b341" if _pct >= 40 else "#f85149")
+                                    st.markdown(
+                                        f"<div style='display:flex;align-items:center;gap:8px;margin:2px 0'>"
+                                        f"<div style='width:90px;font-size:0.75em;color:#8b949e'>"
+                                        f"{_ck.replace('_',' ').title()}</div>"
+                                        f"<div style='flex:1;background:#21262d;border-radius:3px;height:8px'>"
+                                        f"<div style='width:{_pct}%;background:{_bar_c};height:8px;border-radius:3px'></div></div>"
+                                        f"<div style='width:50px;font-size:0.75em;text-align:right'>{_pts}/{_max}</div>"
+                                        f"</div>"
+                                        f"<div style='font-size:0.7em;color:#6e7681;margin-left:98px'>{_cv.get('label','')}</div>",
+                                        unsafe_allow_html=True,
+                                    )
 
                     st.divider()
 

@@ -11,3 +11,4 @@ tqdm>=4.65.0
 plotly>=5.15.0
 streamlit>=1.35.0
 feedparser>=6.0.10
+tradingview-ta>=3.3.0

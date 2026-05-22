@@ -42,4 +42,9 @@ jobs:
           GROQ_API_KEY:          ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY:    ${{ secrets.OPENROUTER_API_KEY }}
+          # Optional live-data provider — Alpaca Markets (free IEX feed).
+          # Massively more reliable than yfinance for cloud runners.
+          # Sign up free: https://alpaca.markets/
+          ALPACA_API_KEY:        ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET:     ${{ secrets.ALPACA_API_SECRET }}
         run: python monitor.py

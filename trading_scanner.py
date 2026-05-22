@@ -8705,7 +8705,46 @@ def compute_master_score(ticker, expiry, bias, conn,
     total += pts
     components["earnings_safety"] = {"max": 5, "pts": pts, "label": label}
 
-    score = round(min(100, max(0, total)), 1)
+    # ── 9. TradingView TA signal (multiplier, optional) ──────────────────────
+    # Not a fixed-point component — instead it modulates the final score by
+    # up to ±15 % based on TradingView's own technical analysis verdict.
+    # If tradingview-ta isn't installed or returns no data, multiplier = 1.0.
+    tv_mult = 1.0
+    tv_sig  = {}
+    if not skip_slow_checks:
+        try:
+            from data_providers import get_tradingview_signal, get_tradingview_multiplier
+            tv_sig  = get_tradingview_signal(ticker, interval="1d") or {}
+            tv_mult = get_tradingview_multiplier(ticker, interval="1d")
+            # Invert multiplier if the trade is bearish — TV "STRONG_BUY" is
+            # a NEGATIVE for a short / put trade.
+            if str(bias).lower() == "bearish" and tv_mult != 1.0:
+                tv_mult = 2.0 - tv_mult   # 1.10 → 0.90, 0.85 → 1.15, etc.
+        except Exception:
+            tv_mult = 1.0
+    if tv_sig:
+        components["tradingview_ta"] = {
+            "max":   "×",
+            "pts":   f"{tv_mult:.2f}",
+            "label": (
+                f"TradingView {tv_sig.get('recommendation','?')} "
+                f"({tv_sig.get('buy_count',0)}B/{tv_sig.get('sell_count',0)}S/"
+                f"{tv_sig.get('neutral_count',0)}N) → {tv_mult:.2f}×"
+            ),
+            "multiplier": tv_mult,
+            "raw":        tv_sig,
+        }
+    else:
+        components["tradingview_ta"] = {
+            "max":   "×",
+            "pts":   "1.00",
+            "label": "TradingView TA unavailable — no effect (1.00×)",
+            "multiplier": 1.0,
+        }
+
+    # ── Final score with TV multiplier applied + clamped to 0-100 ────────────
+    raw_score = max(0, total)
+    score = round(min(100, raw_score * tv_mult), 1)
 
     # ── Grade + decision ──────────────────────────────────────────────────────
     if score >= 85:
@@ -8734,6 +8773,9 @@ def compute_master_score(ticker, expiry, bias, conn,
         "size_multiplier": mult,
         "components":      components,
         "summary":         summary,
+        "tv_signal":       tv_sig,
+        "tv_multiplier":   tv_mult,
+        "base_score":      round(raw_score, 1),
     }
 
 

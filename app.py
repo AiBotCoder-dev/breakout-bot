@@ -21,7 +21,8 @@ import numpy as np
 def _hoist_ai_secrets():
     try:
         import streamlit as _st_for_secrets
-        _wanted = {"GROQ_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY"}
+        _wanted = {"GROQ_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY",
+                   "ALPACA_API_KEY", "ALPACA_API_SECRET"}
 
         def _walk(obj, depth=0):
             if depth > 3:
@@ -357,21 +358,32 @@ def badge(text: str, colour: str = "blue"):
 def _fetch_live_prices(tickers: tuple, _salt: int = 0) -> dict:
     """Return {ticker: last_price} for all tickers.
 
-    Uses a multi-strategy fallback because yfinance is unreliable from
-    cloud hosts (rate-limiting, partial fills, occasional empty responses):
-        1. Bulk download   (5-min bars over 2 days)
-        2. Bulk download   (1-day bars over 5 days)  — daily close fallback
-        3. Per-ticker      (yf.Ticker.fast_info.last_price)
-        4. Per-ticker      (1-day bar download)
+    Uses the unified data_providers layer:
+      1. Alpaca Markets   (official live IEX feed, no rate limiting)
+      2. yfinance          (fallback, can be rate-limited on cloud)
 
-    Returns whatever it managed to fetch.  Missing tickers are simply absent
-    from the dict so callers can show "—" instead of misleading fake values.
+    Alpaca is dramatically more reliable on Streamlit Cloud than yfinance
+    — set ALPACA_API_KEY + ALPACA_API_SECRET in Streamlit secrets to enable.
+    Sign up free: https://alpaca.markets/
     """
     _ = _salt   # intentionally unused — purely a cache-key differentiator
     if not tickers:
         return {}
-    prices: dict = {}
-    remaining = set(tickers)
+
+    # ── Try the unified data layer first (Alpaca → yfinance) ─────────────────
+    try:
+        from data_providers import get_live_prices as _dp_get
+        prices_dp = _dp_get(tickers, allow_yfinance_fallback=False)
+        if prices_dp and len(prices_dp) == len(tickers):
+            return prices_dp
+    except Exception:
+        prices_dp = {}
+
+    # If Alpaca got some but not all, fill in the rest via yfinance below
+    prices: dict = dict(prices_dp)
+    remaining = set(t.upper() for t in tickers) - set(prices.keys())
+    if not remaining:
+        return prices
 
     def _extract(raw, target_tickers):
         """Pull last Close per ticker from a yfinance dataframe."""

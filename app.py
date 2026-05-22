@@ -694,7 +694,7 @@ with st.sidebar:
             )
 
             # ── Debug: show what we actually detect ─────────────────────────
-            with st.expander("🔧 Debug — why isn't this working?", expanded=False):
+            with st.expander("🔧 Debug — why isn't this working?", expanded=True):
                 _dbg = {}
                 for _k in ("GROQ_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY"):
                     _v_env = os.environ.get(_k, "")
@@ -711,10 +711,33 @@ with st.sidebar:
                         "secrets preview": (_v_sec[:6] + "…") if _v_sec and "<err" not in _v_sec else _v_sec or "—",
                     }
                 st.json(_dbg)
+
+                # ── Show ALL top-level keys in st.secrets ───────────────────
+                st.markdown("**All top-level keys Streamlit currently sees in `st.secrets`:**")
+                try:
+                    _all_keys = []
+                    for _k in st.secrets:
+                        _v = st.secrets[_k]
+                        if isinstance(_v, dict):
+                            _all_keys.append(f"`[{_k}]` (section) — sub-keys: "
+                                             f"{list(_v.keys())}")
+                        else:
+                            _preview = str(_v)[:6] + "…" if _v else "(empty)"
+                            _all_keys.append(f"`{_k}` = {_preview}")
+                    if _all_keys:
+                        for _line in _all_keys:
+                            st.markdown(f"- {_line}")
+                    else:
+                        st.warning("st.secrets is **empty** — no secrets are saved!")
+                except Exception as _se:
+                    st.error(f"Could not read st.secrets at all: {_se}")
+
                 st.caption(
-                    "If `in st.secrets` is True but `in os.environ` is False, the "
-                    "bridge in app.py imports failed — reboot the app from "
-                    "Streamlit Cloud dashboard."
+                    "**If GROQ_API_KEY is NOT in the list above** → "
+                    "1) Open dashboard → ⚙ Settings → Secrets, "
+                    "2) Confirm the key is there, "
+                    "3) Click **Save** (this is the step usually missed), "
+                    "4) Click ⋮ → **Reboot app** at the top of the dashboard."
                 )
         else:
             st.caption(f"⚡ Powered by **{_AI.provider.upper()}**")

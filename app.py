@@ -1092,14 +1092,32 @@ with st.sidebar:
                         unsafe_allow_html=True,
                     )
                     if not _applied:
-                        if st.button("✅ Mark as Applied",
-                                     key=f"mark_applied_{_latest.get('id')}",
-                                     help="Track which suggestions you've implemented"):
-                            try:
-                                _le.mark_suggestion_applied(_latest.get("id"))
-                                st.rerun()
-                            except Exception:
-                                pass
+                        _ab1, _ab2 = st.columns(2)
+                        with _ab1:
+                            if st.button("⚡ Apply Now",
+                                         key=f"apply_now_{_latest.get('id')}",
+                                         type="primary",
+                                         help="Auto-parse the Action and apply the change to the DB"):
+                                try:
+                                    _res = _le.apply_suggestion(_latest.get("id"))
+                                    if _res.get("ok"):
+                                        st.success(f"✅ {_res['message']}", icon="✅")
+                                        st.balloons()
+                                        st.rerun()
+                                    else:
+                                        st.warning(_res.get("message", "Couldn't auto-apply"),
+                                                   icon="⚠️")
+                                except Exception as _ae:
+                                    st.error(f"Apply failed: {_ae}", icon="❌")
+                        with _ab2:
+                            if st.button("✓ Mark as Applied (no change)",
+                                         key=f"mark_applied_{_latest.get('id')}",
+                                         help="Mark without applying — for suggestions you implemented manually"):
+                                try:
+                                    _le.mark_suggestion_applied(_latest.get("id"))
+                                    st.rerun()
+                                except Exception:
+                                    pass
                 else:
                     st.caption("No suggestion yet for today.")
                     if st.button("🪄 Generate Now", key="gen_suggestion_now",

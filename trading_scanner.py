@@ -9700,3 +9700,153 @@ CREATE TABLE IF NOT EXISTS paper_suggestions (
             return True
         except Exception:
             return False
+
+    # ── Apply suggestions automatically ───────────────────────────────────────
+
+    def set_min_master_score(self, new_score: float) -> bool:
+        """Update min_master_score in paper_adjustments table."""
+        try:
+            self.conn.execute(
+                "UPDATE paper_adjustments SET min_master_score=?, updated_at=? "
+                "WHERE id=1",
+                (float(new_score), datetime.utcnow().isoformat())
+            )
+            return True
+        except Exception:
+            return False
+
+    def set_size_multiplier_cap(self, new_cap: float) -> bool:
+        """Update size_multiplier_cap in paper_adjustments table."""
+        try:
+            self.conn.execute(
+                "UPDATE paper_adjustments SET size_multiplier_cap=?, updated_at=? "
+                "WHERE id=1",
+                (float(new_cap), datetime.utcnow().isoformat())
+            )
+            return True
+        except Exception:
+            return False
+
+    def add_to_blacklist(self, kind: str, entry: str) -> bool:
+        """Append *entry* to sector_blacklist / pattern_blacklist / wyckoff_blacklist.
+
+        kind: 'sector' | 'pattern' | 'wyckoff'
+        """
+        import json as _json
+        col_map = {
+            "sector":  "sector_blacklist",
+            "pattern": "pattern_blacklist",
+            "wyckoff": "wyckoff_blacklist",
+        }
+        col = col_map.get(kind)
+        if not col or not entry:
+            return False
+        try:
+            row = self.conn.execute(
+                f"SELECT {col} FROM paper_adjustments WHERE id=1"
+            ).fetchone()
+            current = []
+            if row:
+                try:
+                    current = _json.loads(_row_get(row, col, "[]") or "[]")
+                except Exception:
+                    current = []
+            if entry not in current:
+                current.append(entry)
+            self.conn.execute(
+                f"UPDATE paper_adjustments SET {col}=?, updated_at=? WHERE id=1",
+                (_json.dumps(current), datetime.utcnow().isoformat())
+            )
+            return True
+        except Exception:
+            return False
+
+    def apply_suggestion(self, suggestion_id: int) -> dict:
+        """Auto-apply a stored suggestion by parsing its action text.
+
+        Returns dict:
+          ok       — True if the change was applied to the DB
+          message  — what changed (or why it couldn't)
+          category — the suggestion category
+          before   — previous value (if applicable)
+          after    — new value (if applicable)
+        """
+        import re as _re
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM paper_suggestions WHERE id=?",
+                (int(suggestion_id),)
+            ).fetchone()
+        except Exception:
+            row = None
+        if not row:
+            return {"ok": False, "message": "Suggestion not found"}
+
+        category = (_row_get(row, "category", "") or "").lower().strip()
+        action   = (_row_get(row, "action",   "") or "").strip()
+        action_l = action.lower()
+        adj = self.get_active_adjustments()
+
+        # ── THRESHOLDS — min_master_score / size_multiplier_cap ──────────────
+        if category == "thresholds":
+            if "min_master_score" in action_l or "master score" in action_l:
+                m = _re.search(r"(\d+(?:\.\d+)?)", action)
+                if m:
+                    new_val = float(m.group(1))
+                    if not (0 <= new_val <= 100):
+                        return {"ok": False,
+                                "message": f"Parsed value {new_val} is out of range 0-100"}
+                    before = float(adj.get("min_master_score", 65))
+                    if self.set_min_master_score(new_val):
+                        self.mark_suggestion_applied(suggestion_id)
+                        return {"ok": True, "category": category,
+                                "before": before, "after": new_val,
+                                "message": f"min_master_score changed from {before:.1f} to {new_val:.1f}"}
+                return {"ok": False,
+                        "message": "Could not parse a numeric value from the action text"}
+            if "size_multiplier_cap" in action_l or "size cap" in action_l or "sizing cap" in action_l:
+                m = _re.search(r"(\d+(?:\.\d+)?)", action)
+                if m:
+                    new_val = float(m.group(1))
+                    if new_val > 2:    # they typed it as a percentage e.g. 75
+                        new_val = new_val / 100
+                    if not (0 < new_val <= 1.5):
+                        return {"ok": False, "message": f"Parsed cap {new_val} out of range"}
+                    before = float(adj.get("size_multiplier_cap", 1.0))
+                    if self.set_size_multiplier_cap(new_val):
+                        self.mark_suggestion_applied(suggestion_id)
+                        return {"ok": True, "category": category,
+                                "before": before, "after": new_val,
+                                "message": f"size_multiplier_cap changed from {before:.2f}× to {new_val:.2f}×"}
+            return {"ok": False, "message": "Threshold suggestion couldn't be auto-parsed — apply manually"}
+
+        # ── BLACKLISTS — sector / pattern / wyckoff ─────────────────────────
+        if category == "blacklists":
+            # Look for quoted entries in the action text
+            quoted = _re.findall(r'["\']([^"\']+)["\']', action)
+            kinds = []
+            if "sector" in action_l:
+                kinds.append("sector")
+            if "pattern" in action_l:
+                kinds.append("pattern")
+            if "wyckoff" in action_l:
+                kinds.append("wyckoff")
+            if not kinds:
+                kinds = ["sector"]
+            added = []
+            for kind in kinds:
+                for entry in quoted:
+                    if self.add_to_blacklist(kind, entry):
+                        added.append(f"{kind}:{entry}")
+            if added:
+                self.mark_suggestion_applied(suggestion_id)
+                return {"ok": True, "category": category,
+                        "message": f"Blacklist additions: {', '.join(added)}"}
+            return {"ok": False, "message": "No quoted blacklist entry found in action text"}
+
+        # ── UNSUPPORTED categories ─────────────────────────────────────────
+        return {
+            "ok": False, "category": category,
+            "message": ("This suggestion category requires manual code changes — "
+                        "I can help you implement it but can't auto-apply.")
+        }

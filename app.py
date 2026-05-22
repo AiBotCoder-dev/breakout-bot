@@ -1528,6 +1528,160 @@ with st.sidebar:
                 st.session_state.ai_chat_history = []
                 st.rerun()
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # 📰 NEWS TRACKER — Live market news classified by AI
+    # ══════════════════════════════════════════════════════════════════════════
+    with st.expander("📰 News Tracker", expanded=False):
+        st.caption(
+            "Pulls live headlines from MarketWatch, CNBC, Investing.com, "
+            "Federal Reserve, and Yahoo — categorizes each as "
+            "Health / War / Tariffs / Negotiations / Earnings / Regulatory / "
+            "Macro / Product / Legal, and rates impact + sentiment. Feeds "
+            "into your Master Score and the auto-entry decision."
+        )
+
+        if conn is None:
+            st.info("Database unavailable.")
+        else:
+            try:
+                from news_agent import NewsAgent
+                _na = NewsAgent(conn, ai_analyst=_AI)
+
+                # ── Pull / refresh controls ──────────────────────────────────
+                _nc1, _nc2 = st.columns([3, 1])
+                with _nc1:
+                    _hours = st.slider("Lookback window (hours)", 1, 72, 24,
+                                       key="news_hours_slider")
+                with _nc2:
+                    if st.button("🔄 Pull Latest",
+                                 key="news_refresh_btn",
+                                 type="primary",
+                                 help="Fetch + classify new headlines (uses AI if configured)"):
+                        with st.spinner("Pulling news from all sources & classifying…"):
+                            try:
+                                _r = _na.run_cycle(max_per_source=15, max_new=20)
+                                st.success(
+                                    f"✓ Pulled {_r['fetched']}  ·  "
+                                    f"new {_r['new']}  ·  "
+                                    f"high-impact {_r['high_imp']}",
+                                    icon="📰",
+                                )
+                            except Exception as _re:
+                                st.error(f"Fetch failed: {_re}")
+
+                # ── Market pulse ────────────────────────────────────────────
+                try:
+                    _pulse = _na.get_market_pulse(hours=_hours)
+                    _mood = _pulse.get("mood", "NEUTRAL")
+                    _mood_colors = {
+                        "BULLISH":         ("#3fb950", "🟢"),
+                        "MILDLY_BULLISH":  ("#58a6ff", "🔵"),
+                        "NEUTRAL":         ("#8b949e", "⚪"),
+                        "MILDLY_BEARISH":  ("#e3b341", "🟡"),
+                        "BEARISH":         ("#f85149", "🔴"),
+                    }
+                    _mc, _me = _mood_colors.get(_mood, ("#8b949e", "⚪"))
+                    st.markdown(
+                        f"<div style='background:#161b22;border-left:4px solid {_mc};"
+                        f"border-radius:6px;padding:8px 12px;margin:6px 0'>"
+                        f"<b>{_me} Market Pulse: <span style='color:{_mc}'>{_mood.replace('_',' ')}</span></b>"
+                        f"  ·  net sentiment {_pulse.get('net_sentiment', 0):+.2f}"
+                        f"  ·  {_pulse.get('n_events', 0)} events in last {_hours}h"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    # Category counts
+                    _cat_counts = _pulse.get("category_counts", {})
+                    if _cat_counts:
+                        _cat_str = "  ·  ".join(
+                            f"{k}: {v}" for k, v in sorted(
+                                _cat_counts.items(), key=lambda x: -x[1])[:5]
+                        )
+                        st.caption(f"📊 By category: {_cat_str}")
+                except Exception:
+                    pass
+
+                # ── Recent high-impact headlines ─────────────────────────────
+                _market_news = _na.get_recent_market_news(hours=_hours,
+                                                            min_impact=4,
+                                                            limit=15)
+                if _market_news:
+                    st.markdown(f"**🗞 Top {len(_market_news)} headlines (impact ≥ 4):**")
+                    for _ev in _market_news[:10]:
+                        _sent = (_ev.get("sentiment") or "NEUTRAL").upper()
+                        _cat  = _ev.get("category", "OTHER")
+                        _imp  = int(_ev.get("impact_score") or 0)
+                        _hl   = (_ev.get("headline") or "")[:160]
+                        _src  = _ev.get("source", "")
+                        _url  = _ev.get("url", "")
+                        _tickers_str = _ev.get("affected_tickers", "") or ""
+                        _emoji = {
+                            "POSITIVE": "✅",
+                            "NEGATIVE": "🛑",
+                            "NEUTRAL":  "⚪",
+                        }.get(_sent, "⚪")
+                        _bar_c = ("#3fb950" if _sent == "POSITIVE" else
+                                  "#f85149" if _sent == "NEGATIVE" else "#8b949e")
+                        _line = (
+                            f"<div style='background:#0d1117;border-left:3px solid {_bar_c};"
+                            f"padding:6px 10px;margin:3px 0;border-radius:4px'>"
+                            f"<div style='font-size:0.7em;color:#8b949e'>"
+                            f"{_emoji} {_cat}  ·  impact {_imp}/10  ·  "
+                            f"{_src}"
+                            + (f"  ·  affects: <b>{_tickers_str}</b>" if _tickers_str else "")
+                            + f"</div>"
+                            f"<div style='font-size:0.88em;color:#e6edf3;margin-top:2px'>"
+                        )
+                        if _url:
+                            _line += f"<a href='{_url}' target='_blank' style='color:#e6edf3;text-decoration:none'>{_hl}</a>"
+                        else:
+                            _line += _hl
+                        _line += "</div></div>"
+                        st.markdown(_line, unsafe_allow_html=True)
+                else:
+                    st.info("No news events in lookback window. Click 🔄 Pull Latest to fetch.",
+                            icon="📭")
+
+                # ── Per-position news impact ─────────────────────────────────
+                try:
+                    _p_eng_news = ts.PaperTradingEngine(conn)
+                    _open_for_news = _p_eng_news.open_positions
+                    if _open_for_news:
+                        st.markdown("**📊 News impact on your open positions:**")
+                        _pos_rows = []
+                        for _p in _open_for_news[:10]:
+                            _tk = _p.get("ticker", "?")
+                            try:
+                                _ni = _na.get_news_impact(_tk, hours=_hours)
+                                _flag = "🛑 SKIP" if _ni.get("should_skip") else (
+                                    "✅" if _ni.get("net_sentiment", 0) > 0.1 else
+                                    "⚪" if abs(_ni.get("net_sentiment", 0)) < 0.1 else
+                                    "🟡"
+                                )
+                                _pos_rows.append({
+                                    "Ticker":     _tk,
+                                    "Events":     _ni.get("n_events", 0),
+                                    "Net":        f"{_ni.get('net_sentiment', 0):+.2f}",
+                                    "Max Impact": _ni.get("max_impact", 0),
+                                    "Category":   _ni.get("dominant_category", "—"),
+                                    "Modifier":   f"{_ni.get('score_modifier', 1.0):.2f}×",
+                                    "Status":     _flag,
+                                })
+                            except Exception:
+                                _pos_rows.append({
+                                    "Ticker": _tk, "Events": "?", "Net": "—",
+                                    "Max Impact": "—", "Category": "—",
+                                    "Modifier": "—", "Status": "err"
+                                })
+                        st.dataframe(pd.DataFrame(_pos_rows), hide_index=True,
+                                     use_container_width=True)
+                except Exception:
+                    pass
+
+            except Exception as _ne:
+                st.error(f"News Tracker error: {_ne}")
+
     st.divider()
 
     universe = st.selectbox(

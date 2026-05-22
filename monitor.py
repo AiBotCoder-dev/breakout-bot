@@ -390,6 +390,21 @@ def auto_enter_stocks(conn, paper, session, quality,
                 print(f"    {ticker:8s} — price drifted +{drift_pct:.1f}% above scan entry, skip (chasing)")
                 continue
 
+        # ── NEWS VETO — skip outright if major negative news in last 24h ───
+        try:
+            from news_agent import NewsAgent as _NA
+            _na_local = _NA(conn, ai_analyst=None)
+            _ni = _na_local.get_news_impact(ticker, hours=24)
+            if _ni.get("should_skip"):
+                top_h = ""
+                if _ni.get("top_event"):
+                    top_h = str(_ni["top_event"].get("headline", ""))[:80]
+                print(f"    {ticker:8s} — NEWS VETO: major negative news "
+                      f"(\"{top_h}\"), skip")
+                continue
+        except Exception:
+            pass
+
         # ── MASTER SCORE GATE ─────────────────────────────────────────────
         # Single unified check that replaces individual Wyckoff/volume/MTF gates.
         # Threshold = learning_adjustments.min_master_score (default 65).
@@ -627,6 +642,22 @@ def auto_enter_options(conn, vix_data, session, quality,
                       f"cash=${cash_avail:.2f} — skip")
                 continue
             contracts = 1
+
+        # ── NEWS VETO — skip outright if major negative news in last 24h ───
+        # For options, the veto is bias-aware: bullish puts on bad news = OK.
+        try:
+            from news_agent import NewsAgent as _NA
+            _na_local = _NA(conn, ai_analyst=None)
+            _ni = _na_local.get_news_impact(ticker, hours=24)
+            if _ni.get("should_skip") and opt_type == "call":
+                top_h = ""
+                if _ni.get("top_event"):
+                    top_h = str(_ni["top_event"].get("headline", ""))[:80]
+                print(f"    {ticker:8s} — NEWS VETO (call): negative news "
+                      f"(\"{top_h}\"), skip")
+                continue
+        except Exception:
+            pass
 
         # ── MASTER SCORE GATE (replaces individual Wyckoff/MTF checks) ────
         bias_for_score = "bullish" if opt_type == "call" else "bearish"
@@ -887,6 +918,45 @@ def main():
         conn.close()
         print("\n  Done.\n")
         return
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # NEWS AGENT — Pull and classify fresh news before any trading decisions
+    # ══════════════════════════════════════════════════════════════════════════
+    print(f"\n  {'─'*50}")
+    print(f"  NEWS AGENT — Pulling latest market news")
+    try:
+        from news_agent import NewsAgent
+        _news_agent = NewsAgent(conn, ai_analyst=_AI)
+        _news_result = _news_agent.run_cycle(max_per_source=15, max_new=20)
+        print(f"  Fetched {_news_result['fetched']} items, "
+              f"persisted {_news_result['new']} new, "
+              f"{_news_result['high_imp']} high-impact")
+
+        # Telegram alert for any HIGH-impact news that just landed
+        for hi in (_news_result.get("high_items") or [])[:3]:
+            item = hi["item"]
+            cls  = hi["classification"]
+            tickers_str = ", ".join(cls.get("affected_tickers", [])) or "—"
+            send_telegram(
+                f"🚨 <b>HIGH-IMPACT NEWS</b>\n"
+                f"<b>{item.get('headline', '')[:200]}</b>\n"
+                f"Category : {cls.get('category', '?')}  "
+                f"Sentiment: {cls.get('sentiment', '?')}  "
+                f"Impact: {cls.get('impact_score', 0)}/10\n"
+                f"Affects  : {tickers_str}\n"
+                f"Source   : {item.get('source', '')}"
+            )
+
+        # Market pulse for the run log
+        try:
+            pulse = _news_agent.get_market_pulse(hours=24)
+            print(f"  Market pulse: {pulse['mood']} "
+                  f"(net {pulse['net_sentiment']:+.2f} over {pulse['n_events']} events)")
+        except Exception:
+            pass
+    except Exception as _ne:
+        print(f"  WARN news agent failed: {_ne}")
+        _news_agent = None
 
     # ══════════════════════════════════════════════════════════════════════════
     # PORTFOLIO-LEVEL RISK GATES

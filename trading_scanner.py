@@ -8722,6 +8722,40 @@ def compute_master_score(ticker, expiry, bias, conn,
                 tv_mult = 2.0 - tv_mult   # 1.10 → 0.90, 0.85 → 1.15, etc.
         except Exception:
             tv_mult = 1.0
+
+    # ── 10. News impact (multiplier, optional) ───────────────────────────────
+    # Aggregates news events affecting *ticker* in the last 24 hours via
+    # NewsAgent.get_news_impact().  Negative news = score penalty;
+    # positive news = score boost.  Invert for bearish trades.
+    news_mult = 1.0
+    news_imp  = {}
+    if not skip_slow_checks:
+        try:
+            from news_agent import NewsAgent
+            _na = NewsAgent(conn, ai_analyst=None)   # AI not needed for read-only impact
+            news_imp = _na.get_news_impact(ticker, hours=24) or {}
+            news_mult = float(news_imp.get("score_modifier", 1.0) or 1.0)
+            if str(bias).lower() == "bearish" and news_mult != 1.0:
+                news_mult = 2.0 - news_mult
+        except Exception:
+            news_mult = 1.0
+    if news_imp.get("n_events"):
+        components["news_impact"] = {
+            "max":        "×",
+            "pts":        f"{news_mult:.2f}",
+            "label":      (f"News: {news_imp['n_events']} event(s), "
+                            f"net {news_imp['net_sentiment']:+.2f}, "
+                            f"{news_imp['dominant_category']} → {news_mult:.2f}×"),
+            "multiplier": news_mult,
+            "raw":        news_imp,
+        }
+    else:
+        components["news_impact"] = {
+            "max":        "×",
+            "pts":        "1.00",
+            "label":      "No recent news for this ticker (1.00×)",
+            "multiplier": 1.0,
+        }
     if tv_sig:
         components["tradingview_ta"] = {
             "max":   "×",
@@ -8742,9 +8776,9 @@ def compute_master_score(ticker, expiry, bias, conn,
             "multiplier": 1.0,
         }
 
-    # ── Final score with TV multiplier applied + clamped to 0-100 ────────────
+    # ── Final score: base × TV multiplier × news multiplier, clamped 0-100 ──
     raw_score = max(0, total)
-    score = round(min(100, raw_score * tv_mult), 1)
+    score = round(min(100, raw_score * tv_mult * news_mult), 1)
 
     # ── Grade + decision ──────────────────────────────────────────────────────
     if score >= 85:
@@ -8775,6 +8809,8 @@ def compute_master_score(ticker, expiry, bias, conn,
         "summary":         summary,
         "tv_signal":       tv_sig,
         "tv_multiplier":   tv_mult,
+        "news_impact":     news_imp,
+        "news_multiplier": news_mult,
         "base_score":      round(raw_score, 1),
     }
 

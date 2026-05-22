@@ -700,6 +700,148 @@ with st.sidebar:
     st.divider()
 
     # ══════════════════════════════════════════════════════════════════════════
+    # 🔧 PORTFOLIO HEALTH — diagnostic panel
+    # ══════════════════════════════════════════════════════════════════════════
+    with st.expander("🔧 Portfolio Health", expanded=False):
+        st.caption("Live diagnostic to verify the paper portfolio is updating.")
+        try:
+            _pe_diag = ts.PaperTradingEngine(conn)
+            _summ    = _pe_diag.get_summary()
+            _opens   = _pe_diag.open_positions
+
+            # ── Last scan timestamp ──────────────────────────────────────────
+            try:
+                _last_scan = conn.execute(
+                    "SELECT scan_timestamp, scan_id, COUNT(*) "
+                    "FROM calls WHERE scan_id = "
+                    "(SELECT scan_id FROM calls ORDER BY scan_timestamp DESC LIMIT 1) "
+                    "GROUP BY scan_timestamp, scan_id"
+                ).fetchone()
+                if _last_scan:
+                    _scan_ts = str(_last_scan[0])
+                    _scan_n  = int(_last_scan[2])
+                    try:
+                        _dt = pd.to_datetime(_scan_ts)
+                        _age_h = (pd.Timestamp.utcnow().tz_localize(None) - _dt.tz_localize(None)).total_seconds() / 3600
+                        _age_str = (f"**{_age_h:.1f} h ago**" if _age_h < 48
+                                    else f"**{_age_h/24:.1f} days ago** ⚠️")
+                    except Exception:
+                        _age_str = ""
+                    st.markdown(f"📡 **Last scan:** {_scan_ts}  ·  {_scan_n} tickers  ·  {_age_str}")
+                else:
+                    st.warning("⚠️ No scans found in DB. Run the breakout scanner to populate signals.")
+            except Exception as _e:
+                st.caption(f"Scan lookup error: {_e}")
+
+            # ── Last closed position ─────────────────────────────────────────
+            try:
+                _last_closed = conn.execute(
+                    "SELECT ticker, exit_date, exit_reason, net_pnl FROM paper_portfolio "
+                    "WHERE status='CLOSED' ORDER BY exit_date DESC LIMIT 1"
+                ).fetchone()
+                if _last_closed:
+                    _cd = str(_last_closed[1])
+                    _ct = str(_last_closed[0])
+                    _cr = str(_last_closed[2])
+                    _cp = float(_last_closed[3] or 0)
+                    try:
+                        _dt = pd.to_datetime(_cd)
+                        _age_d = (pd.Timestamp.utcnow().tz_localize(None) - _dt.tz_localize(None)).total_seconds() / 86400
+                        _age_str = (f"{_age_d:.1f}d ago" if _age_d < 30 else f"{_age_d:.0f}d ago ⚠️")
+                    except Exception:
+                        _age_str = ""
+                    st.markdown(
+                        f"📜 **Last close:** {_ct} on {_cd} ({_age_str})  ·  "
+                        f"{_cr}  ·  ${_cp:+.2f}"
+                    )
+                else:
+                    st.markdown("📜 **No closes yet.**")
+            except Exception as _e:
+                st.caption(f"Close lookup error: {_e}")
+
+            st.markdown(
+                f"💼 **Portfolio:** ${_summ['available_cash']:,.2f} cash  ·  "
+                f"{_summ['n_open']}/{_summ.get('max_positions', 5)} open  ·  "
+                f"Realized ${_summ['realized_pnl']:+,.2f}  ·  "
+                f"Trades made {_summ['trades_made']}"
+            )
+
+            # ── Live position health: how close to stops/targets? ────────────
+            if _opens:
+                st.markdown("**Open positions — live stop/target distances:**")
+                _ph_rows = []
+                for _p in _opens:
+                    _tk    = _p.get("ticker", "?")
+                    _entry = float(_p.get("entry_price")  or 0)
+                    _stop  = float(_p.get("stop_loss")    or 0)
+                    _tgt   = float(_p.get("target_price") or 0)
+                    try:
+                        _cur = float(yf.Ticker(_tk).fast_info.last_price or 0)
+                    except Exception:
+                        _cur = 0
+                    if _cur > 0 and _stop > 0 and _tgt > 0:
+                        _d_stop = (_cur - _stop) / _cur * 100
+                        _d_tgt  = (_tgt - _cur) / _cur * 100
+                        _flag = ""
+                        if _cur <= _stop * 1.005:
+                            _flag = "🛑 SHOULD HAVE STOPPED"
+                        elif _cur >= _tgt * 0.995:
+                            _flag = "🎯 SHOULD HAVE TARGETED"
+                        _ph_rows.append({
+                            "Ticker": _tk,
+                            "Entry":  f"${_entry:.2f}",
+                            "Current": f"${_cur:.2f}",
+                            "Stop":   f"${_stop:.2f}",
+                            "Target": f"${_tgt:.2f}",
+                            "To Stop": f"{_d_stop:+.1f}%",
+                            "To Tgt":  f"{_d_tgt:+.1f}%",
+                            "Status": _flag,
+                        })
+                    else:
+                        _ph_rows.append({
+                            "Ticker": _tk, "Entry": f"${_entry:.2f}",
+                            "Current": "?", "Stop": f"${_stop:.2f}",
+                            "Target": f"${_tgt:.2f}", "To Stop": "—",
+                            "To Tgt": "—", "Status": "no live price",
+                        })
+                st.dataframe(pd.DataFrame(_ph_rows), hide_index=True,
+                             use_container_width=True)
+                _stuck = [r for r in _ph_rows if r["Status"]]
+                if _stuck:
+                    st.error(
+                        f"⚠️ {len(_stuck)} position(s) have hit stops/targets but are still OPEN. "
+                        "The monitor isn't closing them. Check GitHub Actions → Position Monitor "
+                        "for failed runs.",
+                        icon="🛑",
+                    )
+            else:
+                st.info("No open positions. Either monitor hasn't found any signals to enter "
+                        "or all positions have closed already.", icon="📂")
+
+            # ── Risk Engine status ───────────────────────────────────────────
+            try:
+                _diag_risk = ts.get_portfolio_risk_status(_pe_diag)
+                st.markdown(
+                    f"🛡 **Risk Engine:** {_diag_risk['risk_level']}  ·  "
+                    f"Can open: **{'YES' if _diag_risk['can_open_new'] else 'NO'}**  ·  "
+                    f"Sizing {_diag_risk['size_multiplier']:.2f}×"
+                )
+                if not _diag_risk["can_open_new"]:
+                    st.error(_diag_risk["reason"], icon="🛑")
+            except Exception:
+                pass
+
+            st.caption(
+                "If your scan is more than 24 h old or no positions are entering, "
+                "the chase guard may be skipping stale signals. Run a fresh scan "
+                "from the sidebar to refresh."
+            )
+        except Exception as _diag_exc:
+            st.error(f"Diagnostic error: {_diag_exc}")
+
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════════════════════
     # 🤖 AI ANALYST CHAT
     # ══════════════════════════════════════════════════════════════════════════
     with st.expander("🤖 AI Analyst", expanded=False):

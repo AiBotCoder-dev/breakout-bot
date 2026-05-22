@@ -1,0 +1,41 @@
+name: Daily AI Briefing
+
+# Runs once each US trading day at 8:30 AM ET (~13:30 UTC summer / 14:30 UTC winter).
+# Two cron entries cover both DST seasons; daily_briefing.py is idempotent so
+# if both fire on a DST boundary day, only one will see fresh data anyway.
+
+on:
+  schedule:
+    - cron: '30 13 * * 1-5'   # 8:30 AM EDT (summer)
+    - cron: '30 14 * * 1-5'   # 8:30 AM EST (winter)
+
+  workflow_dispatch:           # manual trigger from GitHub UI
+
+jobs:
+  briefing:
+    name: Send morning AI briefing
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Send daily briefing
+        env:
+          DATABASE_URL:          ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
+          GROQ_API_KEY:          ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY:    ${{ secrets.OPENROUTER_API_KEY }}
+        run: python daily_briefing.py

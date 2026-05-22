@@ -31,6 +31,29 @@ if _DIR not in sys.path:
 
 import trading_scanner as ts
 
+# ── Optional AI analyst (silently disabled if no API key) ─────────────────────
+try:
+    from ai_engine import AIAnalyst
+    _AI = AIAnalyst()
+except Exception:
+    _AI = None
+
+
+def _ai_rationale(label: str, payload: dict, max_tokens: int = 160) -> str:
+    """Return a short AI-written rationale or empty string if AI is off."""
+    if _AI is None or not _AI.available:
+        return ""
+    try:
+        prompt = (
+            f"Write a 2-sentence rationale for this {label}. "
+            "Cite specific signals from the JSON. End with one specific risk.\n\n"
+            + str(payload)[:2500]
+        )
+        return _AI.chat(prompt, max_tokens=max_tokens) or ""
+    except Exception:
+        return ""
+
+
 # ── Auto-entry configuration ──────────────────────────────────────────────────
 # Raise these thresholds to be more selective; lower them to trade more often.
 STOCK_MIN_SCORE          = 75    # explosive_score threshold for stock auto-entry
@@ -424,6 +447,18 @@ def auto_enter_stocks(conn, paper, session, quality,
                   f"price=${live_price:.2f}  stop=${stop:.2f}  tgt=${tgt:.2f}  "
                   f"shares={shares:.1f}  cost=${gross:.2f}{spring_flag}")
             summ_now = paper.get_summary()
+
+            # ── AI rationale (free, optional) ─────────────────────────────
+            _ai_text = _ai_rationale("stock paper-trade entry", {
+                "ticker": ticker, "price": live_price,
+                "stop": stop, "target": tgt, "pattern": pattern,
+                "master_score": m_score, "grade": m_grade,
+                "wyckoff": wy_phase,
+                "multi_tf": master['components'].get('multi_tf', {}).get('label',''),
+                "volume":   master['components'].get('inst_volume', {}).get('label',''),
+            })
+            _ai_block = f"\n🤖 <i>{_ai_text}</i>\n" if _ai_text else ""
+
             send_telegram(
                 f"🤖 <b>AUTO-BUY: {ticker}</b>{spring_flag}{squeeze_flag}\n"
                 f"Master   : <b>{m_score}/100 ({m_grade})</b>  {m_decision}\n"
@@ -438,6 +473,7 @@ def auto_enter_stocks(conn, paper, session, quality,
                 f"(master {m_mult:.1f} × risk {risk_mult:.2f})\n"
                 f"Cash     : ${summ_now.get('available_cash',0):,.2f}\n"
                 f"Session  : {quality}  ({session.get('name','')})"
+                + _ai_block
             )
         else:
             print(f"    ✗ {ticker:8s} — {result.get('reason', 'failed')}")
@@ -629,6 +665,19 @@ def auto_enter_options(conn, vix_data, session, quality,
                   f"${strike:.0f}{opt_type[0].upper()} {expiry} ({dte}DTE)  "
                   f"mid=${mid:.2f}  {contracts}×  cost=${cost_total:.2f}  PoP={pop_s}{squeeze_str}")
 
+            # ── AI rationale (free, optional) ─────────────────────────────
+            _ai_text = _ai_rationale("options paper-trade entry", {
+                "ticker": ticker, "strategy": strategy,
+                "strike": strike, "expiry": expiry, "dte": dte,
+                "option_type": opt_type, "premium": mid, "contracts": contracts,
+                "master_score": m_score, "grade": m_grade,
+                "pop_pct": pop_s, "breakeven_move_pct": be,
+                "wyckoff": master['components'].get('wyckoff', {}).get('label',''),
+                "multi_tf": master['components'].get('multi_tf', {}).get('label',''),
+                "gamma_squeeze": bool(squeeze_str),
+            })
+            _ai_block = f"\n🤖 <i>{_ai_text}</i>\n" if _ai_text else ""
+
             send_telegram(
                 f"🤖 <b>AUTO-OPTIONS: {ticker}</b>"
                 + (" 🚀" if squeeze_str else "") + "\n"
@@ -644,6 +693,7 @@ def auto_enter_options(conn, vix_data, session, quality,
                 f"(master {m_mult:.1f} × risk {risk_mult:.2f}) · VIX {vix_m:.1f}×\n"
                 f"Cash     : ${result.get('cash_remaining', 0):,.2f}\n"
                 f"Session  : {quality}  ({session.get('name','')})"
+                + _ai_block
             )
         else:
             print(f"    ✗ {ticker:8s} — {result.get('error', 'failed')}")

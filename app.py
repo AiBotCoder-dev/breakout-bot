@@ -14,6 +14,13 @@ import sys, os, io, argparse, contextlib, re as _re
 from datetime import datetime, timedelta
 import numpy as np
 
+# ── AI engine (optional — works without an API key, falls back silently) ──────
+try:
+    from ai_engine import AIAnalyst
+    _AI = AIAnalyst()
+except Exception:
+    _AI = None
+
 
 # ── PostgreSQL adapter (makes psycopg2 look like sqlite3) ─────────────────────
 class _PgRow:
@@ -654,6 +661,122 @@ with st.sidebar:
 
     # ── Live Market Clock ──────────────────────────────────────────────────────
     _render_market_clock()
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 🤖 AI ANALYST CHAT
+    # ══════════════════════════════════════════════════════════════════════════
+    with st.expander("🤖 AI Analyst", expanded=False):
+        if _AI is None or not _AI.available:
+            st.info(
+                "**AI not configured.** Add a free API key in Streamlit "
+                "Settings → Secrets to enable:\n\n"
+                "- `GROQ_API_KEY` (recommended — fastest, free 14 k/day):  "
+                "https://console.groq.com/keys\n"
+                "- `GEMINI_API_KEY` (Google, free 1 M tokens/day):  "
+                "https://aistudio.google.com/app/apikey\n"
+                "- `OPENROUTER_API_KEY`:  https://openrouter.ai/keys",
+                icon="🔑",
+            )
+        else:
+            st.caption(f"⚡ Powered by **{_AI.provider.upper()}**")
+
+            # Init chat history
+            if "ai_chat_history" not in st.session_state:
+                st.session_state.ai_chat_history = []
+
+            # Display previous messages
+            for msg in st.session_state.ai_chat_history[-10:]:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+
+            # Quick-action buttons
+            _qa1, _qa2 = st.columns(2)
+            _qbtn = None
+            if _qa1.button("📊 Portfolio Risk", key="ai_qa_risk",
+                           use_container_width=True):
+                _qbtn = "What's the biggest risk in my current paper portfolio right now?"
+            if _qa2.button("🌅 Morning Brief", key="ai_qa_brief",
+                           use_container_width=True):
+                _qbtn = "Give me a short market briefing for today's trading."
+            _qa3, _qa4 = st.columns(2)
+            if _qa3.button("🎯 Top Setup", key="ai_qa_setup",
+                           use_container_width=True):
+                _qbtn = "What's the best high-conviction setup from my latest scan?"
+            if _qa4.button("🧠 Coach Me", key="ai_qa_coach",
+                           use_container_width=True):
+                _qbtn = ("Review my closed paper trades and give me 3 specific "
+                         "improvements I can make.")
+
+            # Chat input
+            _ai_input = st.chat_input("Ask the AI…", key="ai_chat_input")
+            _user_msg = _ai_input or _qbtn
+
+            if _user_msg:
+                # ── Build context that gives AI awareness ─────────────────────
+                _ai_ctx: dict = {}
+                try:
+                    _ai_ctx["vix"] = ts.get_vix_level()
+                except Exception:
+                    pass
+                # SPY regime from cached ctx if available
+                try:
+                    if "_ctx" in dir() and isinstance(_ctx, dict):
+                        _ai_ctx["regime"] = _ctx.get("regime")
+                except Exception:
+                    pass
+                # Recent scan picks
+                try:
+                    rows = conn.execute(
+                        "SELECT ticker, explosive_score, breakout_prob, "
+                        "pattern_detected, entry_price, target_price, stop_loss "
+                        "FROM calls ORDER BY scan_timestamp DESC LIMIT 5"
+                    ).fetchall()
+                    _ai_ctx["latest_scan"] = [
+                        {k: r.get(k) for k in r.keys()} for r in rows
+                    ]
+                except Exception:
+                    pass
+                # Open paper positions
+                try:
+                    _p = ts.PaperTradingEngine(conn)
+                    _ai_ctx["open_positions"] = _p.open_positions[:8]
+                    _ai_ctx["portfolio_summary"] = _p.get_summary()
+                    _ai_ctx["risk_status"] = ts.get_portfolio_risk_status(_p)
+                except Exception:
+                    pass
+                # Open options positions
+                try:
+                    _op = ts.OptionsPaperEngine(conn)
+                    _ai_ctx["open_options"] = _op.get_positions("OPEN")[:8]
+                except Exception:
+                    pass
+
+                # Append user msg
+                st.session_state.ai_chat_history.append(
+                    {"role": "user", "content": _user_msg}
+                )
+                with st.chat_message("user"):
+                    st.markdown(_user_msg)
+
+                # Call AI
+                with st.chat_message("assistant"):
+                    with st.spinner("Analyst thinking…"):
+                        _reply = _AI.chat(_user_msg, context=_ai_ctx)
+                    st.markdown(_reply)
+                    if _AI.last_latency_ms:
+                        st.caption(f"⚡ {_AI.last_latency_ms} ms · {_AI.provider}")
+
+                st.session_state.ai_chat_history.append(
+                    {"role": "assistant", "content": _reply}
+                )
+                st.rerun()
+
+            if st.session_state.ai_chat_history and st.button(
+                    "🗑 Clear Chat", key="ai_clear_btn"):
+                st.session_state.ai_chat_history = []
+                st.rerun()
+
     st.divider()
 
     universe = st.selectbox(

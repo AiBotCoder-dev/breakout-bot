@@ -303,7 +303,8 @@ def _get_live_price(ticker: str):
 # ── Auto-entry: stocks ────────────────────────────────────────────────────────
 
 def auto_enter_stocks(conn, paper, session, quality,
-                      risk_mult=1.0, market_regime=None):
+                      risk_mult=1.0, market_regime=None,
+                      learning_adjustments=None):
     """
     Automatically open paper stock positions for tickers in the latest breakout
     scan that PASS the Master Score gate.
@@ -391,7 +392,7 @@ def auto_enter_stocks(conn, paper, session, quality,
 
         # ── MASTER SCORE GATE ─────────────────────────────────────────────
         # Single unified check that replaces individual Wyckoff/volume/MTF gates.
-        # Threshold = 65 (BUY).  Score < 65 → skip.  Score ≥ 65 → size by mult.
+        # Threshold = learning_adjustments.min_master_score (default 65).
         try:
             master = ts.compute_master_score(
                 ticker, expiry=None, bias="bullish", conn=conn,
@@ -413,8 +414,42 @@ def auto_enter_stocks(conn, paper, session, quality,
         if m_decision == "SKIP":
             continue
 
+        # ── Apply learning-adjustment floors ──────────────────────────────
+        # The bot's punishment-mode + accumulated lessons raise these thresholds.
+        _pattern_now = str(r.get("pattern_detected") or "")
+        if learning_adjustments:
+            min_score_required = float(learning_adjustments.get("min_master_score", 65))
+            if m_score < min_score_required:
+                print(f"    {ticker:8s} — Master {m_score} < learning floor {min_score_required:.0f}, skip")
+                continue
+
+            # Pattern blacklist (from past lessons)
+            _pat_bl = learning_adjustments.get("pattern_blacklist", [])
+            if _pattern_now and _pattern_now in _pat_bl:
+                print(f"    {ticker:8s} — pattern '{_pattern_now}' is BLACKLISTED by learning engine, skip")
+                continue
+
+            # Wyckoff blacklist (default: DISTRIBUTION, MARKDOWN)
+            _wy_bl = learning_adjustments.get("wyckoff_blacklist", [])
+            try:
+                _wy_phase_lbl = master["components"].get("wyckoff", {}).get("label", "").upper()
+                _wy_skip = False
+                for bad in _wy_bl:
+                    if bad and bad.upper() in _wy_phase_lbl:
+                        print(f"    {ticker:8s} — Wyckoff phase blacklisted ({bad}), skip")
+                        _wy_skip = True
+                        break
+                if _wy_skip:
+                    continue
+            except Exception:
+                pass
+
         # ── Sizing: master multiplier × portfolio risk multiplier ─────────
         effective_mult = m_mult * risk_mult
+        # Also enforce the learning-derived sizing cap
+        if learning_adjustments:
+            effective_mult = min(effective_mult,
+                                 float(learning_adjustments.get("size_multiplier_cap", 1.0)))
         if effective_mult <= 0.05:
             print(f"    {ticker:8s} — effective sizing too low ({effective_mult:.2f}×), skip")
             continue
@@ -487,7 +522,8 @@ def auto_enter_stocks(conn, paper, session, quality,
 # ── Auto-entry: options ───────────────────────────────────────────────────────
 
 def auto_enter_options(conn, vix_data, session, quality,
-                       risk_mult=1.0, market_regime=None):
+                       risk_mult=1.0, market_regime=None,
+                       learning_adjustments=None):
     """
     Automatically open paper options positions using Weekly ATM strategy (5–7 DTE)
     for tickers that PASS the Master Score gate.
@@ -615,6 +651,26 @@ def auto_enter_options(conn, vix_data, session, quality,
         if m_decision == "SKIP":
             continue
 
+        # ── Apply learning-adjustment floors ──────────────────────────────
+        if learning_adjustments:
+            min_score_required = float(learning_adjustments.get("min_master_score", 65))
+            if m_score < min_score_required:
+                print(f"    {ticker:8s} — Master {m_score} < learning floor {min_score_required:.0f}, skip")
+                continue
+            _wy_bl = learning_adjustments.get("wyckoff_blacklist", [])
+            try:
+                _wy_phase_lbl = master["components"].get("wyckoff", {}).get("label", "").upper()
+                _wy_skip = False
+                for bad in _wy_bl:
+                    if bad and bad.upper() in _wy_phase_lbl:
+                        print(f"    {ticker:8s} — Wyckoff phase blacklisted ({bad}) for options, skip")
+                        _wy_skip = True
+                        break
+                if _wy_skip:
+                    continue
+            except Exception:
+                pass
+
         # ── Gamma squeeze bonus flag ───────────────────────────────────────
         squeeze_str = ""
         try:
@@ -626,6 +682,9 @@ def auto_enter_options(conn, vix_data, session, quality,
 
         # ── Apply master + portfolio multipliers to contracts ──────────────
         effective_mult = m_mult * risk_mult
+        if learning_adjustments:
+            effective_mult = min(effective_mult,
+                                 float(learning_adjustments.get("size_multiplier_cap", 1.0)))
         if effective_mult <= 0.05:
             print(f"    {ticker:8s} — effective sizing too low ({effective_mult:.2f}×), skip")
             continue
@@ -836,8 +895,102 @@ def main():
     print(f"\n  {'─'*50}")
     print(f"  RISK ENGINE — Portfolio & Market Gates")
 
-    # ── Gate 1: Portfolio drawdown ────────────────────────────────────────────
+    # ── Gate 0: SELF-LEARNING ENGINE — check for punishment / reset ───────────
+    learning_engine = None
+    learning_adjustments = {
+        "min_master_score":  65,
+        "sector_blacklist":  [],
+        "pattern_blacklist": [],
+        "size_multiplier_cap": 1.0,
+        "learning_iteration": 0,
+    }
     portfolio_size_mult = 1.0
+
+    try:
+        opts_for_reset  = ts.OptionsPaperEngine(conn)
+        learning_engine = ts.LearningEngine(conn)
+        le_state = learning_engine.check_state(paper, opts_for_reset)
+        learning_adjustments = le_state.get("adjustments", learning_adjustments)
+        action = le_state.get("action", "NORMAL")
+
+        print(f"  Learning Engine: {action}  ·  iter #{learning_adjustments['learning_iteration']}")
+        print(f"    Drawdown    : {le_state.get('drawdown_pct', 0):.1f}%")
+        print(f"    {le_state.get('message', '')}")
+
+        # ── HARD RESET (-50%) ────────────────────────────────────────────────
+        if action == "RESET":
+            les = le_state.get("lessons", {})
+            print(f"  🚨🚨🚨 HARD RESET TRIGGERED 🚨🚨🚨")
+            print(f"    {les.get('lessons_summary', '')}")
+            send_telegram(
+                f"🚨🚨🚨 <b>CAPITAL RESET TRIGGERED</b> 🚨🚨🚨\n"
+                f"Drawdown : {le_state.get('drawdown_pct', 0):.1f}%\n"
+                f"Peak     : ${le_state.get('peak_equity', 0):,.2f}\n"
+                f"Final    : ${le_state.get('current_equity', 0):,.2f}\n"
+                f"\n"
+                f"📚 <b>Learning Iteration #{les.get('learning_iteration', 1)}</b>\n"
+                f"Closed: {les.get('n_trades', 0)} trades "
+                f"({les.get('n_wins', 0)}W / {les.get('n_losses', 0)}L · "
+                f"{les.get('win_rate_pct', 0):.0f}%)\n"
+                f"Avg win: ${les.get('avg_win_pnl', 0):.2f}  |  "
+                f"Avg loss: ${les.get('avg_loss_pnl', 0):.2f}\n"
+                f"Worst sector: {les.get('worst_sector', '—')}\n"
+                f"Worst pattern: {les.get('worst_pattern', '—')}\n"
+                f"\n"
+                f"🔧 <b>Adjustments active going forward:</b>\n"
+                f"• Min Master Score: {les.get('new_min_master_score', 65):.0f}\n"
+                f"• Sector blacklist: {', '.join(les.get('sector_blacklist', []) or ['none'])}\n"
+                f"• Pattern blacklist: {', '.join(les.get('pattern_blacklist', []) or ['none'])}\n"
+                f"\n"
+                f"Capital reset to $1,000.  Bot will use these adjustments to avoid the same mistakes."
+            )
+            # Reload paper engine since capital was just reset
+            paper = ts.PaperTradingEngine(conn)
+            print(f"\n  Done (session={quality}, action=RESET).\n")
+            conn.close()
+            return
+
+        # ── PUNISHMENT MODE entry (-15%) ─────────────────────────────────────
+        if action == "ENTER_PUNISHMENT":
+            send_telegram(
+                f"⚠️ <b>PUNISHMENT MODE TRIGGERED</b>\n"
+                f"Drawdown : {le_state.get('drawdown_pct', 0):.1f}%\n"
+                f"Peak     : ${le_state.get('peak_equity', 0):,.2f}\n"
+                f"Current  : ${le_state.get('current_equity', 0):,.2f}\n"
+                f"Target   : ${le_state.get('recovery_target', 0):,.2f}\n"
+                f"\n"
+                f"🛑 No new trades until equity recovers to within 5% of peak.\n"
+                f"📈 When unfrozen: Master Score floor raised to 75 (was 65).\n"
+                f"Position sizing capped at 0.5×.\n"
+                f"\n"
+                f"This is automatic discipline — the bot must prove it can recover before being allowed to trade again."
+            )
+            print(f"\n  Done (session={quality}, action=PUNISHMENT_ENTERED).\n")
+            conn.close()
+            return
+
+        # ── PUNISHMENT continuing ─────────────────────────────────────────────
+        if action == "CONTINUE_PUNISHMENT":
+            print(f"  Still in PUNISHMENT — skipping all new entries this cycle.")
+            print(f"\n  Done (session={quality}, action=PUNISHMENT_CONTINUE).\n")
+            conn.close()
+            return
+
+        # ── PUNISHMENT exit (recovered) ───────────────────────────────────────
+        if action == "EXIT_PUNISHMENT":
+            send_telegram(
+                f"✅ <b>PUNISHMENT MODE ENDED</b>\n"
+                f"Equity recovered to ${le_state.get('current_equity', 0):,.2f}\n"
+                f"Resuming normal trading with active adjustments:\n"
+                f"• Min Master Score: {learning_adjustments['min_master_score']:.0f}\n"
+                f"• Iteration #{learning_adjustments['learning_iteration']}"
+            )
+
+    except Exception as exc:
+        print(f"  WARN learning engine check failed: {exc}")
+        traceback.print_exc()
+
+    # ── Gate 1: Portfolio drawdown (already handled in learning engine) ──────
     try:
         risk = ts.get_portfolio_risk_status(paper)
         print(f"  Portfolio status: {risk['risk_level']}")
@@ -846,6 +999,10 @@ def main():
         print(f"    Max sector    : {risk['max_sector_pct']:.0f}%")
         print(f"    {risk['reason']}")
         portfolio_size_mult = risk.get("size_multiplier", 1.0)
+
+        # Also honour the size cap from learning adjustments
+        portfolio_size_mult = min(portfolio_size_mult,
+                                   learning_adjustments.get("size_multiplier_cap", 1.0))
 
         if not risk.get("can_open_new", True):
             print(f"\n  🛑 RISK ENGINE HALTED NEW ENTRIES")
@@ -897,7 +1054,8 @@ def main():
     # ── Auto-entry: stocks ────────────────────────────────────────────────────
     try:
         auto_enter_stocks(conn, paper, session, quality,
-                          risk_mult=combined_mult, market_regime=market_regime)
+                          risk_mult=combined_mult, market_regime=market_regime,
+                          learning_adjustments=learning_adjustments)
     except Exception as exc:
         print(f"\n  ERROR in auto_enter_stocks: {exc}")
         traceback.print_exc()
@@ -911,7 +1069,8 @@ def main():
         pass
     try:
         auto_enter_options(conn, vix_for_opts, session, quality,
-                           risk_mult=combined_mult, market_regime=market_regime)
+                           risk_mult=combined_mult, market_regime=market_regime,
+                           learning_adjustments=learning_adjustments)
     except Exception as exc:
         print(f"\n  ERROR in auto_enter_options: {exc}")
         traceback.print_exc()

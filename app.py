@@ -992,6 +992,69 @@ with st.sidebar:
             except Exception:
                 pass
 
+            # ── Learning Engine status ───────────────────────────────────────
+            st.divider()
+            st.markdown("**🧠 Self-Learning Engine**")
+            try:
+                _le      = ts.LearningEngine(conn)
+                _adj     = _le.get_active_adjustments()
+                _pun     = _le.get_punishment_status()
+                _lessons = _le.get_lesson_history(limit=5)
+
+                _iter = _adj.get("learning_iteration", 0)
+                _ms   = _adj.get("min_master_score", 65)
+                _sec_bl = _adj.get("sector_blacklist", []) or []
+                _pat_bl = _adj.get("pattern_blacklist", []) or []
+                _wy_bl  = _adj.get("wyckoff_blacklist", []) or []
+                _cap    = _adj.get("size_multiplier_cap", 1.0)
+
+                st.markdown(
+                    f"**Iteration:** #{_iter}  ·  "
+                    f"**Min Master Score:** {_ms:.0f}  ·  "
+                    f"**Size Cap:** {_cap:.2f}×"
+                )
+
+                if _sec_bl or _pat_bl:
+                    if _sec_bl:
+                        st.caption(f"🚫 Sector blacklist: {', '.join(_sec_bl)}")
+                    if _pat_bl:
+                        st.caption(f"🚫 Pattern blacklist: {', '.join(_pat_bl)}")
+                if _wy_bl:
+                    st.caption(f"🚫 Wyckoff blacklist: {', '.join(_wy_bl)}")
+
+                if _pun.get("active"):
+                    _peak  = _pun.get("peak_equity_at_trigger", 0)
+                    _rtgt  = _pun.get("recovery_target", 0)
+                    _curr  = _diag_risk.get("current_equity", 0)
+                    st.error(
+                        f"🛑 **PUNISHMENT MODE ACTIVE**\n\n"
+                        f"Peak: ${_peak:,.2f} → Current: ${_curr:,.2f}\n"
+                        f"Recovery target: ${_rtgt:,.2f}\n"
+                        f"Master Score floor: {_pun.get('master_score_floor', 75):.0f}\n"
+                        f"Size cap: {_pun.get('size_cap', 0.5):.2f}×\n\n"
+                        f"No new trades until equity recovers to within 5% of peak.",
+                        icon="🛑",
+                    )
+
+                if _lessons:
+                    with st.expander(f"📚 Lesson History ({len(_lessons)} resets)", expanded=False):
+                        for _l in _lessons:
+                            _ts_l   = str(_l.get("reset_timestamp", "?"))[:19]
+                            _iter_l = _l.get("learning_iteration", "?")
+                            _dd_l   = _l.get("drawdown_pct", 0) or 0
+                            _wr_l   = _l.get("win_rate_pct", 0) or 0
+                            _n_l    = _l.get("n_trades", 0) or 0
+                            st.markdown(
+                                f"**Iteration #{_iter_l}** — {_ts_l}  ·  "
+                                f"DD {_dd_l:.1f}%  ·  WR {_wr_l:.0f}% over {_n_l} trades"
+                            )
+                            st.caption(_l.get("lessons_summary", ""))
+                            st.divider()
+                else:
+                    st.caption("No resets yet — bot has not hit -50% drawdown.")
+            except Exception as _le_exc:
+                st.caption(f"Learning engine unavailable: {_le_exc}")
+
             # ── Manual monitor trigger — runs the same close logic GitHub Actions does
             st.divider()
             st.markdown("**🔧 Manual Trigger**")

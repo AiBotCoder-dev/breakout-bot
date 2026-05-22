@@ -8766,3 +8766,521 @@ def get_market_context_full():
     except Exception:
         ctx["events"] = []
     return ctx
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SELF-LEARNING RISK ENGINE
+#   Two-layer drawdown protection with persistent learning across resets.
+#     • -15 % drawdown  → enters PUNISHMENT mode (halt + raise score floor)
+#                         until equity recovers to within 5 % of peak.
+#     • -50 % drawdown  → triggers HARD RESET: closes all positions, analyses
+#                         losing trades, saves lessons, resets capital, and
+#                         tightens entry thresholds for the next cycle.
+#   Adjustments persist in the DB so the bot truly adapts over time.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _row_get(row, key, default=None):
+    """Read a key from any row-like (sqlite3.Row or PgAdapter _PgRow).
+
+    sqlite3.Row doesn't have .get() so the standard helper is to convert
+    to a dict first.  This wrapper handles both transparently."""
+    if row is None:
+        return default
+    try:
+        if hasattr(row, "get") and callable(row.get):
+            return row.get(key, default)
+    except Exception:
+        pass
+    try:
+        return dict(row).get(key, default)
+    except Exception:
+        try:
+            return row[key]
+        except Exception:
+            return default
+
+
+class LearningEngine:
+    """Self-improvement engine — punishes drawdowns, learns from failed cycles."""
+
+    PUNISHMENT_THRESHOLD = 15.0   # % drawdown to enter PUNISHMENT mode
+    RESET_THRESHOLD      = 50.0   # % drawdown to trigger HARD RESET
+    RECOVERY_BAND_PCT    = 5.0    # must recover to within 5 % of peak to exit punishment
+
+    _INIT_SQL = """
+CREATE TABLE IF NOT EXISTS paper_lessons (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    learning_iteration  INTEGER,
+    reset_timestamp     TIMESTAMP,
+    reason              TEXT,
+    peak_equity         REAL,
+    final_equity        REAL,
+    drawdown_pct        REAL,
+    n_trades            INTEGER,
+    n_wins              INTEGER,
+    n_losses            INTEGER,
+    avg_win_pnl         REAL,
+    avg_loss_pnl        REAL,
+    win_rate_pct        REAL,
+    worst_sector        TEXT,
+    worst_pattern       TEXT,
+    worst_wyckoff       TEXT,
+    avg_losing_score    REAL,
+    lessons_summary     TEXT
+);
+CREATE TABLE IF NOT EXISTS paper_adjustments (
+    id                  INTEGER PRIMARY KEY,
+    learning_iteration  INTEGER DEFAULT 0,
+    min_master_score    REAL    DEFAULT 65,
+    sector_blacklist    TEXT    DEFAULT '[]',
+    pattern_blacklist   TEXT    DEFAULT '[]',
+    wyckoff_blacklist   TEXT    DEFAULT '["DISTRIBUTION","MARKDOWN"]',
+    size_multiplier_cap REAL    DEFAULT 1.0,
+    updated_at          TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS paper_punishment (
+    id                      INTEGER PRIMARY KEY,
+    active                  INTEGER DEFAULT 0,
+    triggered_at            TIMESTAMP,
+    peak_equity_at_trigger  REAL,
+    recovery_target         REAL,
+    master_score_floor      REAL DEFAULT 75,
+    size_cap                REAL DEFAULT 0.5
+);
+"""
+
+    def __init__(self, conn):
+        self.conn = conn
+        try:
+            self.conn.executescript(self._INIT_SQL)
+        except Exception:
+            pass
+        # Seed the adjustments row if missing
+        try:
+            row = self.conn.execute(
+                "SELECT id FROM paper_adjustments WHERE id=1"
+            ).fetchone()
+            if not row:
+                self.conn.execute(
+                    "INSERT INTO paper_adjustments (id, updated_at) VALUES (1, ?)",
+                    (datetime.utcnow().isoformat(),)
+                )
+        except Exception:
+            pass
+
+    # ── State check (called every monitor cycle) ──────────────────────────────
+
+    def check_state(self, paper_engine, options_engine=None) -> dict:
+        """Inspect portfolio, decide whether to enter punishment, exit, or reset.
+
+        Returns dict:
+          action       — 'NORMAL' | 'ENTER_PUNISHMENT' | 'CONTINUE_PUNISHMENT'
+                         | 'EXIT_PUNISHMENT' | 'RESET'
+          drawdown_pct — current drawdown from peak
+          peak_equity  — peak equity tracked
+          current_equity — current cash + invested
+          message      — human-readable summary
+          adjustments  — current active adjustments dict (post-action)
+        """
+        try:
+            risk = get_portfolio_risk_status(paper_engine)
+        except Exception:
+            return {"action": "NORMAL", "drawdown_pct": 0,
+                    "message": "Risk status unavailable",
+                    "adjustments": self.get_active_adjustments()}
+
+        dd     = float(risk.get("drawdown_pct", 0) or 0)
+        peak   = float(risk.get("peak_equity", 1000) or 1000)
+        curr   = float(risk.get("current_equity", 0) or 0)
+        is_punishing = self._is_punishing()
+
+        # ── -50 % HARD RESET ──────────────────────────────────────────────────
+        if dd >= self.RESET_THRESHOLD:
+            lessons = self.trigger_reset(paper_engine, options_engine,
+                                          peak_equity=peak, final_equity=curr,
+                                          drawdown_pct=dd)
+            return {
+                "action":         "RESET",
+                "drawdown_pct":   dd,
+                "peak_equity":    peak,
+                "current_equity": curr,
+                "message":        f"HARD RESET at {dd:.1f}% drawdown — capital restored, lessons applied",
+                "lessons":        lessons,
+                "adjustments":    self.get_active_adjustments(),
+            }
+
+        # ── -15 % PUNISHMENT entry ────────────────────────────────────────────
+        if not is_punishing and dd >= self.PUNISHMENT_THRESHOLD:
+            recovery_target = peak * (1 - self.RECOVERY_BAND_PCT / 100)
+            self._enter_punishment(peak, recovery_target)
+            return {
+                "action":          "ENTER_PUNISHMENT",
+                "drawdown_pct":    dd,
+                "peak_equity":     peak,
+                "current_equity":  curr,
+                "recovery_target": recovery_target,
+                "message": (
+                    f"⚠️ PUNISHMENT MODE — drawdown {dd:.1f}% ≥ {self.PUNISHMENT_THRESHOLD}%.  "
+                    f"No new trades until equity recovers to ${recovery_target:,.2f} "
+                    f"(within {self.RECOVERY_BAND_PCT}% of peak). "
+                    f"Score floor raised to 75."
+                ),
+                "adjustments":     self.get_active_adjustments(),
+            }
+
+        # ── PUNISHMENT continuation / exit ────────────────────────────────────
+        if is_punishing:
+            row = self._punishment_row()
+            recovery_target = float(_row_get(row, "recovery_target", 0) or 0)
+            if curr >= recovery_target and recovery_target > 0:
+                self._exit_punishment()
+                return {
+                    "action":          "EXIT_PUNISHMENT",
+                    "drawdown_pct":    dd,
+                    "peak_equity":     peak,
+                    "current_equity":  curr,
+                    "message":         f"✅ Recovered above ${recovery_target:,.2f} — punishment ended.",
+                    "adjustments":     self.get_active_adjustments(),
+                }
+            return {
+                "action":          "CONTINUE_PUNISHMENT",
+                "drawdown_pct":    dd,
+                "peak_equity":     peak,
+                "current_equity":  curr,
+                "recovery_target": recovery_target,
+                "message": (
+                    f"🛑 Still in PUNISHMENT — ${curr:,.2f} < ${recovery_target:,.2f} target. "
+                    f"No new trades."
+                ),
+                "adjustments":     self.get_active_adjustments(),
+            }
+
+        # ── NORMAL ────────────────────────────────────────────────────────────
+        return {
+            "action":         "NORMAL",
+            "drawdown_pct":   dd,
+            "peak_equity":    peak,
+            "current_equity": curr,
+            "message":        f"Operating normally  ·  drawdown {dd:.1f}%",
+            "adjustments":    self.get_active_adjustments(),
+        }
+
+    # ── Punishment helpers ────────────────────────────────────────────────────
+
+    def _is_punishing(self) -> bool:
+        try:
+            row = self.conn.execute(
+                "SELECT active FROM paper_punishment WHERE id=1"
+            ).fetchone()
+            if row is None:
+                return False
+            # row[0] works on both sqlite3.Row and _PgRow
+            return bool(int(row[0] or 0) == 1)
+        except Exception:
+            return False
+
+    def _punishment_row(self):
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM paper_punishment WHERE id=1"
+            ).fetchone()
+            if row is None:
+                return None
+            # Normalize to dict so callers can use .get() uniformly
+            try:
+                return dict(row)
+            except Exception:
+                return row
+        except Exception:
+            return None
+
+    def _enter_punishment(self, peak_equity: float, recovery_target: float):
+        try:
+            self.conn.execute("DELETE FROM paper_punishment WHERE id=1")
+            self.conn.execute(
+                "INSERT INTO paper_punishment "
+                "(id, active, triggered_at, peak_equity_at_trigger, recovery_target, "
+                "master_score_floor, size_cap) VALUES (1, 1, ?, ?, ?, 75, 0.5)",
+                (datetime.utcnow().isoformat(), peak_equity, recovery_target)
+            )
+        except Exception:
+            pass
+
+    def _exit_punishment(self):
+        try:
+            self.conn.execute("UPDATE paper_punishment SET active=0 WHERE id=1")
+        except Exception:
+            pass
+
+    # ── Hard reset + lesson extraction ────────────────────────────────────────
+
+    def trigger_reset(self, paper_engine, options_engine=None,
+                      peak_equity=0.0, final_equity=0.0, drawdown_pct=0.0,
+                      reason="-50% DRAWDOWN") -> dict:
+        """Capital reset with lesson learning.  Force-closes everything, saves
+        an analysis of failed trades, applies adjustments, restarts at $1,000."""
+        import json as _json
+
+        # ── 1. Snapshot of closed-trade history BEFORE reset ──────────────────
+        try:
+            rows = self.conn.execute(
+                "SELECT ticker, sector, pattern, explosive_score, breakout_prob, "
+                "net_pnl, gross_invested, exit_reason "
+                "FROM paper_portfolio WHERE status='CLOSED'"
+            ).fetchall()
+            # Normalize each row to a plain dict for cross-DB consistency
+            closed = []
+            for r in rows or []:
+                try:
+                    closed.append(dict(r))
+                except Exception:
+                    pass
+        except Exception:
+            closed = []
+
+        # ── 2. Force-close any remaining open positions ───────────────────────
+        try:
+            for p in paper_engine.open_positions:
+                ep    = float(p.get("entry_price") or 0)
+                ticker = str(p.get("ticker", ""))
+                # Mark as "RESET_CLOSED" at entry (zero P&L) — fair since we don't
+                # have a reliable live price here and we're nuking the account anyway
+                try:
+                    paper_engine.close_position(ticker, ep, "RESET_FORCED")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # ── 3. Analyse losers vs winners ──────────────────────────────────────
+        losers  = [t for t in closed if (t.get("net_pnl") or 0) < 0]
+        winners = [t for t in closed if (t.get("net_pnl") or 0) > 0]
+        n_l, n_w = len(losers), len(winners)
+        n_tot   = n_l + n_w
+
+        avg_loss = (sum(t["net_pnl"] for t in losers) / n_l) if n_l else 0.0
+        avg_win  = (sum(t["net_pnl"] for t in winners) / n_w) if n_w else 0.0
+        win_rate = (n_w / n_tot * 100) if n_tot else 0.0
+
+        def _worst(field):
+            buckets = {}
+            for t in losers:
+                k = str(t.get(field) or "Unknown") or "Unknown"
+                buckets[k] = buckets.get(k, 0) + 1
+            if not buckets:
+                return "—"
+            return max(buckets, key=lambda k: buckets[k])
+
+        worst_sector  = _worst("sector")
+        worst_pattern = _worst("pattern")
+        # Wyckoff isn't stored on trades historically; use placeholder
+        worst_wyckoff = "—"
+
+        avg_losing_score = (sum(float(t.get("explosive_score") or 0) for t in losers) / n_l
+                            if n_l else 0.0)
+
+        # ── 4. Derive adjustments to apply going forward ──────────────────────
+        adjustments = self.get_active_adjustments()
+        new_iter = int(adjustments.get("learning_iteration", 0)) + 1
+
+        new_min_score = float(adjustments.get("min_master_score", 65))
+        # If most losers had master/explosive scores < 75, raise the floor
+        if avg_losing_score and avg_losing_score < 75:
+            new_min_score = min(85.0, max(new_min_score, round(avg_losing_score + 8, 0)))
+
+        sector_blacklist  = list(adjustments.get("sector_blacklist",  []))
+        pattern_blacklist = list(adjustments.get("pattern_blacklist", []))
+
+        # If a sector lost ≥ 60 % of its trades AND had ≥ 3 trades → blacklist
+        sec_stats = {}
+        for t in closed:
+            k = str(t.get("sector") or "Unknown")
+            sec_stats.setdefault(k, [0, 0])  # [wins, losses]
+            if (t.get("net_pnl") or 0) > 0:
+                sec_stats[k][0] += 1
+            else:
+                sec_stats[k][1] += 1
+        for sec, (w, l) in sec_stats.items():
+            tot = w + l
+            if tot >= 3 and l / tot >= 0.6 and sec not in sector_blacklist and sec != "Unknown":
+                sector_blacklist.append(sec)
+
+        # Same for patterns
+        pat_stats = {}
+        for t in closed:
+            k = str(t.get("pattern") or "Unknown")
+            pat_stats.setdefault(k, [0, 0])
+            if (t.get("net_pnl") or 0) > 0:
+                pat_stats[k][0] += 1
+            else:
+                pat_stats[k][1] += 1
+        for pat, (w, l) in pat_stats.items():
+            tot = w + l
+            if tot >= 3 and l / tot >= 0.6 and pat not in pattern_blacklist and pat != "Unknown":
+                pattern_blacklist.append(pat)
+
+        # Wyckoff blacklist is permanent + grows
+        wyckoff_blacklist = list(adjustments.get("wyckoff_blacklist",
+                                                 ["DISTRIBUTION", "MARKDOWN"]))
+        for must_avoid in ("DISTRIBUTION", "MARKDOWN"):
+            if must_avoid not in wyckoff_blacklist:
+                wyckoff_blacklist.append(must_avoid)
+
+        lessons_summary = (
+            f"Iteration {new_iter}: closed {n_tot} trades ({n_w}W / {n_l}L, "
+            f"win-rate {win_rate:.0f}%).  "
+            f"Avg loss ${avg_loss:.2f} vs avg win ${avg_win:.2f}.  "
+            f"Worst sector: {worst_sector}.  Worst pattern: {worst_pattern}.  "
+            f"New min Master Score: {new_min_score:.0f}.  "
+            f"Sectors blacklisted: {sector_blacklist or 'none'}.  "
+            f"Patterns blacklisted: {pattern_blacklist or 'none'}."
+        )
+
+        # ── 5. Persist lesson row ─────────────────────────────────────────────
+        try:
+            self.conn.execute(
+                "INSERT INTO paper_lessons "
+                "(learning_iteration, reset_timestamp, reason, peak_equity, "
+                "final_equity, drawdown_pct, n_trades, n_wins, n_losses, "
+                "avg_win_pnl, avg_loss_pnl, win_rate_pct, worst_sector, "
+                "worst_pattern, worst_wyckoff, avg_losing_score, lessons_summary) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (new_iter, datetime.utcnow().isoformat(), reason, peak_equity,
+                 final_equity, drawdown_pct, n_tot, n_w, n_l, avg_win,
+                 avg_loss, win_rate, worst_sector, worst_pattern, worst_wyckoff,
+                 avg_losing_score, lessons_summary)
+            )
+        except Exception:
+            pass
+
+        # ── 6. Update active adjustments ──────────────────────────────────────
+        try:
+            self.conn.execute("DELETE FROM paper_adjustments WHERE id=1")
+            self.conn.execute(
+                "INSERT INTO paper_adjustments "
+                "(id, learning_iteration, min_master_score, sector_blacklist, "
+                "pattern_blacklist, wyckoff_blacklist, size_multiplier_cap, "
+                "updated_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
+                (new_iter, new_min_score, _json.dumps(sector_blacklist),
+                 _json.dumps(pattern_blacklist), _json.dumps(wyckoff_blacklist),
+                 max(0.5, 1.0 - new_iter * 0.05),    # tighten cap as iterations grow
+                 datetime.utcnow().isoformat())
+            )
+        except Exception:
+            pass
+
+        # ── 7. Clear punishment flag (fresh start) ────────────────────────────
+        self._exit_punishment()
+
+        # ── 8. Reset paper engine to $1,000 ───────────────────────────────────
+        try:
+            if hasattr(paper_engine, "reset"):
+                paper_engine.reset()
+            else:
+                # Best-effort manual reset
+                paper_engine._cash         = _PAPER_BUDGET
+                paper_engine._fees_paid    = 0.0
+                paper_engine._realized_pnl = 0.0
+                paper_engine._starting     = _PAPER_BUDGET
+                paper_engine._save_state()
+        except Exception:
+            pass
+
+        # ── 9. Reset options too if applicable ────────────────────────────────
+        if options_engine and hasattr(options_engine, "reset"):
+            try:
+                options_engine.reset()
+            except Exception:
+                pass
+
+        return {
+            "learning_iteration": new_iter,
+            "n_trades":           n_tot,
+            "n_wins":             n_w,
+            "n_losses":           n_l,
+            "win_rate_pct":       round(win_rate, 1),
+            "avg_loss_pnl":       round(avg_loss, 2),
+            "avg_win_pnl":        round(avg_win,  2),
+            "worst_sector":       worst_sector,
+            "worst_pattern":      worst_pattern,
+            "new_min_master_score": new_min_score,
+            "sector_blacklist":   sector_blacklist,
+            "pattern_blacklist":  pattern_blacklist,
+            "lessons_summary":    lessons_summary,
+        }
+
+    # ── Active adjustments accessor ───────────────────────────────────────────
+
+    def get_active_adjustments(self) -> dict:
+        """Return the threshold adjustments the bot should apply right now."""
+        import json as _json
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM paper_adjustments WHERE id=1"
+            ).fetchone()
+        except Exception:
+            row = None
+        # Sensible defaults if no row
+        if not row:
+            return {
+                "learning_iteration":  0,
+                "min_master_score":    65.0,
+                "sector_blacklist":    [],
+                "pattern_blacklist":   [],
+                "wyckoff_blacklist":   ["DISTRIBUTION", "MARKDOWN"],
+                "size_multiplier_cap": 1.0,
+            }
+        try:
+            sl = _json.loads(_row_get(row, "sector_blacklist", "[]")  or "[]")
+        except Exception:
+            sl = []
+        try:
+            pl = _json.loads(_row_get(row, "pattern_blacklist", "[]") or "[]")
+        except Exception:
+            pl = []
+        try:
+            wl = _json.loads(_row_get(row, "wyckoff_blacklist", '["DISTRIBUTION","MARKDOWN"]')
+                              or '["DISTRIBUTION","MARKDOWN"]')
+        except Exception:
+            wl = ["DISTRIBUTION", "MARKDOWN"]
+        return {
+            "learning_iteration":  int(_row_get(row, "learning_iteration", 0) or 0),
+            "min_master_score":    float(_row_get(row, "min_master_score", 65) or 65),
+            "sector_blacklist":    sl,
+            "pattern_blacklist":   pl,
+            "wyckoff_blacklist":   wl,
+            "size_multiplier_cap": float(_row_get(row, "size_multiplier_cap", 1.0) or 1.0),
+        }
+
+    # ── Lesson history (for UI display) ───────────────────────────────────────
+
+    def get_lesson_history(self, limit: int = 10) -> list:
+        try:
+            rows = self.conn.execute(
+                "SELECT * FROM paper_lessons ORDER BY id DESC LIMIT ?",
+                (int(limit),)
+            ).fetchall()
+            out = []
+            for r in rows or []:
+                try:
+                    out.append(dict(r))
+                except Exception:
+                    pass
+            return out
+        except Exception:
+            return []
+
+    # ── Punishment status accessor (for UI display) ───────────────────────────
+
+    def get_punishment_status(self) -> dict:
+        row = self._punishment_row()
+        if not row or not int(_row_get(row, "active", 0) or 0):
+            return {"active": False}
+        return {
+            "active":                 True,
+            "triggered_at":           str(_row_get(row, "triggered_at", "") or ""),
+            "peak_equity_at_trigger": float(_row_get(row, "peak_equity_at_trigger", 0) or 0),
+            "recovery_target":        float(_row_get(row, "recovery_target", 0) or 0),
+            "master_score_floor":     float(_row_get(row, "master_score_floor", 75) or 75),
+            "size_cap":               float(_row_get(row, "size_cap", 0.5) or 0.5),
+        }

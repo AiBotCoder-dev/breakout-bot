@@ -783,50 +783,97 @@ with st.sidebar:
 
             # ── Live position health: how close to stops/targets? ────────────
             if _opens:
-                st.markdown("**Open positions — live stop/target distances:**")
-                _ph_rows = []
+                st.markdown("**Open positions — live stop/target distances + unrealized P&L:**")
+                _ph_rows   = []
+                _tot_unrl  = 0.0
+                _tot_inv   = 0.0
                 for _p in _opens:
-                    _tk    = _p.get("ticker", "?")
-                    _entry = float(_p.get("entry_price")  or 0)
-                    _stop  = float(_p.get("stop_loss")    or 0)
-                    _tgt   = float(_p.get("target_price") or 0)
+                    _tk     = _p.get("ticker", "?")
+                    _entry  = float(_p.get("entry_price")    or 0)
+                    _stop   = float(_p.get("stop_loss")      or 0)
+                    _tgt    = float(_p.get("target_price")   or 0)
+                    _shares = float(_p.get("shares")         or 0)
+                    _inv    = float(_p.get("gross_invested") or 0)
+                    _entry_date = str(_p.get("entry_date", ""))
                     try:
                         _cur = float(yf.Ticker(_tk).fast_info.last_price or 0)
                     except Exception:
                         _cur = 0
-                    if _cur > 0 and _stop > 0 and _tgt > 0:
-                        _d_stop = (_cur - _stop) / _cur * 100
-                        _d_tgt  = (_tgt - _cur) / _cur * 100
+
+                    # ── Days held ────────────────────────────────────────────
+                    _days = "?"
+                    try:
+                        if _entry_date:
+                            _d  = pd.Timestamp(_entry_date).normalize()
+                            _bd = max(0, len(pd.bdate_range(_d, pd.Timestamp.utcnow().normalize())) - 1)
+                            _days = f"{_bd}d"
+                    except Exception:
+                        pass
+
+                    if _cur > 0:
+                        _unrl_d  = (_cur - _entry) * _shares
+                        _unrl_p  = (_cur - _entry) / _entry * 100 if _entry > 0 else 0
+                        _tot_unrl += _unrl_d
+                        _tot_inv  += _inv
+                        # STRICT breach check — must have actually crossed the level
                         _flag = ""
-                        if _cur <= _stop * 1.005:
-                            _flag = "🛑 SHOULD HAVE STOPPED"
-                        elif _cur >= _tgt * 0.995:
-                            _flag = "🎯 SHOULD HAVE TARGETED"
+                        if _stop > 0 and _cur <= _stop:
+                            _flag = "🛑 STOP BREACHED"
+                        elif _tgt > 0 and _cur >= _tgt:
+                            _flag = "🎯 TARGET HIT"
+                        _d_stop = (_cur - _stop) / _cur * 100 if _stop > 0 and _cur > 0 else 0
+                        _d_tgt  = (_tgt - _cur) / _cur * 100 if _tgt > 0 and _cur > 0 else 0
                         _ph_rows.append({
-                            "Ticker": _tk,
-                            "Entry":  f"${_entry:.2f}",
-                            "Current": f"${_cur:.2f}",
-                            "Stop":   f"${_stop:.2f}",
-                            "Target": f"${_tgt:.2f}",
-                            "To Stop": f"{_d_stop:+.1f}%",
-                            "To Tgt":  f"{_d_tgt:+.1f}%",
-                            "Status": _flag,
+                            "Ticker":    _tk,
+                            "Entry":     f"${_entry:.2f}",
+                            "Current":   f"${_cur:.2f}",
+                            "Stop":      f"${_stop:.2f}",
+                            "Target":    f"${_tgt:.2f}",
+                            "Unrl P&L":  f"${_unrl_d:+.2f} ({_unrl_p:+.1f}%)",
+                            "To Stop":   f"{_d_stop:+.1f}%",
+                            "To Tgt":    f"{_d_tgt:+.1f}%",
+                            "Days":      _days,
+                            "Status":    _flag,
                         })
                     else:
                         _ph_rows.append({
                             "Ticker": _tk, "Entry": f"${_entry:.2f}",
                             "Current": "?", "Stop": f"${_stop:.2f}",
-                            "Target": f"${_tgt:.2f}", "To Stop": "—",
-                            "To Tgt": "—", "Status": "no live price",
+                            "Target": f"${_tgt:.2f}", "Unrl P&L": "—",
+                            "To Stop": "—", "To Tgt": "—", "Days": _days,
+                            "Status": "no live price",
                         })
+
                 st.dataframe(pd.DataFrame(_ph_rows), hide_index=True,
                              use_container_width=True)
-                _stuck = [r for r in _ph_rows if r["Status"]]
+
+                # ── Unrealized P&L total ─────────────────────────────────────
+                if _tot_inv > 0:
+                    _tot_pct = _tot_unrl / _tot_inv * 100
+                    _c = "#3fb950" if _tot_unrl >= 0 else "#f85149"
+                    st.markdown(
+                        f"<div style='font-size:1.05em'>"
+                        f"📊 <b>Total unrealized P&L:</b> "
+                        f"<span style='color:{_c}'>${_tot_unrl:+.2f} "
+                        f"({_tot_pct:+.2f}%)</span>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(
+                        "This is your *live* P&L on open positions — it changes minute by minute "
+                        "but isn't reflected in 'Realized P&L' until positions close."
+                    )
+
+                # ── Breach check ─────────────────────────────────────────────
+                _stuck = [r for r in _ph_rows if r["Status"] and "BREACHED" in r["Status"]
+                                                              or "HIT" in (r["Status"] or "")]
+                _stuck = [r for r in _ph_rows
+                          if r["Status"] in ("🛑 STOP BREACHED", "🎯 TARGET HIT")]
                 if _stuck:
                     st.error(
-                        f"⚠️ {len(_stuck)} position(s) have hit stops/targets but are still OPEN. "
-                        "The monitor isn't closing them. Check GitHub Actions → Position Monitor "
-                        "for failed runs.",
+                        f"⚠️ {len(_stuck)} position(s) have ACTUALLY breached stops/targets but are still OPEN. "
+                        "Try the 🔄 manual trigger below — if that closes them, the GitHub Actions "
+                        "monitor isn't running. If not, there's a bug we need to fix.",
                         icon="🛑",
                     )
             else:

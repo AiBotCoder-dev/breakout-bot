@@ -699,15 +699,27 @@ with st.sidebar:
     _render_market_clock()
     st.divider()
 
+    # Shared DB connection for the sidebar — same cached instance used elsewhere
+    try:
+        conn, _sb_db_mode = get_db()
+    except Exception as _db_exc:
+        conn = None
+        _sb_db_mode = f"error: {_db_exc}"
+
     # ══════════════════════════════════════════════════════════════════════════
     # 🔧 PORTFOLIO HEALTH — diagnostic panel
     # ══════════════════════════════════════════════════════════════════════════
     with st.expander("🔧 Portfolio Health", expanded=False):
         st.caption("Live diagnostic to verify the paper portfolio is updating.")
         try:
+            if conn is None:
+                raise RuntimeError(f"DB not available: {_sb_db_mode}")
+            _diag_mode = _sb_db_mode
             _pe_diag = ts.PaperTradingEngine(conn)
             _summ    = _pe_diag.get_summary()
             _opens   = _pe_diag.open_positions
+
+            st.caption(f"DB mode: `{_diag_mode}`")
 
             # ── Last scan timestamp ──────────────────────────────────────────
             try:

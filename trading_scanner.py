@@ -5204,7 +5204,8 @@ class CallLogger:
     def update_calls(self) -> int:
         pending = self.conn.execute("""
             SELECT id, ticker, entry_price, entry_date,
-                   target_price, stop_loss, est_duration_min, est_duration_max
+                   target_price, stop_loss, est_duration_min, est_duration_max,
+                   pattern_detected
             FROM calls WHERE result = 'PENDING'
         """).fetchall()
         if not pending:
@@ -5221,10 +5222,30 @@ class CallLogger:
             target  = row["target_price"]
             stop    = row["stop_loss"]
             dur_min = row["est_duration_min"] or 0
-            dur_max = row["est_duration_max"] or 20
+            dur_max = row["est_duration_max"] or 0
+            pattern = (row["pattern_detected"] if "pattern_detected" in row.keys() else "") or ""
+
+            # ── Predictor fallback when est_duration_max is unset ────────────
+            # Many older calls were saved without a duration estimate, so the
+            # bot couldn't time-stop them.  Use the predictor as a fallback.
+            if dur_max <= 0 and ep > 0 and target:
+                try:
+                    _pred = predict_duration_to_target(tk, ep, target, pattern=pattern)
+                    if _pred and _pred.get("max_days_est"):
+                        # 2× grace period — only time-stop if we're well past expected
+                        dur_max = int(_pred["max_days_est"]) * 2
+                except Exception:
+                    pass
+            if dur_max <= 0:
+                dur_max = 20    # absolute fallback
 
             try:
-                edate = datetime.strptime(entry_s, "%Y-%m-%d").date()
+                if isinstance(entry_s, str):
+                    edate = datetime.strptime(entry_s[:10], "%Y-%m-%d").date()
+                elif hasattr(entry_s, "hour"):
+                    edate = entry_s.date()
+                else:
+                    edate = entry_s
             except Exception:
                 continue
             held = (today - edate).days
@@ -8739,6 +8760,62 @@ def compute_master_score(ticker, expiry, bias, conn,
                 news_mult = 2.0 - news_mult
         except Exception:
             news_mult = 1.0
+
+    # ── 11. Predicted duration (multiplier, optional) ────────────────────────
+    # Favours fast-resolving setups (capital cycles quicker) and penalises
+    # slow ones (capital tied up for weeks).  Uses the latest call entry +
+    # target from the calls table as the prediction inputs.
+    duration_mult = 1.0
+    duration_info = {}
+    if not skip_slow_checks:
+        try:
+            _trow = conn.execute(
+                "SELECT entry_price, target_price, pattern_detected "
+                "FROM calls WHERE ticker=? AND result='PENDING' "
+                "ORDER BY scan_timestamp DESC LIMIT 1",
+                (str(ticker).upper(),)
+            ).fetchone()
+            if _trow:
+                _t_ep  = float(_row_get(_trow, "entry_price",     0) or 0)
+                _t_tp  = float(_row_get(_trow, "target_price",    0) or 0)
+                _t_pat = str(_row_get(_trow, "pattern_detected", "") or "")
+                if _t_ep > 0 and _t_tp > 0:
+                    _pred = predict_duration_to_target(
+                        ticker, _t_ep, _t_tp,
+                        pattern=_t_pat, market_regime=market_regime,
+                    )
+                    if _pred:
+                        _pd_val = int(_pred.get("predicted_days", 0) or 0)
+                        # Reward fast setups (faster capital turnover);
+                        # penalise slow ones (capital tied up = opportunity cost)
+                        if   _pd_val <= 0:  duration_mult = 1.00
+                        elif _pd_val <= 5:  duration_mult = 1.05    # fast 🚀
+                        elif _pd_val <= 10: duration_mult = 1.00    # standard
+                        elif _pd_val <= 15: duration_mult = 0.97    # slow
+                        elif _pd_val <= 20: duration_mult = 0.93
+                        else:                duration_mult = 0.88   # very slow
+                        duration_info = _pred
+        except Exception:
+            duration_mult = 1.0
+    if duration_info:
+        components["duration"] = {
+            "max":         "×",
+            "pts":         f"{duration_mult:.2f}",
+            "label":       (f"Predicted {duration_info.get('predicted_days', '?')}d "
+                            f"(range {duration_info.get('min_days_est', '?')}-"
+                            f"{duration_info.get('max_days_est', '?')}d, "
+                            f"{duration_info.get('confidence', '?')}) → "
+                            f"{duration_mult:.2f}×"),
+            "multiplier":  duration_mult,
+            "raw":         duration_info,
+        }
+    else:
+        components["duration"] = {
+            "max":   "×",
+            "pts":   "1.00",
+            "label": "Duration prediction unavailable (1.00×)",
+            "multiplier": 1.0,
+        }
     if news_imp.get("n_events"):
         components["news_impact"] = {
             "max":        "×",
@@ -8776,9 +8853,9 @@ def compute_master_score(ticker, expiry, bias, conn,
             "multiplier": 1.0,
         }
 
-    # ── Final score: base × TV multiplier × news multiplier, clamped 0-100 ──
+    # ── Final score: base × TV × news × duration multipliers, clamped 0-100 ──
     raw_score = max(0, total)
-    score = round(min(100, raw_score * tv_mult * news_mult), 1)
+    score = round(min(100, raw_score * tv_mult * news_mult * duration_mult), 1)
 
     # ── Grade + decision ──────────────────────────────────────────────────────
     if score >= 85:
@@ -8801,17 +8878,19 @@ def compute_master_score(ticker, expiry, bias, conn,
         summary = "Failed setup — do not trade."
 
     return {
-        "score":           score,
-        "grade":           grade,
-        "decision":        decision,
-        "size_multiplier": mult,
-        "components":      components,
-        "summary":         summary,
-        "tv_signal":       tv_sig,
-        "tv_multiplier":   tv_mult,
-        "news_impact":     news_imp,
-        "news_multiplier": news_mult,
-        "base_score":      round(raw_score, 1),
+        "score":               score,
+        "grade":               grade,
+        "decision":            decision,
+        "size_multiplier":     mult,
+        "components":          components,
+        "summary":             summary,
+        "tv_signal":           tv_sig,
+        "tv_multiplier":       tv_mult,
+        "news_impact":         news_imp,
+        "news_multiplier":     news_mult,
+        "duration_prediction": duration_info,
+        "duration_multiplier": duration_mult,
+        "base_score":          round(raw_score, 1),
     }
 
 

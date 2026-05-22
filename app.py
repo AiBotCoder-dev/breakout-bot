@@ -784,21 +784,26 @@ with st.sidebar:
             # ── Live position health: how close to stops/targets? ────────────
             if _opens:
                 st.markdown("**Open positions — live stop/target distances + unrealized P&L:**")
+
+                # Use the OFFICIAL get_unrealized_pnl() method so numbers match
+                # the Paper Trades tab exactly (5-min bars + nets out buy fees).
+                _unrl_data = _pe_diag.get_unrealized_pnl()
+                _live_map  = {x["ticker"]: x for x in _unrl_data.get("positions", [])}
+
                 _ph_rows   = []
-                _tot_unrl  = 0.0
-                _tot_inv   = 0.0
                 for _p in _opens:
                     _tk     = _p.get("ticker", "?")
                     _entry  = float(_p.get("entry_price")    or 0)
                     _stop   = float(_p.get("stop_loss")      or 0)
                     _tgt    = float(_p.get("target_price")   or 0)
                     _shares = float(_p.get("shares")         or 0)
-                    _inv    = float(_p.get("gross_invested") or 0)
                     _entry_date = str(_p.get("entry_date", ""))
-                    try:
-                        _cur = float(yf.Ticker(_tk).fast_info.last_price or 0)
-                    except Exception:
-                        _cur = 0
+
+                    # ── Pull live price + P&L from the official method ──────
+                    _live = _live_map.get(_tk, {})
+                    _cur  = float(_live.get("current_price") or 0)
+                    _unrl_d = float(_live.get("unrealized_pnl") or 0)
+                    _unrl_p = float(_live.get("unrealized_pct") or 0)
 
                     # ── Days held ────────────────────────────────────────────
                     _days = "?"
@@ -811,18 +816,14 @@ with st.sidebar:
                         pass
 
                     if _cur > 0:
-                        _unrl_d  = (_cur - _entry) * _shares
-                        _unrl_p  = (_cur - _entry) / _entry * 100 if _entry > 0 else 0
-                        _tot_unrl += _unrl_d
-                        _tot_inv  += _inv
                         # STRICT breach check — must have actually crossed the level
                         _flag = ""
                         if _stop > 0 and _cur <= _stop:
                             _flag = "🛑 STOP BREACHED"
                         elif _tgt > 0 and _cur >= _tgt:
                             _flag = "🎯 TARGET HIT"
-                        _d_stop = (_cur - _stop) / _cur * 100 if _stop > 0 and _cur > 0 else 0
-                        _d_tgt  = (_tgt - _cur) / _cur * 100 if _tgt > 0 and _cur > 0 else 0
+                        _d_stop = (_cur - _stop) / _cur * 100 if _stop > 0 else 0
+                        _d_tgt  = (_tgt - _cur) / _cur * 100 if _tgt > 0 else 0
                         _ph_rows.append({
                             "Ticker":    _tk,
                             "Entry":     f"${_entry:.2f}",
@@ -847,9 +848,11 @@ with st.sidebar:
                 st.dataframe(pd.DataFrame(_ph_rows), hide_index=True,
                              use_container_width=True)
 
-                # ── Unrealized P&L total ─────────────────────────────────────
-                if _tot_inv > 0:
-                    _tot_pct = _tot_unrl / _tot_inv * 100
+                # ── Unrealized P&L total (from official method) ─────────────
+                _tot_unrl = float(_unrl_data.get("total", 0))
+                _tot_cost = float(_unrl_data.get("total_cost", 0))
+                if _tot_cost > 0:
+                    _tot_pct = _tot_unrl / _tot_cost * 100
                     _c = "#3fb950" if _tot_unrl >= 0 else "#f85149"
                     st.markdown(
                         f"<div style='font-size:1.05em'>"
@@ -860,8 +863,8 @@ with st.sidebar:
                         unsafe_allow_html=True,
                     )
                     st.caption(
-                        "This is your *live* P&L on open positions — it changes minute by minute "
-                        "but isn't reflected in 'Realized P&L' until positions close."
+                        "Matches the **Unrealized P&L** shown in the main Paper Trades tab "
+                        "exactly (same method, nets out buy fees). Updates every page refresh."
                     )
 
                 # ── Breach check ─────────────────────────────────────────────

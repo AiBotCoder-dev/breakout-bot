@@ -355,53 +355,101 @@ def badge(text: str, colour: str = "blue"):
 
 @st.cache_data(ttl=30)  # cache live prices for 30 seconds — fresh-ish + cheap
 def _fetch_live_prices(tickers: tuple, _salt: int = 0) -> dict:
-    """Return {ticker: last_price} for all tickers.  Cached 30 s to avoid
-    hammering yfinance while still feeling near-real-time.
+    """Return {ticker: last_price} for all tickers.
 
-    The _salt arg is a cache-buster used by the Refresh buttons — when its
-    value changes, Streamlit treats the call as a new cache key and forces
-    a fresh fetch.  This is more reliable than .clear() across Streamlit
-    versions and prevents stale data when the user wants a true refresh."""
+    Uses a multi-strategy fallback because yfinance is unreliable from
+    cloud hosts (rate-limiting, partial fills, occasional empty responses):
+        1. Bulk download   (5-min bars over 2 days)
+        2. Bulk download   (1-day bars over 5 days)  — daily close fallback
+        3. Per-ticker      (yf.Ticker.fast_info.last_price)
+        4. Per-ticker      (1-day bar download)
+
+    Returns whatever it managed to fetch.  Missing tickers are simply absent
+    from the dict so callers can show "—" instead of misleading fake values.
+    """
     _ = _salt   # intentionally unused — purely a cache-key differentiator
     if not tickers:
         return {}
-    prices = {}
-    try:
-        raw = yf.download(list(tickers), period="2d", interval="5m",
-                          progress=False, auto_adjust=True)
-        if raw is None or raw.empty:
-            return prices
+    prices: dict = {}
+    remaining = set(tickers)
 
-        # Flatten MultiIndex → single level (yfinance ≥ 0.2.x returns MultiIndex)
+    def _extract(raw, target_tickers):
+        """Pull last Close per ticker from a yfinance dataframe."""
+        out = {}
+        if raw is None or raw.empty:
+            return out
         if isinstance(raw.columns, pd.MultiIndex):
-            # Detect which level holds price-type labels (Open/High/Low/Close/Volume)
             _price_labels = {"Open", "High", "Low", "Close", "Volume"}
             lvl = 0 if _price_labels & set(raw.columns.get_level_values(0)) else 1
+            raw = raw.copy()
             raw.columns = raw.columns.get_level_values(lvl)
-            # If still MultiIndex (level flip didn't help), try xs
             if isinstance(raw.columns, pd.MultiIndex):
-                raw = raw.xs("Close", axis=1, level=0)
-
-        # Now raw is a DataFrame or Series
+                try:
+                    raw = raw.xs("Close", axis=1, level=0)
+                except Exception:
+                    return out
         if isinstance(raw, pd.DataFrame):
-            # Multi-ticker download → each column is a ticker
             if "Close" in raw.columns:
-                # Single level with Close column (single ticker case)
                 s = raw["Close"].dropna()
-                if not s.empty and len(tickers) == 1:
-                    prices[tickers[0]] = float(s.iloc[-1])
+                if not s.empty and len(target_tickers) == 1:
+                    out[next(iter(target_tickers))] = float(s.iloc[-1])
             else:
-                for tk in tickers:
+                for tk in target_tickers:
                     if tk in raw.columns:
                         s = raw[tk].dropna()
                         if not s.empty:
-                            prices[tk] = float(s.iloc[-1])
+                            out[tk] = float(s.iloc[-1])
         elif isinstance(raw, pd.Series):
             s = raw.dropna()
-            if not s.empty and tickers:
-                prices[tickers[0]] = float(s.iloc[-1])
+            if not s.empty and target_tickers:
+                out[next(iter(target_tickers))] = float(s.iloc[-1])
+        return out
+
+    # ── Strategy 1: 5-min bars over 2 days ────────────────────────────────────
+    try:
+        raw = yf.download(list(remaining), period="2d", interval="5m",
+                          progress=False, auto_adjust=True, threads=True)
+        prices.update(_extract(raw, remaining))
+        remaining -= set(prices.keys())
     except Exception:
         pass
+
+    # ── Strategy 2: daily bars over 5 days (for tickers still missing) ────────
+    if remaining:
+        try:
+            raw = yf.download(list(remaining), period="5d", interval="1d",
+                              progress=False, auto_adjust=True, threads=True)
+            prices.update(_extract(raw, remaining))
+            remaining -= set(prices.keys())
+        except Exception:
+            pass
+
+    # ── Strategy 3: per-ticker fast_info ──────────────────────────────────────
+    for tk in list(remaining):
+        try:
+            v = getattr(yf.Ticker(tk).fast_info, "last_price", None)
+            if v and float(v) > 0:
+                prices[tk] = float(v)
+                remaining.discard(tk)
+        except Exception:
+            pass
+
+    # ── Strategy 4: per-ticker 1d download (slowest, last resort) ────────────
+    for tk in list(remaining):
+        try:
+            raw = yf.download(tk, period="5d", interval="1d",
+                              progress=False, auto_adjust=True)
+            if raw is not None and not raw.empty:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    raw.columns = raw.columns.get_level_values(0)
+                if "Close" in raw.columns:
+                    s = raw["Close"].dropna()
+                    if not s.empty:
+                        prices[tk] = float(s.iloc[-1])
+                        remaining.discard(tk)
+        except Exception:
+            pass
+
     return prices
 
 def _render_stock_card(r: dict):
@@ -816,15 +864,16 @@ with st.sidebar:
 
                     # ── Live price from cached source (matches Paper Trades) ──
                     _cur = float(_live_prices_diag.get(_tk) or 0)
-                    if _cur > 0 and _gross > 0:
+                    _has_live = _cur > 0
+                    if _has_live and _gross > 0:
                         _cur_val = _shares * _cur
                         _unrl_d  = _cur_val - _gross          # nets buy fee (gross includes it)
                         _unrl_p  = _unrl_d / _gross * 100
                         _tot_unrl += _unrl_d
                         _tot_cost += _gross
                     else:
-                        _unrl_d = 0.0
-                        _unrl_p = 0.0
+                        _unrl_d = None   # honest "no data"
+                        _unrl_p = None
 
                     # ── Days held ────────────────────────────────────────────
                     _days = "?"
@@ -868,6 +917,21 @@ with st.sidebar:
 
                 st.dataframe(pd.DataFrame(_ph_rows), hide_index=True,
                              use_container_width=True)
+
+                # ── No-prices warning ────────────────────────────────────────
+                _diag_live_count = sum(1 for r in _ph_rows if r.get("Current", "?") != "?")
+                if _diag_live_count == 0 and len(_ph_rows) > 0:
+                    st.error(
+                        "🚨 **yfinance failed for all positions.** "
+                        "Streamlit Cloud is likely being rate-limited by Yahoo Finance. "
+                        "Click 🔄 Refresh in 30-60 seconds to retry.",
+                        icon="🚨",
+                    )
+                elif _diag_live_count < len(_ph_rows):
+                    st.warning(
+                        f"⚠️ Live prices fetched for only {_diag_live_count}/{len(_ph_rows)} positions.",
+                        icon="⚠️",
+                    )
 
                 # ── Unrealized P&L total (uses same cached price source) ────
                 if _tot_cost > 0:
@@ -2002,22 +2066,35 @@ with tab_paper:
         with st.spinner("Fetching live prices…"):
             live_prices = _fetch_live_prices(tickers_tuple, _salt=_price_salt)
 
-    # Build per-position live data
+    # Build per-position live data — only include positions WITH a live price
+    # in the totals.  Without a live price we cannot honestly say what the
+    # unrealized P&L is, so we mark it as N/A rather than show fake math.
     live_pos_map: dict = {}
     total_live_value = 0.0
     total_cost_basis = 0.0
+    _live_count      = 0
     for p in positions:
         tk     = p["ticker"]
         ep     = float(p.get("entry_price") or 0)
         shares = float(p.get("shares") or 0)
         gross  = float(p.get("gross_invested") or 0)
         cur    = live_prices.get(tk)
-        has_lv = cur is not None
-        if not has_lv:
-            cur = ep
-        cur_val = shares * cur
-        unr_pnl = cur_val - gross
-        unr_pct = (unr_pnl / gross * 100) if gross else 0.0
+        has_lv = cur is not None and cur > 0
+
+        if has_lv:
+            cur_val = shares * cur
+            unr_pnl = cur_val - gross
+            unr_pct = (unr_pnl / gross * 100) if gross else 0.0
+            total_live_value += cur_val
+            total_cost_basis += gross
+            _live_count += 1
+        else:
+            # No live price → don't fabricate a value
+            cur     = ep   # display fallback only
+            cur_val = None
+            unr_pnl = None
+            unr_pct = None
+
         live_pos_map[tk] = {
             "current_price":  cur,
             "current_value":  cur_val,
@@ -2025,15 +2102,29 @@ with tab_paper:
             "unrealized_pct": unr_pct,
             "has_live_price": has_lv,
         }
-        total_live_value += cur_val
-        total_cost_basis += gross
 
-    total_unrealized = total_live_value - total_cost_basis
-    unr_pct_total    = (total_unrealized / total_cost_basis * 100) if total_cost_basis else 0.0
-    prices_fetched   = bool(live_prices)
+    # If NO positions had live prices, totals are unknown — don't show fake P&L
+    if _live_count == 0:
+        total_unrealized = None
+        unr_pct_total    = None
+    else:
+        total_unrealized = total_live_value - total_cost_basis
+        unr_pct_total    = (total_unrealized / total_cost_basis * 100) if total_cost_basis else 0.0
+    prices_fetched = _live_count > 0
+    _missing_count = len(positions) - _live_count
 
-    # Mark-to-market total (cash + current value of positions at live prices)
-    mtm_total = s["available_cash"] + (total_live_value if positions else 0.0)
+    # Mark-to-market total (cash + current value of positions at live prices).
+    # When live prices are missing for some positions, fall back to cost basis
+    # for those — better than leaving them out entirely.
+    _mtm_positions_val = 0.0
+    for p in positions:
+        tk    = p["ticker"]
+        _lpm  = live_pos_map.get(tk, {})
+        if _lpm.get("has_live_price") and _lpm.get("current_value") is not None:
+            _mtm_positions_val += float(_lpm["current_value"])
+        else:
+            _mtm_positions_val += float(p.get("gross_invested") or 0)
+    mtm_total = s["available_cash"] + _mtm_positions_val
     mtm_ret   = mtm_total - s["starting_capital"]
 
     # ── Header KPIs ──────────────────────────────────────────────────────────
@@ -2067,26 +2158,36 @@ with tab_paper:
     # ── Unrealized P&L row ───────────────────────────────────────────────────
     if positions:
         st.markdown("<br>", unsafe_allow_html=True)
-        unr_col = "green" if total_unrealized >= 0 else "red"
         c1, c2, c3 = st.columns(3)
-        with c1:
-            kpi("Unrealized P&L",
-                f"{'+'if total_unrealized>=0 else ''}${total_unrealized:,.2f}",
-                unr_col)
-        with c2:
-            kpi("Unrealized %",
-                f"{'+'if unr_pct_total>=0 else ''}{unr_pct_total:.2f}%",
-                unr_col)
-        with c3:
-            kpi("Cost Basis (Open)",
-                f"${total_cost_basis:,.2f}",
-                "yellow")
+        if total_unrealized is None:
+            # No live prices at all — show N/A honestly
+            with c1: kpi("Unrealized P&L", "N/A — no live prices", "yellow")
+            with c2: kpi("Unrealized %",   "—",                    "yellow")
+        else:
+            unr_col = "green" if total_unrealized >= 0 else "red"
+            with c1: kpi("Unrealized P&L",
+                         f"{'+'if total_unrealized>=0 else ''}${total_unrealized:,.2f}",
+                         unr_col)
+            with c2: kpi("Unrealized %",
+                         f"{'+'if unr_pct_total>=0 else ''}{unr_pct_total:.2f}%",
+                         unr_col)
+        with c3: kpi("Cost Basis (Open)", f"${sum(float(p.get('gross_invested') or 0) for p in positions):,.2f}", "yellow")
+
         _pl1, _pl2 = st.columns([4, 1])
         with _pl1:
-            if prices_fetched:
-                st.caption("✅ Live prices — auto-refresh every 30 s, page-reload also refreshes")
+            if prices_fetched and _missing_count == 0:
+                st.caption("✅ Live prices for all positions — auto-refresh every 30 s")
+            elif prices_fetched and _missing_count > 0:
+                st.caption(f"⚠️ Live prices for {_live_count}/{len(positions)} positions  ·  "
+                           f"{_missing_count} position(s) could not be fetched")
             else:
-                st.caption("⚠️ Live prices unavailable — showing cost basis (unrealized P&L = $0)")
+                st.error(
+                    "🚨 **yfinance returned no prices for any position.**  "
+                    "Streamlit Cloud sometimes gets rate-limited by Yahoo. "
+                    "Click 🔄 Refresh now to retry, or wait a minute and try again. "
+                    "If this persists, the issue is upstream — your bot logic is fine.",
+                    icon="🚨",
+                )
         with _pl2:
             if st.button("🔄 Refresh now", key="paper_refresh_prices",
                          help="Force a fresh price fetch (bypasses cache)"):

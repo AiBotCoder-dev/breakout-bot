@@ -353,9 +353,11 @@ def badge(text: str, colour: str = "blue"):
     return f'<span class="badge badge-{colour}">{text}</span>'
 
 
-@st.cache_data(ttl=300)  # cache live prices for 5 minutes
+@st.cache_data(ttl=30)  # cache live prices for 30 seconds — fresh-ish + cheap
 def _fetch_live_prices(tickers: tuple) -> dict:
-    """Return {ticker: last_price} for all tickers. Cached 5 min to avoid hammering yfinance."""
+    """Return {ticker: last_price} for all tickers.  Cached 30 s to avoid
+    hammering yfinance while still feeling near-real-time.  Cache can be
+    cleared manually via st.cache_data.clear() (the refresh buttons do this)."""
     if not tickers:
         return {}
     prices = {}
@@ -865,17 +867,24 @@ with st.sidebar:
                 if _tot_cost > 0:
                     _tot_pct = _tot_unrl / _tot_cost * 100
                     _c = "#3fb950" if _tot_unrl >= 0 else "#f85149"
-                    st.markdown(
-                        f"<div style='font-size:1.05em'>"
-                        f"📊 <b>Total unrealized P&L:</b> "
-                        f"<span style='color:{_c}'>${_tot_unrl:+.2f} "
-                        f"({_tot_pct:+.2f}%)</span>"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
+                    _ut1, _ut2 = st.columns([3, 1])
+                    with _ut1:
+                        st.markdown(
+                            f"<div style='font-size:1.05em'>"
+                            f"📊 <b>Total unrealized P&L:</b> "
+                            f"<span style='color:{_c}'>${_tot_unrl:+.2f} "
+                            f"({_tot_pct:+.2f}%)</span>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+                    with _ut2:
+                        if st.button("🔄 Refresh", key="diag_refresh_prices",
+                                     help="Force fresh prices"):
+                            _fetch_live_prices.clear()
+                            st.rerun()
                     st.caption(
-                        "Now matches the **Unrealized P&L** shown in the main Paper Trades tab "
-                        "exactly — both use the same 5-min cached price snapshot."
+                        "Matches **Paper Trades** tab — 30-second auto-refresh, "
+                        "or click 🔄 above for an instant refresh."
                     )
 
                 # ── Breach check ─────────────────────────────────────────────
@@ -2059,10 +2068,17 @@ with tab_paper:
             kpi("Cost Basis (Open)",
                 f"${total_cost_basis:,.2f}",
                 "yellow")
-        if prices_fetched:
-            st.caption("✅ Live prices fetched — refreshes every 5 minutes")
-        else:
-            st.caption("⚠️ Live prices unavailable — showing cost basis (unrealized P&L = $0)")
+        _pl1, _pl2 = st.columns([4, 1])
+        with _pl1:
+            if prices_fetched:
+                st.caption("✅ Live prices — auto-refresh every 30 s, page-reload also refreshes")
+            else:
+                st.caption("⚠️ Live prices unavailable — showing cost basis (unrealized P&L = $0)")
+        with _pl2:
+            if st.button("🔄 Refresh now", key="paper_refresh_prices",
+                         help="Force a fresh price fetch (clears 30 s cache)"):
+                _fetch_live_prices.clear()
+                st.rerun()
 
     st.markdown("<br>", unsafe_allow_html=True)
 

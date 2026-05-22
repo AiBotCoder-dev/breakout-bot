@@ -140,6 +140,40 @@ def main():
     sent = send_telegram(msg)
     print(f"  Telegram: {'✓ sent' if sent else '✗ failed'}")
     print(f"  AI latency: {_AI.last_latency_ms} ms")
+
+    # ── Daily Learning Engine improvement suggestion ──────────────────────────
+    print()
+    print("  Generating daily Learning Engine improvement suggestion…")
+    try:
+        paper      = ts.PaperTradingEngine(conn)
+        learning   = ts.LearningEngine(conn)
+        suggestion = learning.generate_improvement_suggestion(_AI, paper)
+
+        if suggestion.get("suggestion"):
+            from_cache = suggestion.get("from_cache", False)
+            print(f"  {'(cached)' if from_cache else '(fresh)'} {suggestion['category']} — "
+                  f"{suggestion['suggestion']}")
+
+            # Build a clean Telegram payload — separate from the briefing
+            sm = (
+                f"💡 <b>Daily Learning Engine Suggestion</b>\n"
+                f"{datetime.utcnow().strftime('%a %d %b %Y')}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏷  <b>Category:</b> {suggestion.get('category', '—')}\n\n"
+                f"📌 <b>Suggestion:</b>\n{suggestion.get('suggestion', '—')}\n\n"
+                f"🧠 <b>Rationale:</b>\n{suggestion.get('rationale', '—')}\n\n"
+                f"⚙️  <b>Action:</b>\n<code>{suggestion.get('action', '—')}</code>"
+            )
+            if len(sm) > 4000:
+                sm = sm[:3990] + "…"
+            sent_s = send_telegram(sm)
+            print(f"  Suggestion → Telegram: {'✓ sent' if sent_s else '✗ failed'}")
+        else:
+            print("  Suggestion generator returned empty result — skipping.")
+    except Exception as _sx:
+        print(f"  WARN suggestion generation failed: {_sx}")
+        traceback.print_exc()
+
     conn.close()
     print("  Done.")
 

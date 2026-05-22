@@ -8847,6 +8847,18 @@ CREATE TABLE IF NOT EXISTS paper_punishment (
     master_score_floor      REAL DEFAULT 75,
     size_cap                REAL DEFAULT 0.5
 );
+CREATE TABLE IF NOT EXISTS paper_suggestions (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    suggestion_date         DATE,
+    learning_iteration      INTEGER,
+    category                TEXT,
+    suggestion              TEXT,
+    rationale               TEXT,
+    action                  TEXT,
+    applied                 INTEGER DEFAULT 0,
+    diagnostics_json        TEXT,
+    created_at              TIMESTAMP
+);
 """
 
     def __init__(self, conn):
@@ -9284,3 +9296,362 @@ CREATE TABLE IF NOT EXISTS paper_punishment (
             "master_score_floor":     float(_row_get(row, "master_score_floor", 75) or 75),
             "size_cap":               float(_row_get(row, "size_cap", 0.5) or 0.5),
         }
+
+    # ── Engine diagnostics & AI improvement suggestion ────────────────────────
+
+    def compile_engine_diagnostics(self, paper_engine) -> dict:
+        """Gather a rich snapshot of the bot's current performance so the AI
+        can make informed improvement suggestions.  Captures win rates,
+        score distributions, holding times, exit reasons, sector + pattern
+        performance — everything that helps spot what to tweak."""
+        diag = {
+            "iteration":         0,
+            "adjustments":       self.get_active_adjustments(),
+            "punishment":        self.get_punishment_status(),
+            "portfolio":         {},
+            "totals":            {},
+            "win_rate_pct":      0.0,
+            "by_exit_reason":    {},
+            "by_sector":         {},
+            "by_pattern":        {},
+            "score_buckets":     {"winners": [], "losers": []},
+            "lesson_history":    [],
+            "recent_close_avg":  {},
+        }
+        diag["iteration"] = diag["adjustments"].get("learning_iteration", 0)
+
+        # ── Portfolio summary ─────────────────────────────────────────────────
+        try:
+            summ = paper_engine.get_summary()
+            diag["portfolio"] = {
+                "cash":             float(summ.get("available_cash", 0)),
+                "realized_pnl":     float(summ.get("realized_pnl", 0)),
+                "total_return_pct": float(summ.get("total_return_pct", 0)),
+                "trades_made":      int(summ.get("trades_made", 0)),
+                "n_open":           int(summ.get("open_positions", 0) or 0),
+                "n_closed":         int(summ.get("n_closed", 0) or 0),
+            }
+        except Exception:
+            pass
+
+        # ── Closed trades analysis ────────────────────────────────────────────
+        try:
+            rows = self.conn.execute(
+                "SELECT ticker, sector, pattern, explosive_score, breakout_prob, "
+                "net_pnl, gross_invested, exit_reason, entry_date, exit_date "
+                "FROM paper_portfolio WHERE status='CLOSED'"
+            ).fetchall()
+            closed = [dict(r) for r in (rows or [])]
+        except Exception:
+            closed = []
+
+        if not closed:
+            diag["totals"] = {"n_winners": 0, "n_losers": 0, "n_total": 0}
+            diag["lesson_history"] = self.get_lesson_history(limit=5)
+            return diag
+
+        winners = [t for t in closed if (t.get("net_pnl") or 0) > 0]
+        losers  = [t for t in closed if (t.get("net_pnl") or 0) <= 0]
+        n_w, n_l = len(winners), len(losers)
+        n_t = n_w + n_l
+
+        diag["totals"] = {
+            "n_winners":     n_w,
+            "n_losers":      n_l,
+            "n_total":       n_t,
+            "sum_win_pnl":   round(sum(t.get("net_pnl", 0) for t in winners), 2),
+            "sum_loss_pnl":  round(sum(t.get("net_pnl", 0) for t in losers),  2),
+            "avg_win_pnl":   round(sum(t.get("net_pnl", 0) for t in winners) / n_w, 2) if n_w else 0,
+            "avg_loss_pnl":  round(sum(t.get("net_pnl", 0) for t in losers) / n_l,  2) if n_l else 0,
+            "biggest_win":   round(max((t.get("net_pnl", 0) for t in winners), default=0), 2),
+            "biggest_loss":  round(min((t.get("net_pnl", 0) for t in losers),  default=0), 2),
+        }
+        diag["win_rate_pct"] = round(n_w / n_t * 100, 1) if n_t else 0
+
+        # ── Per-bucket breakdowns ─────────────────────────────────────────────
+        def _bucket(field):
+            wins = {}
+            losses = {}
+            for t in closed:
+                k = str(t.get(field) or "Unknown") or "Unknown"
+                if (t.get("net_pnl") or 0) > 0:
+                    wins[k] = wins.get(k, 0) + 1
+                else:
+                    losses[k] = losses.get(k, 0) + 1
+            out = {}
+            for k in set(list(wins.keys()) + list(losses.keys())):
+                w, l = wins.get(k, 0), losses.get(k, 0)
+                tot = w + l
+                out[k] = {
+                    "wins":   w,
+                    "losses": l,
+                    "win_rate_pct": round(w / tot * 100, 1) if tot else 0,
+                    "total":  tot,
+                }
+            return out
+
+        diag["by_exit_reason"] = _bucket("exit_reason")
+        diag["by_sector"]      = _bucket("sector")
+        diag["by_pattern"]     = _bucket("pattern")
+
+        # ── Score distributions ───────────────────────────────────────────────
+        diag["score_buckets"]["winners"] = sorted(
+            [float(t.get("explosive_score") or 0) for t in winners])[:20]
+        diag["score_buckets"]["losers"] = sorted(
+            [float(t.get("explosive_score") or 0) for t in losers])[:20]
+
+        # ── Lesson history (past resets) ──────────────────────────────────────
+        diag["lesson_history"] = self.get_lesson_history(limit=5)
+
+        # ── Recent closes (last 5) ────────────────────────────────────────────
+        try:
+            recent_rows = self.conn.execute(
+                "SELECT ticker, net_pnl, exit_reason, exit_date "
+                "FROM paper_portfolio WHERE status='CLOSED' "
+                "ORDER BY exit_date DESC LIMIT 5"
+            ).fetchall()
+            diag["recent_close_avg"] = [
+                {k: dict(r).get(k) for k in ("ticker", "net_pnl", "exit_reason", "exit_date")}
+                for r in (recent_rows or [])
+            ]
+        except Exception:
+            pass
+
+        return diag
+
+    def generate_improvement_suggestion(self, ai_analyst, paper_engine) -> dict:
+        """Use the AI analyst to propose ONE concrete improvement to the
+        learning engine.  Stores the suggestion in paper_suggestions.
+
+        Returns dict: {date, suggestion, rationale, action, category, id}
+        Falls back to a deterministic suggestion if AI is unavailable, so the
+        feature still works without API keys."""
+        diag = self.compile_engine_diagnostics(paper_engine)
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+
+        # Skip if we already have a suggestion for today (idempotent daily run)
+        try:
+            existing = self.conn.execute(
+                "SELECT id, category, suggestion, rationale, action "
+                "FROM paper_suggestions WHERE suggestion_date=? "
+                "ORDER BY id DESC LIMIT 1",
+                (today,)
+            ).fetchone()
+            if existing:
+                d = dict(existing)
+                return {
+                    "date":       today,
+                    "category":   d.get("category", ""),
+                    "suggestion": d.get("suggestion", ""),
+                    "rationale":  d.get("rationale", ""),
+                    "action":     d.get("action", ""),
+                    "id":         d.get("id"),
+                    "from_cache": True,
+                }
+        except Exception:
+            pass
+
+        # ── Build the AI prompt ──────────────────────────────────────────────
+        prompt = (
+            "You are tuning a self-learning paper trading bot.  Below is a JSON "
+            "snapshot of the current Learning Engine state, recent performance, "
+            "active blacklists, and lesson history.  Suggest ONE specific "
+            "improvement that would make the bot more profitable going forward.\n\n"
+            "RULES:\n"
+            "1. Be concrete and actionable — name a specific parameter, threshold, "
+            "blacklist entry, or new check.\n"
+            "2. Cite numbers from the JSON to justify the change.\n"
+            "3. Pick ONE thing — the highest-leverage improvement for THIS state.\n"
+            "4. If the bot has few trades (<5 closed), suggest something to "
+            "increase trade frequency without sacrificing quality.\n"
+            "5. If the bot is over-trading or losing money, suggest tightening.\n"
+            "6. If win rate is decent but P&L is negative, suggest sizing/exit fixes.\n\n"
+            "Format your response EXACTLY like this (no extra prose):\n"
+            "CATEGORY: thresholds|blacklists|sizing|exits|new_check|other\n"
+            "SUGGESTION: <one sentence summary>\n"
+            "RATIONALE: <2-3 sentences citing specific numbers>\n"
+            "ACTION: <exact parameter / blacklist entry / code change to make>\n"
+        )
+
+        ai_response = ""
+        if ai_analyst and getattr(ai_analyst, "available", False):
+            try:
+                ai_response = ai_analyst.chat(prompt, context=diag, max_tokens=500)
+            except Exception:
+                ai_response = ""
+
+        # ── Parse AI response ────────────────────────────────────────────────
+        category, suggestion, rationale, action = "", "", "", ""
+        if ai_response and "SUGGESTION:" in ai_response:
+            try:
+                lines = [ln.strip() for ln in ai_response.splitlines() if ln.strip()]
+                for ln in lines:
+                    if ln.upper().startswith("CATEGORY:"):
+                        category = ln.split(":", 1)[1].strip()
+                    elif ln.upper().startswith("SUGGESTION:"):
+                        suggestion = ln.split(":", 1)[1].strip()
+                    elif ln.upper().startswith("RATIONALE:"):
+                        rationale = ln.split(":", 1)[1].strip()
+                    elif ln.upper().startswith("ACTION:"):
+                        action = ln.split(":", 1)[1].strip()
+            except Exception:
+                pass
+
+        # ── Deterministic fallback if AI failed or returned unparseable text ─
+        if not suggestion:
+            category, suggestion, rationale, action = self._fallback_suggestion(diag)
+
+        # ── Persist to DB ─────────────────────────────────────────────────────
+        import json as _json
+        new_id = None
+        try:
+            cur = self.conn.execute(
+                "INSERT INTO paper_suggestions "
+                "(suggestion_date, learning_iteration, category, suggestion, "
+                "rationale, action, diagnostics_json, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (today, diag.get("iteration", 0), category, suggestion, rationale,
+                 action, _json.dumps(diag, default=str)[:8000],
+                 datetime.utcnow().isoformat())
+            )
+            # Get the new ID
+            try:
+                last = self.conn.execute(
+                    "SELECT id FROM paper_suggestions ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                new_id = int(dict(last).get("id")) if last else None
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        return {
+            "date":       today,
+            "category":   category,
+            "suggestion": suggestion,
+            "rationale":  rationale,
+            "action":     action,
+            "id":         new_id,
+            "from_cache": False,
+        }
+
+    @staticmethod
+    def _fallback_suggestion(diag: dict) -> tuple:
+        """Deterministic rule-based suggestion when AI is unavailable.
+        Picks the most relevant heuristic given the bot's current state."""
+        n_t = diag.get("totals", {}).get("n_total", 0)
+        wr  = diag.get("win_rate_pct", 0)
+        adj = diag.get("adjustments", {})
+        ms_floor = adj.get("min_master_score", 65)
+        iter_n = diag.get("iteration", 0)
+        portfolio = diag.get("portfolio", {})
+        n_open = portfolio.get("n_open", 0)
+        realized = portfolio.get("realized_pnl", 0)
+
+        # Too few trades — encourage activity
+        if n_t < 5:
+            return (
+                "thresholds",
+                "Lower min_master_score to widen the candidate pool",
+                f"Only {n_t} trades closed so far — insufficient data to learn from. "
+                f"The current floor of {ms_floor:.0f} may be filtering too aggressively.",
+                f"Set LearningEngine.get_active_adjustments min_master_score to "
+                f"{max(55, ms_floor - 5):.0f} (was {ms_floor:.0f}) for 1 week to gather more data.",
+            )
+
+        # Punishment active
+        if diag.get("punishment", {}).get("active"):
+            return (
+                "risk_management",
+                "Add a partial-profit-taking rule before punishment kicks in",
+                f"Bot is currently in PUNISHMENT mode at iteration #{iter_n}. "
+                f"Drawdown was reached without taking any profits along the way.",
+                "Add rule: when any position is up >25%, automatically take 50% off "
+                "and trail stop on the remainder. Locks in gains before reversals.",
+            )
+
+        # Low win rate
+        if wr < 40 and n_t >= 10:
+            return (
+                "thresholds",
+                "Raise min_master_score floor to filter out weak setups",
+                f"Win rate is {wr:.0f}% across {n_t} closed trades — below the 50% "
+                f"breakeven threshold. Current Master Score floor of {ms_floor:.0f} is "
+                f"too lenient.",
+                f"Increase min_master_score to {min(85, ms_floor + 10):.0f} "
+                f"to require higher-conviction setups.",
+            )
+
+        # Decent win rate but losing money → R:R issue
+        if wr >= 50 and realized < 0:
+            return (
+                "exits",
+                "Tighten stops + extend targets to improve R:R ratio",
+                f"Win rate {wr:.0f}% is good but realized P&L is negative ${realized:.2f}. "
+                "Losers are bigger than winners — stops are too wide OR targets are too close.",
+                "In PaperTradingEngine.open_position, tighten stop_dist floor from 2% to "
+                "1.5% AND raise default target multiplier from 1.5× to 2.0× of risk.",
+            )
+
+        # High exit count via TIME_STOP → positions sitting too long
+        by_exit = diag.get("by_exit_reason", {})
+        ts_count = by_exit.get("TIME_STOP", {}).get("total", 0)
+        if ts_count >= 3 and ts_count / n_t > 0.3:
+            return (
+                "exits",
+                "Reduce holding window — too many positions are dying from theta",
+                f"{ts_count}/{n_t} trades exited via TIME_STOP. Positions are sitting "
+                f"in their range without hitting T1 — wasted capital.",
+                "In check_stops_and_targets, change the TIME_STOP threshold from "
+                "10 trading days to 7. Frees up slots faster.",
+            )
+
+        # Default
+        return (
+            "new_check",
+            "Add a pre-market gap filter to skip positions with overnight news",
+            f"No specific pattern detected in {n_t} trades — start with a defensive "
+            "addition. Pre-market gaps >5% indicate news that often invalidates "
+            "the breakout setup.",
+            "Add a check in open_position: if abs(open_price - prev_close) / prev_close "
+            "> 0.05, skip this entry today (news-driven, unpredictable).",
+        )
+
+    def get_latest_suggestion(self) -> dict:
+        """Return the most recent improvement suggestion."""
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM paper_suggestions ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                return dict(row)
+        except Exception:
+            pass
+        return {}
+
+    def get_suggestion_history(self, limit: int = 30) -> list:
+        """Return the last N suggestions."""
+        try:
+            rows = self.conn.execute(
+                "SELECT * FROM paper_suggestions ORDER BY id DESC LIMIT ?",
+                (int(limit),)
+            ).fetchall()
+            out = []
+            for r in rows or []:
+                try:
+                    out.append(dict(r))
+                except Exception:
+                    pass
+            return out
+        except Exception:
+            return []
+
+    def mark_suggestion_applied(self, suggestion_id: int) -> bool:
+        try:
+            self.conn.execute(
+                "UPDATE paper_suggestions SET applied=1 WHERE id=?",
+                (int(suggestion_id),)
+            )
+            return True
+        except Exception:
+            return False

@@ -1052,6 +1052,71 @@ with st.sidebar:
                             st.divider()
                 else:
                     st.caption("No resets yet — bot has not hit -50% drawdown.")
+
+                # ── Daily AI improvement suggestion ──────────────────────
+                st.markdown("**💡 Today's Improvement Suggestion**")
+                _latest = _le.get_latest_suggestion()
+                _today_iso = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+                _has_today = (_latest and str(_latest.get("suggestion_date","")).startswith(_today_iso))
+
+                if _has_today and _latest.get("suggestion"):
+                    _applied = bool(_latest.get("applied", 0))
+                    _border = "#3fb950" if _applied else "#58a6ff"
+                    _tag    = "✅ Applied" if _applied else "🆕 New"
+                    st.markdown(
+                        f"<div style='background:#161b22;border-left:4px solid {_border};"
+                        f"border-radius:6px;padding:10px 14px;margin:4px 0'>"
+                        f"<div style='font-size:0.7em;color:#8b949e'>"
+                        f"{_latest.get('suggestion_date','?')}  ·  "
+                        f"{_tag}  ·  category: <b>{_latest.get('category','?')}</b></div>"
+                        f"<div style='font-weight:bold;color:#e6edf3;margin-top:4px'>"
+                        f"{_latest.get('suggestion','—')}</div>"
+                        f"<div style='font-size:0.85em;color:#c9d1d9;margin-top:6px'>"
+                        f"<b>Why:</b> {_latest.get('rationale','—')}</div>"
+                        f"<div style='font-size:0.85em;color:#c9d1d9;margin-top:6px;"
+                        f"background:#0d1117;padding:6px 8px;border-radius:4px'>"
+                        f"<b>Action:</b> <code>{_latest.get('action','—')}</code></div>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                    if not _applied:
+                        if st.button("✅ Mark as Applied",
+                                     key=f"mark_applied_{_latest.get('id')}",
+                                     help="Track which suggestions you've implemented"):
+                            try:
+                                _le.mark_suggestion_applied(_latest.get("id"))
+                                st.rerun()
+                            except Exception:
+                                pass
+                else:
+                    st.caption("No suggestion yet for today.")
+                    if st.button("🪄 Generate Now", key="gen_suggestion_now",
+                                 help="Manually trigger today's suggestion (runs daily at 8:30 AM ET via GitHub Actions)"):
+                        try:
+                            from ai_engine import AIAnalyst as _AIA
+                            _ai_inst = _AIA()
+                            with st.spinner("Analysing engine state and generating suggestion…"):
+                                _new = _le.generate_improvement_suggestion(_ai_inst, _pe_diag)
+                            if _new.get("suggestion"):
+                                st.success(f"💡 {_new['suggestion']}", icon="💡")
+                                st.rerun()
+                            else:
+                                st.warning("Could not generate a suggestion.")
+                        except Exception as _ge:
+                            st.error(f"Generation failed: {_ge}", icon="❌")
+
+                # ── Suggestion history ────────────────────────────────────
+                _sug_hist = _le.get_suggestion_history(limit=15)
+                if _sug_hist:
+                    with st.expander(f"🗂  Suggestion History ({len(_sug_hist)})",
+                                     expanded=False):
+                        for _s in _sug_hist:
+                            _sd  = str(_s.get("suggestion_date", "?"))
+                            _ap  = "✅" if _s.get("applied") else "⬜"
+                            _cat = _s.get("category", "—")
+                            st.markdown(f"{_ap} **{_sd}** · _{_cat}_ · "
+                                       f"{_s.get('suggestion', '—')}")
+                            st.caption(_s.get("rationale", ""))
             except Exception as _le_exc:
                 st.caption(f"Learning engine unavailable: {_le_exc}")
 

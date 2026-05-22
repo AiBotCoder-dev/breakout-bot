@@ -1670,6 +1670,32 @@ with tab_dash:
     # Open positions table
     st.markdown('<div class="section-hdr">Open Virtual Positions</div>',
                 unsafe_allow_html=True)
+
+    # ── Refresh control: update_calls() fetches live prices for all pending
+    # virtual positions and recomputes current_price / current_pct / outcomes.
+    # Cached for 5 min so re-renders don't trigger 104 yfinance calls.
+    _vp_c1, _vp_c2, _vp_c3 = st.columns([2, 1, 1])
+    with _vp_c1:
+        st.caption("Live P&L tracking on every breakout call.  "
+                   "Click 🔄 to fetch fresh prices for all open positions.")
+    with _vp_c2:
+        _vp_last = st.session_state.get("virtual_pos_refreshed_at", "Never")
+        st.caption(f"Last refresh: **{_vp_last}**")
+    with _vp_c3:
+        if st.button("🔄 Refresh All Prices", key="dash_refresh_virtual",
+                     type="primary", use_container_width=True,
+                     help="Fetches live prices for all open virtual positions (~30s for 100 tickers)"):
+            with st.spinner("Refreshing live prices for all open positions…"):
+                try:
+                    _n = logger.update_calls()
+                    st.session_state["virtual_pos_refreshed_at"] = (
+                        datetime.utcnow().strftime("%H:%M:%S UTC")
+                    )
+                    st.success(f"Updated {_n} position(s)", icon="✅")
+                    st.rerun()
+                except Exception as _re:
+                    st.error(f"Refresh failed: {_re}")
+
     open_pos = tracker.get_open_positions()
     if not open_pos:
         st.info("No open positions. Run a scan to start tracking.", icon="📂")
@@ -1680,8 +1706,24 @@ with tab_dash:
             ep  = p.get("entry_price") or 0
             cur = p.get("current_price") or ep
             pct = p.get("current_pct") or 0
+
+            # ── Date parsing: handle Postgres date objects + string formats ──
+            _ed = p.get("entry_date")
+            day_n = "?"
             try:
-                day_n = (today - datetime.strptime(p["entry_date"], "%Y-%m-%d").date()).days + 1
+                if _ed is None:
+                    pass
+                elif isinstance(_ed, str):
+                    _ed_dt = datetime.strptime(_ed[:10], "%Y-%m-%d").date()
+                    day_n = (today - _ed_dt).days + 1
+                elif hasattr(_ed, "year"):
+                    # datetime.date OR datetime.datetime from psycopg2
+                    _ed_dt = _ed.date() if hasattr(_ed, "hour") else _ed
+                    day_n = (today - _ed_dt).days + 1
+                else:
+                    # pandas Timestamp or other — try pd.Timestamp
+                    _ed_dt = pd.Timestamp(_ed).date()
+                    day_n = (today - _ed_dt).days + 1
             except Exception:
                 day_n = "?"
             tgt = p.get("target_price")

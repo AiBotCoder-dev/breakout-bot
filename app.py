@@ -1328,6 +1328,72 @@ with tab_mgmt:
                 if _bl:
                     st.caption(f"🚫 {_bl_label}: {', '.join(_bl)}")
 
+            # ── Continuous learning panel: signal performance + recent nudges ─
+            with st.expander("📈 Continuous Learning (per-trade signal performance)",
+                              expanded=False):
+                # Process any new closes that the monitor hasn't picked up yet
+                if st.button("🔄 Process Recent Closes",
+                             key="mgmt_proc_closes", use_container_width=True,
+                             help="Run continuous learning on any trades closed since last monitor cycle"):
+                    with st.spinner("Processing closed trades..."):
+                        _lcr = _mgmt_le.process_recent_closes(max_per_cycle=200)
+                        st.success(f"Processed {_lcr['n_processed']} "
+                                    f"({_lcr['n_wins']}W / {_lcr['n_losses']}L)")
+                        st.rerun()
+
+                # Per-signal performance
+                _sig_types = ["sector", "pattern", "score_bucket",
+                              "prob_bucket", "exit_reason"]
+                _sig_labels = {"sector": "🏭 Sector", "pattern": "📐 Pattern",
+                               "score_bucket": "💯 Score Bucket",
+                               "prob_bucket": "🎯 Prob Bucket",
+                               "exit_reason": "🚪 Exit Reason"}
+                for _st_name in _sig_types:
+                    rows = _mgmt_le.get_signal_performance(signal_type=_st_name, min_trades=1)
+                    if not rows:
+                        continue
+                    st.markdown(f"**{_sig_labels.get(_st_name, _st_name)}**")
+                    _df_rows = []
+                    for r in rows[:10]:
+                        wr  = r.get("win_rate_pct", 0)
+                        n_t = r.get("n_trades", 0)
+                        _icon = "🟢" if wr >= 60 else "🟡" if wr >= 40 else "🔴"
+                        _df_rows.append({
+                            "Value":     r.get("signal_value", "?"),
+                            "Trades":    n_t,
+                            "Wins":      r.get("n_wins", 0),
+                            "Losses":    r.get("n_losses", 0),
+                            "Win %":     f"{_icon} {wr:.0f}%",
+                            "Expectancy": f"${r.get('expectancy', 0):+.2f}",
+                        })
+                    st.dataframe(pd.DataFrame(_df_rows), hide_index=True,
+                                 use_container_width=True)
+
+                # Recent learning events log
+                st.markdown("**🪄 Recent Auto-Adjustments**")
+                _events = _mgmt_le.get_recent_learning_events(limit=10)
+                if _events:
+                    for e in _events:
+                        _t = str(e.get("event_at", ""))[:19]
+                        _et = e.get("event_type", "?")
+                        _dt = e.get("detail", "")
+                        _bv = e.get("before_value", "")
+                        _av = e.get("after_value", "")
+                        _ic = {
+                            "NUDGE_RAISE_SCORE": "📈",
+                            "NUDGE_LOWER_SCORE": "📉",
+                            "BLACKLIST_ADD":     "🚫",
+                        }.get(_et, "•")
+                        _change = (f"  ·  <code>{_bv} → {_av}</code>"
+                                   if _bv and _av else "")
+                        st.markdown(
+                            f"{_ic} <small style='color:#8b949e'>{_t}</small>  "
+                            f"<b>{_et}</b>{_change}<br>"
+                            f"<small>{_dt}</small>",
+                            unsafe_allow_html=True)
+                else:
+                    st.caption("No auto-adjustments yet — learning kicks in after the first 10 closed trades.")
+
             st.markdown("**💡 Today's Improvement Suggestion**")
             _latest = _mgmt_le.get_latest_suggestion()
             _today = pd.Timestamp.utcnow().strftime("%Y-%m-%d")

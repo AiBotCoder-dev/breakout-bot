@@ -9215,6 +9215,35 @@ CREATE TABLE IF NOT EXISTS paper_suggestions (
     diagnostics_json        TEXT,
     created_at              TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS paper_signal_performance (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_type             TEXT,
+    signal_value            TEXT,
+    n_trades                INTEGER DEFAULT 0,
+    n_wins                  INTEGER DEFAULT 0,
+    n_losses                INTEGER DEFAULT 0,
+    sum_win_pnl             REAL    DEFAULT 0,
+    sum_loss_pnl            REAL    DEFAULT 0,
+    last_updated            TIMESTAMP,
+    UNIQUE(signal_type, signal_value)
+);
+CREATE TABLE IF NOT EXISTS paper_learn_state (
+    id                      INTEGER PRIMARY KEY,
+    last_processed_trade_id INTEGER DEFAULT 0,
+    recent_wins             INTEGER DEFAULT 0,
+    recent_losses           INTEGER DEFAULT 0,
+    nudges_made             INTEGER DEFAULT 0,
+    last_nudge_at           TIMESTAMP,
+    notes                   TEXT
+);
+CREATE TABLE IF NOT EXISTS paper_learning_log (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_at                TIMESTAMP,
+    event_type              TEXT,
+    detail                  TEXT,
+    before_value            TEXT,
+    after_value             TEXT
+);
 """
 
     def __init__(self, conn):
@@ -10161,3 +10190,350 @@ CREATE TABLE IF NOT EXISTS paper_suggestions (
             "message": ("This suggestion category requires manual code changes — "
                         "I can help you implement it but can't auto-apply.")
         }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CONTINUOUS LEARNING — adapts after every closed trade, not just resets
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # Configurable nudge amounts (small, conservative — accumulate over many trades)
+    _NUDGE_WIN_THRESHOLD       = 60   # win-rate %  ≥ this → become more aggressive
+    _NUDGE_LOSS_THRESHOLD      = 30   # win-rate %  ≤ this → become more conservative
+    _NUDGE_LOOKBACK_TRADES     = 10   # how many recent closes to consider
+    _NUDGE_STEP_AGGR           = 1.0  # min_master_score decrease per aggressive nudge
+    _NUDGE_STEP_CAUT           = 2.0  # min_master_score increase per cautious nudge
+    _NUDGE_MIN_MASTER          = 45.0
+    _NUDGE_MAX_MASTER          = 85.0
+
+    # Probationary blacklist (faster reversible blacklist)
+    _PROBATION_LOSS_COUNT      = 2    # 2 losses in same bucket → probation
+    _BLACKLIST_LOSS_COUNT      = 3    # 3 losses in same bucket → blacklist
+
+    def _log_learn_event(self, event_type: str, detail: str = "",
+                         before: str = "", after: str = ""):
+        try:
+            self.conn.execute(
+                "INSERT INTO paper_learning_log "
+                "(event_at, event_type, detail, before_value, after_value) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (datetime.utcnow().isoformat(), event_type[:64],
+                 str(detail)[:512], str(before)[:200], str(after)[:200])
+            )
+        except Exception:
+            pass
+
+    def _learn_state(self) -> dict:
+        """Read (or seed) the persistent learn-state row."""
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM paper_learn_state WHERE id=1"
+            ).fetchone()
+            if row:
+                return dict(row)
+        except Exception:
+            pass
+        try:
+            self.conn.execute(
+                "INSERT INTO paper_learn_state (id, last_processed_trade_id) "
+                "VALUES (1, 0)"
+            )
+        except Exception:
+            pass
+        return {"id": 1, "last_processed_trade_id": 0,
+                "recent_wins": 0, "recent_losses": 0,
+                "nudges_made": 0, "last_nudge_at": None, "notes": ""}
+
+    def _bump_signal_perf(self, signal_type: str, signal_value: str,
+                          is_win: bool, pnl: float):
+        """Increment win/loss counters for a (type, value) signal cell."""
+        signal_value = (signal_value or "").strip() or "Unknown"
+        try:
+            # Try update first
+            row = self.conn.execute(
+                "SELECT id, n_trades, n_wins, n_losses, sum_win_pnl, sum_loss_pnl "
+                "FROM paper_signal_performance "
+                "WHERE signal_type=? AND signal_value=?",
+                (signal_type, signal_value)
+            ).fetchone()
+            if row:
+                rid       = _row_get(row, "id")
+                n_t       = int(_row_get(row, "n_trades",     0) or 0) + 1
+                n_w       = int(_row_get(row, "n_wins",       0) or 0) + (1 if is_win else 0)
+                n_l       = int(_row_get(row, "n_losses",     0) or 0) + (0 if is_win else 1)
+                s_w_pnl   = float(_row_get(row, "sum_win_pnl",  0) or 0) + (pnl if is_win else 0)
+                s_l_pnl   = float(_row_get(row, "sum_loss_pnl", 0) or 0) + (pnl if not is_win else 0)
+                self.conn.execute(
+                    "UPDATE paper_signal_performance "
+                    "SET n_trades=?, n_wins=?, n_losses=?, "
+                    "sum_win_pnl=?, sum_loss_pnl=?, last_updated=? "
+                    "WHERE id=?",
+                    (n_t, n_w, n_l, s_w_pnl, s_l_pnl,
+                     datetime.utcnow().isoformat(), rid)
+                )
+            else:
+                self.conn.execute(
+                    "INSERT INTO paper_signal_performance "
+                    "(signal_type, signal_value, n_trades, n_wins, n_losses, "
+                    "sum_win_pnl, sum_loss_pnl, last_updated) "
+                    "VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
+                    (signal_type, signal_value,
+                     1 if is_win else 0,
+                     0 if is_win else 1,
+                     pnl if is_win else 0,
+                     pnl if not is_win else 0,
+                     datetime.utcnow().isoformat())
+                )
+        except Exception:
+            pass
+
+    def record_trade_outcome(self, trade: dict):
+        """Update signal performance stats + trigger threshold/blacklist nudges
+        based on this single closed trade.  Called from process_recent_closes()."""
+        try:
+            pnl    = float(trade.get("net_pnl", 0) or 0)
+            is_win = pnl > 0
+
+            # Bump every signal dimension we have on the trade
+            for sig_type, sig_value in [
+                ("sector",       trade.get("sector",  "")),
+                ("pattern",      trade.get("pattern", "")),
+                ("score_bucket", self._bucket_score(trade.get("explosive_score", 0))),
+                ("prob_bucket",  self._bucket_prob (trade.get("breakout_prob",   0))),
+                ("exit_reason",  trade.get("exit_reason", "")),
+            ]:
+                self._bump_signal_perf(sig_type, str(sig_value or ""),
+                                        is_win, pnl)
+
+            # ── Adaptive blacklisting per sector / pattern ──────────────────
+            for sig_type, kind in [("sector", "sector"), ("pattern", "pattern")]:
+                self._maybe_promote_blacklist(sig_type, kind,
+                                              str(trade.get(sig_type, "") or ""))
+
+            # ── Threshold nudge based on rolling win rate ───────────────────
+            self._maybe_nudge_threshold(is_win)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _bucket_score(score) -> str:
+        try:
+            s = float(score or 0)
+        except Exception:
+            return "Unknown"
+        if   s >= 85: return "85+"
+        elif s >= 75: return "75-84"
+        elif s >= 65: return "65-74"
+        elif s >= 50: return "50-64"
+        else:          return "<50"
+
+    @staticmethod
+    def _bucket_prob(prob) -> str:
+        try:
+            p = float(prob or 0)
+        except Exception:
+            return "Unknown"
+        if   p >= 80: return "80+"
+        elif p >= 70: return "70-79"
+        elif p >= 60: return "60-69"
+        else:          return "<60"
+
+    def _maybe_promote_blacklist(self, sig_type: str, kind: str, value: str):
+        """If a signal value has accumulated too many losses, escalate it.
+        Two-tier system:
+          probation (size cap 0.3× for that value) → at _PROBATION_LOSS_COUNT
+          blacklist (auto-skip)                    → at _BLACKLIST_LOSS_COUNT
+        """
+        if not value or value == "Unknown":
+            return
+        try:
+            row = self.conn.execute(
+                "SELECT n_trades, n_wins, n_losses FROM paper_signal_performance "
+                "WHERE signal_type=? AND signal_value=?",
+                (sig_type, value)
+            ).fetchone()
+            if not row:
+                return
+            n_t = int(_row_get(row, "n_trades", 0) or 0)
+            n_w = int(_row_get(row, "n_wins",   0) or 0)
+            n_l = int(_row_get(row, "n_losses", 0) or 0)
+            wr  = n_w / n_t * 100 if n_t else 0
+
+            adj = self.get_active_adjustments()
+            bl_key  = f"{kind}_blacklist"
+            current = list(adj.get(bl_key, []))
+
+            # Promote to blacklist?
+            if n_l >= self._BLACKLIST_LOSS_COUNT and wr < 30 and value not in current:
+                self.add_to_blacklist(kind, value)
+                self._log_learn_event(
+                    "BLACKLIST_ADD",
+                    f"{kind}='{value}' added to blacklist after {n_l}L/{n_w}W (WR {wr:.0f}%)",
+                    before=", ".join(current) or "none",
+                    after=", ".join(current + [value]),
+                )
+        except Exception:
+            pass
+
+    def _maybe_nudge_threshold(self, last_was_win: bool):
+        """Rolling-window threshold adjustment.  After every NUDGE_LOOKBACK_TRADES
+        closes, recompute win rate and nudge min_master_score accordingly."""
+        st = self._learn_state()
+        wins   = int(st.get("recent_wins",   0) or 0)
+        losses = int(st.get("recent_losses", 0) or 0)
+        if last_was_win:
+            wins += 1
+        else:
+            losses += 1
+
+        # Save rolling window
+        try:
+            self.conn.execute(
+                "UPDATE paper_learn_state SET recent_wins=?, recent_losses=? WHERE id=1",
+                (wins, losses)
+            )
+        except Exception:
+            pass
+
+        total = wins + losses
+        if total < self._NUDGE_LOOKBACK_TRADES:
+            return
+
+        # We've hit the lookback window — compute & nudge
+        wr = wins / total * 100 if total else 0
+        adj = self.get_active_adjustments()
+        cur_min = float(adj.get("min_master_score", 65))
+        new_min = cur_min
+
+        if wr <= self._NUDGE_LOSS_THRESHOLD:
+            # Be more conservative
+            new_min = min(self._NUDGE_MAX_MASTER, cur_min + self._NUDGE_STEP_CAUT)
+            if new_min > cur_min:
+                self.set_min_master_score(new_min)
+                self._log_learn_event(
+                    "NUDGE_RAISE_SCORE",
+                    f"Last {total} trades WR {wr:.0f}% → raised min_master_score",
+                    before=f"{cur_min:.0f}",
+                    after=f"{new_min:.0f}",
+                )
+        elif wr >= self._NUDGE_WIN_THRESHOLD:
+            # Be more aggressive
+            new_min = max(self._NUDGE_MIN_MASTER, cur_min - self._NUDGE_STEP_AGGR)
+            if new_min < cur_min:
+                self.set_min_master_score(new_min)
+                self._log_learn_event(
+                    "NUDGE_LOWER_SCORE",
+                    f"Last {total} trades WR {wr:.0f}% → lowered min_master_score",
+                    before=f"{cur_min:.0f}",
+                    after=f"{new_min:.0f}",
+                )
+
+        # Reset rolling window + bump nudge count
+        try:
+            self.conn.execute(
+                "UPDATE paper_learn_state SET recent_wins=0, recent_losses=0, "
+                "nudges_made = COALESCE(nudges_made,0) + 1, last_nudge_at=? "
+                "WHERE id=1",
+                (datetime.utcnow().isoformat(),)
+            )
+        except Exception:
+            pass
+
+    def process_recent_closes(self, max_per_cycle: int = 50) -> dict:
+        """Find paper trades that have closed since the last call and update
+        learning stats for each.  Idempotent — uses last_processed_trade_id
+        to avoid re-processing.
+
+        Returns dict with counts: n_processed, n_wins, n_losses.
+        """
+        st = self._learn_state()
+        last_id = int(st.get("last_processed_trade_id", 0) or 0)
+
+        try:
+            rows = self.conn.execute(
+                "SELECT id, ticker, pattern, sector, explosive_score, "
+                "breakout_prob, net_pnl, exit_reason "
+                "FROM paper_portfolio "
+                "WHERE status='CLOSED' AND id > ? "
+                "ORDER BY id ASC LIMIT ?",
+                (last_id, int(max_per_cycle))
+            ).fetchall()
+        except Exception:
+            return {"n_processed": 0, "n_wins": 0, "n_losses": 0, "error": "db read failed"}
+
+        n_wins = 0
+        n_losses = 0
+        max_seen_id = last_id
+        for r in rows or []:
+            try:
+                trade = dict(r)
+            except Exception:
+                continue
+            pnl = float(trade.get("net_pnl", 0) or 0)
+            if pnl > 0:
+                n_wins += 1
+            elif pnl < 0:
+                n_losses += 1
+            self.record_trade_outcome(trade)
+            tid = int(trade.get("id") or 0)
+            if tid > max_seen_id:
+                max_seen_id = tid
+
+        # Persist the watermark
+        if max_seen_id > last_id:
+            try:
+                self.conn.execute(
+                    "UPDATE paper_learn_state SET last_processed_trade_id=? WHERE id=1",
+                    (max_seen_id,)
+                )
+            except Exception:
+                pass
+
+        return {"n_processed": len(rows or []), "n_wins": n_wins,
+                "n_losses": n_losses, "watermark": max_seen_id}
+
+    def get_signal_performance(self, signal_type: str = None,
+                                  min_trades: int = 1) -> list:
+        """Return per-signal performance rows for the UI / diagnostics."""
+        try:
+            if signal_type:
+                rows = self.conn.execute(
+                    "SELECT * FROM paper_signal_performance "
+                    "WHERE signal_type=? AND n_trades>=? "
+                    "ORDER BY n_trades DESC, n_wins DESC",
+                    (signal_type, int(min_trades))
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT * FROM paper_signal_performance "
+                    "WHERE n_trades>=? "
+                    "ORDER BY signal_type, n_trades DESC",
+                    (int(min_trades),)
+                ).fetchall()
+            out = []
+            for r in rows or []:
+                try:
+                    d = dict(r)
+                except Exception:
+                    continue
+                n_t = int(d.get("n_trades", 0) or 0)
+                n_w = int(d.get("n_wins",   0) or 0)
+                d["win_rate_pct"] = round(n_w / n_t * 100, 1) if n_t else 0.0
+                d["expectancy"]   = (
+                    round((float(d.get("sum_win_pnl") or 0) +
+                           float(d.get("sum_loss_pnl") or 0)) / n_t, 2)
+                    if n_t else 0.0
+                )
+                out.append(d)
+            return out
+        except Exception:
+            return []
+
+    def get_recent_learning_events(self, limit: int = 20) -> list:
+        """Recent threshold nudges, blacklist additions, etc., for display."""
+        try:
+            rows = self.conn.execute(
+                "SELECT * FROM paper_learning_log ORDER BY id DESC LIMIT ?",
+                (int(limit),)
+            ).fetchall()
+            return [dict(r) for r in rows or []]
+        except Exception:
+            return []

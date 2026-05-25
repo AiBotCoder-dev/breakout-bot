@@ -991,6 +991,18 @@ def main():
     try:
         opts_for_reset  = ts.OptionsPaperEngine(conn)
         learning_engine = ts.LearningEngine(conn)
+
+        # ── Continuous learning: process every trade closed since last cycle ──
+        # This is the "adapt fast" mechanism — runs every 5 minutes, updates
+        # signal performance stats and nudges thresholds based on outcomes.
+        try:
+            _lc = learning_engine.process_recent_closes(max_per_cycle=50)
+            if _lc.get("n_processed", 0) > 0:
+                print(f"  Continuous learning: processed {_lc['n_processed']} "
+                      f"closed trades ({_lc['n_wins']}W / {_lc['n_losses']}L)")
+        except Exception as _cle:
+            print(f"  WARN continuous learning failed: {_cle}")
+
         le_state = learning_engine.check_state(paper, opts_for_reset)
         learning_adjustments = le_state.get("adjustments", learning_adjustments)
         action = le_state.get("action", "NORMAL")

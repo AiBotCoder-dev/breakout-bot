@@ -1293,13 +1293,54 @@ with tab_mgmt:
                 f"<br><small style='color:#8b949e'>{_rs.get('reason', '')}</small>"
                 f"</div>", unsafe_allow_html=True)
             _sec_exp = _rs.get("sector_exposure", {})
+            _n_unk = int(_rs.get("n_unknown_sector", 0) or 0)
+            _unk_pct = float(_rs.get("unknown_sector_pct", 0) or 0)
+
+            # Show Backfill button if any positions have unknown sector
+            if _n_unk > 0:
+                _bf_c1, _bf_c2 = st.columns([3, 1])
+                with _bf_c1:
+                    st.info(
+                        f"ℹ️ {_n_unk} legacy position(s) missing sector data "
+                        f"({_unk_pct:.0f}% of book). Click → to fetch sectors from yfinance.",
+                        icon="ℹ️",
+                    )
+                with _bf_c2:
+                    if st.button("🔧 Backfill Sectors",
+                                  key="mgmt_backfill_sectors",
+                                  type="primary",
+                                  help="One-shot: fetches sector via yfinance for "
+                                       "positions opened before sector tracking was added"):
+                        with st.spinner(f"Fetching sectors for {_n_unk} ticker(s)…"):
+                            _bf = ts.backfill_position_sectors(conn, limit=200)
+                            if _bf.get("updated", 0) > 0:
+                                st.success(_bf.get("message", "Done"),
+                                           icon="✅")
+                                if _bf.get("details"):
+                                    st.caption("Updated: " + ", ".join(_bf["details"][:15]))
+                                st.rerun()
+                            else:
+                                st.warning(_bf.get("message", "No updates"))
+
             if _sec_exp:
                 st.markdown("**Sector exposure**")
-                for _sec, _pct in sorted(_sec_exp.items(), key=lambda x: -x[1])[:6]:
-                    _bc = "#f85149" if _pct > 40 else "#e3b341" if _pct > 25 else "#58a6ff"
+                for _sec, _pct in sorted(_sec_exp.items(), key=lambda x: -x[1])[:8]:
+                    # Unknown bucket gets a different visual treatment
+                    if _sec == "Unknown":
+                        _bc = "#6e7681"
+                        _label = "⚪ Unknown (legacy)"
+                    elif _pct > 40:
+                        _bc = "#f85149"
+                        _label = _sec
+                    elif _pct > 25:
+                        _bc = "#e3b341"
+                        _label = _sec
+                    else:
+                        _bc = "#58a6ff"
+                        _label = _sec
                     st.markdown(
                         f"<div style='display:flex;gap:8px;align-items:center;margin:2px 0'>"
-                        f"<div style='width:130px;font-size:0.78em'>{_sec}</div>"
+                        f"<div style='width:160px;font-size:0.78em'>{_label}</div>"
                         f"<div style='flex:1;background:#21262d;border-radius:3px;height:8px'>"
                         f"<div style='width:{min(100, _pct)}%;background:{_bc};height:8px;border-radius:3px'></div></div>"
                         f"<div style='width:42px;font-size:0.78em;text-align:right'>{_pct:.0f}%</div>"

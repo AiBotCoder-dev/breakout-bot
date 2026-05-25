@@ -8556,7 +8556,15 @@ def get_portfolio_risk_status(paper_engine):
             sector_exp[sec] = sector_exp.get(sec, 0.0) + float(p.get("gross_invested") or 0)
         sector_exp = {k: round(v / current_equity * 100, 1)
                       for k, v in sector_exp.items()}
-    max_sector_pct = max(sector_exp.values()) if sector_exp else 0.0
+
+    # The "Unknown" bucket is legacy positions opened before sector tracking —
+    # it doesn't mean real concentration risk.  Compute concentration based on
+    # KNOWN sectors only, and surface the unknown count as an info banner.
+    unknown_pct  = float(sector_exp.get("Unknown", 0))
+    known_sector_exp = {k: v for k, v in sector_exp.items() if k != "Unknown"}
+    max_sector_pct = max(known_sector_exp.values()) if known_sector_exp else 0.0
+    n_unknown     = sum(1 for p in positions
+                         if not (str(p.get("sector") or "").strip()))
 
     # ── Decision gates ────────────────────────────────────────────────────────
     if drawdown_pct >= 25:
@@ -8581,14 +8589,22 @@ def get_portfolio_risk_status(paper_engine):
         risk_level     = "CAUTION"
         can_open       = True
         size_mult      = 0.7
-        reason         = (f"⚠️ Sector concentration {max_sector_pct:.0f}% — "
+        reason         = (f"⚠️ Sector concentration {max_sector_pct:.0f}% in known sectors — "
                           "diversify; reduce new same-sector entries.")
+    elif unknown_pct >= 50 and n_unknown >= 3:
+        # Many legacy positions without sector data — informational, not a real risk
+        risk_level     = "NORMAL"
+        can_open       = True
+        size_mult      = 1.0
+        reason         = (f"ℹ️ {n_unknown} legacy position(s) missing sector data "
+                          f"({unknown_pct:.0f}% of book). Run 'Backfill Sectors' in "
+                          "the Management dashboard to enable real concentration tracking.")
     else:
         risk_level     = "NORMAL"
         can_open       = True
         size_mult      = 1.0
         reason         = (f"✓ Normal operating range. Drawdown {drawdown_pct:.1f} %, "
-                          f"max sector exposure {max_sector_pct:.0f} %.")
+                          f"max known-sector exposure {max_sector_pct:.0f} %.")
 
     return {
         "drawdown_pct":    drawdown_pct,
@@ -8596,10 +8612,71 @@ def get_portfolio_risk_status(paper_engine):
         "current_equity":  round(current_equity, 2),
         "sector_exposure": sector_exp,
         "max_sector_pct":  round(max_sector_pct, 1),
+        "unknown_sector_pct": round(unknown_pct, 1),
+        "n_unknown_sector":   n_unknown,
         "risk_level":      risk_level,
         "can_open_new":    can_open,
         "size_multiplier": size_mult,
         "reason":          reason,
+    }
+
+
+def backfill_position_sectors(conn, limit: int = 100) -> dict:
+    """One-shot helper: look up sector via yfinance for any open paper_portfolio
+    rows that have an empty/null sector field.  Updates the DB in place.
+
+    Use this AFTER deploying the sector-fix commit to retroactively populate
+    sector data on positions that were opened before the fix.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT id, ticker FROM paper_portfolio "
+            "WHERE status='OPEN' AND (sector IS NULL OR sector='') "
+            "LIMIT ?",
+            (int(limit),)
+        ).fetchall()
+    except Exception as exc:
+        return {"updated": 0, "failed": 0, "error": str(exc)}
+
+    if not rows:
+        return {"updated": 0, "failed": 0, "message": "No positions need backfilling"}
+
+    updated = 0
+    failed  = 0
+    details: list = []
+    for r in rows:
+        try:
+            d   = dict(r)
+            tid = int(d.get("id") or 0)
+            tk  = str(d.get("ticker") or "").upper()
+            if not tk:
+                continue
+            sector = ""
+            try:
+                info = yf.Ticker(tk).info or {}
+                sector = str(info.get("sector") or "")
+            except Exception:
+                pass
+            if sector:
+                try:
+                    conn.execute(
+                        "UPDATE paper_portfolio SET sector=? WHERE id=?",
+                        (sector, tid)
+                    )
+                    updated += 1
+                    details.append(f"{tk}→{sector}")
+                except Exception:
+                    failed += 1
+            else:
+                failed += 1
+                details.append(f"{tk}→(unavailable)")
+        except Exception:
+            failed += 1
+    return {
+        "updated":   updated,
+        "failed":    failed,
+        "details":   details,
+        "message":   f"Backfilled {updated}/{len(rows)} positions ({failed} failed)",
     }
 
 

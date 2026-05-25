@@ -7815,11 +7815,10 @@ def detect_wyckoff_phase(ticker, lookback_days=60):
       action  — plain-English trading implication
     """
     try:
-        hist = yf.download(ticker, period="3mo", interval="1d",
-                           progress=False, auto_adjust=True)
-        if isinstance(hist.columns, pd.MultiIndex):
-            hist.columns = hist.columns.get_level_values(0)
-        hist = hist.dropna(subset=["Close"])
+        # Use shared cache — same data fetched by master_score, squeeze scanner,
+        # duration predictor, multi-TF check.  Eliminates 5× duplicate downloads.
+        hist = get_cached_history(ticker, period="3mo", interval="1d")
+        hist = hist.dropna(subset=["Close"]) if not hist.empty else hist
         if len(hist) < 20:
             return {"phase": "INSUFFICIENT_DATA", "confidence": 0,
                     "description": "Not enough history", "is_tradeable": False,
@@ -7947,11 +7946,9 @@ def analyze_institutional_volume(ticker, lookback_days=20):
       vol_ratio, close_pct, description, implication
     """
     try:
-        hist = yf.download(ticker, period="2mo", interval="1d",
-                           progress=False, auto_adjust=True)
-        if isinstance(hist.columns, pd.MultiIndex):
-            hist.columns = hist.columns.get_level_values(0)
-        hist = hist.dropna(subset=["Close"])
+        # Shared cache — re-uses the 3mo daily fetch from Wyckoff/duration
+        hist = get_cached_history(ticker, period="3mo", interval="1d")
+        hist = hist.dropna(subset=["Close"]) if not hist.empty else hist
         if len(hist) < 10:
             return {"primary_pattern": "INSUFFICIENT_DATA", "bullish_score": 50,
                     "description": "Not enough data", "vol_ratio": 1.0}
@@ -8896,9 +8893,49 @@ def compute_master_score(ticker, expiry, bias, conn,
             "multiplier": 1.0,
         }
 
-    # ── Final score: base × TV × news × duration multipliers, clamped 0-100 ──
+    # ── 12. Squeeze multiplier (optional bonus for explosive setups) ────────
+    # Compresses long-form research into one multiplier:
+    #   EXPLOSIVE → 1.15× (rare 2-10x setups get a major boost)
+    #   HIGH      → 1.08×
+    #   MODERATE  → 1.03×
+    #   LOW       → 1.00×
+    # Always 1.00× for bearish trades — squeezes only work on the upside.
+    squeeze_mult = 1.0
+    squeeze_data = {}
+    if not skip_slow_checks and str(bias).lower() != "bearish":
+        try:
+            squeeze_data = SqueezeScanner(ticker, conn=conn).scan() or {}
+            sq_cat = squeeze_data.get("category", "LOW")
+            squeeze_mult = {
+                "EXPLOSIVE": 1.15,
+                "HIGH":      1.08,
+                "MODERATE":  1.03,
+                "LOW":       1.00,
+                "NONE":      1.00,
+            }.get(sq_cat, 1.0)
+        except Exception:
+            squeeze_mult = 1.0
+    if squeeze_data and squeeze_data.get("squeeze_score", 0) > 0:
+        components["squeeze"] = {
+            "max":         "×",
+            "pts":         f"{squeeze_mult:.2f}",
+            "label":       (f"Squeeze: {squeeze_data.get('category', 'LOW')} "
+                            f"({squeeze_data.get('squeeze_score', 0)}/100) → {squeeze_mult:.2f}×"),
+            "multiplier":  squeeze_mult,
+            "raw":         squeeze_data,
+        }
+    else:
+        components["squeeze"] = {
+            "max":   "×",
+            "pts":   "1.00",
+            "label": "Squeeze data unavailable (1.00×)",
+            "multiplier": 1.0,
+        }
+
+    # ── Final score: base × TV × news × duration × squeeze, clamped 0-100 ───
     raw_score = max(0, total)
-    score = round(min(100, raw_score * tv_mult * news_mult * duration_mult), 1)
+    score = round(min(100, raw_score * tv_mult * news_mult *
+                       duration_mult * squeeze_mult), 1)
 
     # ── Grade + decision ──────────────────────────────────────────────────────
     if score >= 85:
@@ -8933,6 +8970,8 @@ def compute_master_score(ticker, expiry, bias, conn,
         "news_multiplier":     news_mult,
         "duration_prediction": duration_info,
         "duration_multiplier": duration_mult,
+        "squeeze_data":        squeeze_data,
+        "squeeze_multiplier":  squeeze_mult,
         "base_score":          round(raw_score, 1),
     }
 
@@ -9016,6 +9055,332 @@ _REGIME_DURATION_MULT = {
 }
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# HISTORY CACHE — share yfinance fetches across all engines within a cycle
+#   Critical optimization: Wyckoff, multi-TF, institutional volume, squeeze
+#   scanner, duration predictor all need daily bars.  Without this cache they
+#   each fetch independently — 5+ identical yfinance calls per ticker per cycle.
+# ══════════════════════════════════════════════════════════════════════════════
+
+import time as _time_cache
+
+_HIST_CACHE: dict = {}     # key (ticker, period, interval) → (timestamp, dataframe)
+_HIST_CACHE_TTL = 300       # 5 min — fresh enough for intra-cycle reuse
+
+
+def get_cached_history(ticker: str, period: str = "3mo",
+                        interval: str = "1d"):
+    """Return cached yfinance OHLCV or fetch + cache.  Drop-in replacement for
+    yf.download(ticker, period=..., interval=...) inside any engine.
+
+    Eliminates the ~5x duplicate fetches per ticker per monitor cycle that
+    were happening before.  TTL is 5 minutes — short enough for live trading,
+    long enough to amortize across all engines.
+    """
+    key = (str(ticker).upper(), str(period), str(interval))
+    now = _time_cache.time()
+    cached = _HIST_CACHE.get(key)
+    if cached and (now - cached[0]) < _HIST_CACHE_TTL:
+        return cached[1]
+    try:
+        df = yf.download(key[0], period=period, interval=interval,
+                         progress=False, auto_adjust=True, threads=True)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        _HIST_CACHE[key] = (now, df)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _hist_cache_stats() -> dict:
+    """Diagnostic stats for the history cache."""
+    return {"entries": len(_HIST_CACHE), "ttl_seconds": _HIST_CACHE_TTL}
+
+
+def _hist_cache_clear():
+    """Purge the cache — for tests or explicit refresh."""
+    global _HIST_CACHE
+    _HIST_CACHE = {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BOLLINGER SQUEEZE DETECTOR
+#   When BB width compresses to historical bottom 15%, a violent move usually
+#   follows.  Used by both SqueezeScanner and duration prediction.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_bollinger_squeeze(ticker: str, period: int = 20,
+                              lookback_days: int = 180) -> dict:
+    """Detect Bollinger Band squeeze.  Returns:
+       bb_width_pct       — current BB width as % of price
+       pct_rank           — current width's percentile in lookback window (0 = tightest)
+       is_squeezed        — True when pct_rank ≤ 15
+       squeeze_strength   — 'EXTREME' / 'STRONG' / 'MODERATE' / 'NONE'
+       days_in_squeeze    — consecutive days at pct_rank ≤ 25
+    Returns {} on insufficient data.
+    """
+    try:
+        hist = get_cached_history(ticker, period="1y", interval="1d")
+        hist = hist.dropna(subset=["Close"])
+        if len(hist) < period + 30:
+            return {}
+
+        close = hist["Close"]
+        sma   = close.rolling(period).mean()
+        std   = close.rolling(period).std()
+        upper = sma + 2 * std
+        lower = sma - 2 * std
+        bb_width = (upper - lower) / sma * 100
+        bb_width = bb_width.dropna().tail(lookback_days)
+
+        current   = float(bb_width.iloc[-1])
+        pct_rank  = float(bb_width.rank(pct=True).iloc[-1]) * 100
+        is_squeezed = pct_rank <= 15
+
+        # Consecutive days in squeeze (pct_rank ≤ 25 from end)
+        rank_series = bb_width.rank(pct=True) * 100
+        days_in_squeeze = 0
+        for v in rank_series.iloc[::-1]:
+            if v <= 25:
+                days_in_squeeze += 1
+            else:
+                break
+
+        if pct_rank <= 5:
+            strength = "EXTREME"
+        elif pct_rank <= 15:
+            strength = "STRONG"
+        elif pct_rank <= 25:
+            strength = "MODERATE"
+        else:
+            strength = "NONE"
+
+        return {
+            "bb_width_pct":     round(current, 2),
+            "pct_rank":         round(pct_rank, 1),
+            "is_squeezed":      is_squeezed,
+            "squeeze_strength": strength,
+            "days_in_squeeze":  int(days_in_squeeze),
+        }
+    except Exception:
+        return {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SQUEEZE SCANNER — finds 2-10x potential setups
+#   Combines: short interest, float size, days-to-cover, BB squeeze,
+#   volume velocity, gamma exposure proxy.  Single 0-100 score with
+#   actionable category.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SqueezeScanner:
+    """Hunts for explosive 2-10x squeeze candidates using free yfinance data.
+
+    Component scoring (sums to 100):
+      Short Interest Score   30   short% of float, very explosive >20%
+      Float Tightness        20   smaller float = bigger moves
+      Days to Cover          15   high days-to-cover = harder to unwind
+      BB Squeeze             15   compressed volatility ready to release
+      Volume Velocity        10   accelerating volume = early entry
+      Catalyst Proximity     10   recent news = trigger
+    """
+
+    # Tier thresholds for category labelling
+    _TIER_EXPLOSIVE  = 80   # 2-10x potential, RARE
+    _TIER_HIGH       = 65   # 50-100% upside reasonable
+    _TIER_MODERATE   = 50   # 20-50% upside
+
+    def __init__(self, ticker: str, conn=None):
+        self.ticker = str(ticker).upper()
+        self.conn   = conn
+
+    def scan(self) -> dict:
+        """Run full squeeze analysis.  Returns rich dict with score + components."""
+        out = {
+            "ticker":          self.ticker,
+            "squeeze_score":   0,
+            "category":        "NONE",
+            "components":      {},
+            "shortable_float_pct":  None,
+            "days_to_cover":   None,
+            "float_shares":    None,
+            "avg_volume":      None,
+            "bb_squeeze":      {},
+            "recommendation":  "",
+            "upside_estimate": "",
+        }
+
+        # ── Pull yfinance fundamentals (.info has short interest data) ──────
+        try:
+            tk = yf.Ticker(self.ticker)
+            info = tk.info or {}
+        except Exception:
+            info = {}
+
+        short_pct_float = float(info.get("shortPercentOfFloat") or 0) * 100
+        shares_short    = int(info.get("sharesShort") or 0)
+        days_to_cover   = float(info.get("shortRatio") or 0)
+        float_shares    = int(info.get("floatShares") or 0)
+        avg_volume      = int(info.get("averageVolume") or 0)
+
+        out["shortable_float_pct"] = round(short_pct_float, 2)
+        out["days_to_cover"]       = days_to_cover
+        out["float_shares"]        = float_shares
+        out["avg_volume"]          = avg_volume
+
+        # If short data is genuinely missing, fall back to days_to_cover only
+        # (compute it ourselves if shares_short and avg_volume both exist)
+        if days_to_cover <= 0 and shares_short and avg_volume:
+            days_to_cover = shares_short / max(avg_volume, 1)
+            out["days_to_cover"] = round(days_to_cover, 1)
+
+        # ── 1. Short Interest score (30 pts) ────────────────────────────────
+        if short_pct_float >= 30:
+            si_pts, si_lbl = 30, f"EXTREME short interest {short_pct_float:.0f}% of float 🔥"
+        elif short_pct_float >= 20:
+            si_pts, si_lbl = 24, f"HIGH short interest {short_pct_float:.0f}% of float"
+        elif short_pct_float >= 12:
+            si_pts, si_lbl = 16, f"Moderate short interest {short_pct_float:.0f}%"
+        elif short_pct_float >= 5:
+            si_pts, si_lbl = 8,  f"Low short interest {short_pct_float:.0f}%"
+        else:
+            si_pts, si_lbl = 0,  f"No meaningful short interest ({short_pct_float:.1f}%)"
+        out["components"]["short_interest"] = {"pts": si_pts, "max": 30, "label": si_lbl}
+
+        # ── 2. Float Tightness (20 pts) ─────────────────────────────────────
+        if 0 < float_shares <= 10_000_000:
+            f_pts, f_lbl = 20, f"NANO float {float_shares:,} — explosive moves possible"
+        elif float_shares <= 30_000_000:
+            f_pts, f_lbl = 16, f"Micro float {float_shares:,}"
+        elif float_shares <= 75_000_000:
+            f_pts, f_lbl = 11, f"Small float {float_shares:,}"
+        elif float_shares <= 200_000_000:
+            f_pts, f_lbl = 6,  f"Medium float {float_shares:,}"
+        elif float_shares > 0:
+            f_pts, f_lbl = 2,  f"Large float {float_shares:,} — moves dampened"
+        else:
+            f_pts, f_lbl = 0,  "Float data unavailable"
+        out["components"]["float"] = {"pts": f_pts, "max": 20, "label": f_lbl}
+
+        # ── 3. Days to Cover (15 pts) ───────────────────────────────────────
+        if days_to_cover >= 10:
+            d_pts, d_lbl = 15, f"{days_to_cover:.1f} days to cover — shorts trapped 🔒"
+        elif days_to_cover >= 5:
+            d_pts, d_lbl = 11, f"{days_to_cover:.1f} days to cover — high pressure"
+        elif days_to_cover >= 3:
+            d_pts, d_lbl = 7,  f"{days_to_cover:.1f} days to cover — moderate"
+        elif days_to_cover > 0:
+            d_pts, d_lbl = 3,  f"{days_to_cover:.1f} days to cover — low"
+        else:
+            d_pts, d_lbl = 0,  "Days-to-cover unavailable"
+        out["components"]["days_to_cover"] = {"pts": d_pts, "max": 15, "label": d_lbl}
+
+        # ── 4. Bollinger Squeeze (15 pts) ───────────────────────────────────
+        bb = detect_bollinger_squeeze(self.ticker)
+        out["bb_squeeze"] = bb
+        if bb:
+            strength = bb.get("squeeze_strength", "NONE")
+            days_sq  = bb.get("days_in_squeeze", 0)
+            if strength == "EXTREME":
+                bb_pts, bb_lbl = 15, f"EXTREME BB squeeze ({days_sq}d) — release imminent ⚡"
+            elif strength == "STRONG":
+                bb_pts, bb_lbl = 11, f"STRONG BB squeeze ({days_sq}d)"
+            elif strength == "MODERATE":
+                bb_pts, bb_lbl = 5,  f"Moderate BB compression ({days_sq}d)"
+            else:
+                bb_pts, bb_lbl = 0,  "No BB squeeze present"
+        else:
+            bb_pts, bb_lbl = 0, "BB analysis unavailable"
+        out["components"]["bb_squeeze"] = {"pts": bb_pts, "max": 15, "label": bb_lbl}
+
+        # ── 5. Volume Velocity (10 pts) ─────────────────────────────────────
+        try:
+            hist = get_cached_history(self.ticker, period="2mo", interval="1d")
+            hist = hist.dropna(subset=["Volume"])
+            if len(hist) >= 21:
+                recent_avg = float(hist["Volume"].tail(5).mean())
+                base_avg   = float(hist["Volume"].tail(20).mean())
+                ratio = recent_avg / base_avg if base_avg else 1.0
+                if ratio >= 2.5:
+                    v_pts, v_lbl = 10, f"Volume {ratio:.1f}× normal — institutional accumulation 🚀"
+                elif ratio >= 1.5:
+                    v_pts, v_lbl = 7,  f"Volume {ratio:.1f}× normal — building interest"
+                elif ratio >= 1.2:
+                    v_pts, v_lbl = 4,  f"Volume {ratio:.1f}× normal — mild uptick"
+                else:
+                    v_pts, v_lbl = 0,  f"Volume {ratio:.1f}× normal — quiet"
+            else:
+                v_pts, v_lbl = 0, "Volume data insufficient"
+        except Exception:
+            v_pts, v_lbl = 0, "Volume analysis failed"
+        out["components"]["volume_velocity"] = {"pts": v_pts, "max": 10, "label": v_lbl}
+
+        # ── 6. Catalyst Proximity (10 pts) ──────────────────────────────────
+        # Uses the NewsAgent if available; otherwise heuristic via yfinance news
+        c_pts, c_lbl = 0, "No recent catalyst detected"
+        if self.conn:
+            try:
+                from news_agent import NewsAgent
+                ni = NewsAgent(self.conn, ai_analyst=None).get_news_impact(
+                    self.ticker, hours=72
+                )
+                if ni and ni.get("n_events", 0) > 0:
+                    impact = ni.get("max_impact", 0)
+                    sent   = (ni.get("top_event") or {}).get("sentiment", "")
+                    if impact >= 7 and sent == "POSITIVE":
+                        c_pts, c_lbl = 10, f"Strong positive catalyst (impact {impact}/10) 📰"
+                    elif impact >= 5:
+                        c_pts, c_lbl = 6,  f"Catalyst present (impact {impact}/10)"
+                    elif ni.get("n_events", 0) >= 3:
+                        c_pts, c_lbl = 3,  f"Multiple news events ({ni['n_events']})"
+            except Exception:
+                pass
+        out["components"]["catalyst"] = {"pts": c_pts, "max": 10, "label": c_lbl}
+
+        # ── Sum + category ──────────────────────────────────────────────────
+        total = si_pts + f_pts + d_pts + bb_pts + v_pts + c_pts
+        out["squeeze_score"] = total
+
+        if total >= self._TIER_EXPLOSIVE:
+            out["category"]        = "EXPLOSIVE"
+            out["upside_estimate"] = "2-10x potential"
+            out["recommendation"]  = ("🔥 EXPLOSIVE SETUP — short squeeze ALL signals firing. "
+                                       "High risk, high reward. Small position size + tight stop.")
+        elif total >= self._TIER_HIGH:
+            out["category"]        = "HIGH"
+            out["upside_estimate"] = "50-100% upside"
+            out["recommendation"]  = ("⚡ HIGH SQUEEZE potential — multiple compression signals "
+                                       "aligned.  Reasonable position size with wider stop.")
+        elif total >= self._TIER_MODERATE:
+            out["category"]        = "MODERATE"
+            out["upside_estimate"] = "20-50% upside"
+            out["recommendation"]  = ("📊 MODERATE squeeze setup — some compression signals.  "
+                                       "Trade with normal sizing.")
+        else:
+            out["category"]        = "LOW"
+            out["upside_estimate"] = "Standard upside"
+            out["recommendation"]  = ("Standard setup — no significant squeeze advantage.")
+
+        return out
+
+    @staticmethod
+    def scan_many(tickers: list, conn=None,
+                   min_score: int = 50) -> list:
+        """Scan a batch of tickers and return only those scoring ≥ min_score,
+        sorted by squeeze_score descending."""
+        results = []
+        for tk in tickers:
+            try:
+                r = SqueezeScanner(tk, conn=conn).scan()
+                if r["squeeze_score"] >= min_score:
+                    results.append(r)
+            except Exception:
+                continue
+        results.sort(key=lambda x: x["squeeze_score"], reverse=True)
+        return results
+
+
 def predict_duration_to_target(ticker, entry_price, target_price,
                                 pattern="", market_regime=None,
                                 min_days=1, max_days=30):
@@ -9062,12 +9427,9 @@ def predict_duration_to_target(ticker, entry_price, target_price,
                 "method":            "Target already reached at entry price",
             }
 
-        # ── ATR-based daily move estimate ─────────────────────────────────────
-        hist = yf.download(ticker, period="3mo", interval="1d",
-                           progress=False, auto_adjust=True)
-        if isinstance(hist.columns, pd.MultiIndex):
-            hist.columns = hist.columns.get_level_values(0)
-        hist = hist.dropna(subset=["Close"])
+        # ── ATR-based daily move estimate (uses shared history cache) ────────
+        hist = get_cached_history(ticker, period="3mo", interval="1d")
+        hist = hist.dropna(subset=["Close"]) if not hist.empty else hist
         if len(hist) < 15:
             return None
 

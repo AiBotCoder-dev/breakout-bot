@@ -1545,6 +1545,93 @@ with tab_mgmt:
 
     st.divider()
 
+    # ── SECTION 3.5 — SQUEEZE SCANNER (2-10x hunter) ─────────────────────────
+    st.markdown("### 🚀 Squeeze Scanner — 2-10× Hunter")
+    st.caption(
+        "Combines short interest + float tightness + days-to-cover + "
+        "Bollinger compression + volume velocity + catalyst proximity into "
+        "ONE explosive-move score. EXPLOSIVE category = 2-10x potential setups."
+    )
+
+    _sc_c1, _sc_c2 = st.columns([3, 1])
+    with _sc_c1:
+        _sc_input = st.text_input(
+            "Tickers (comma-separated)",
+            value="AAPL, NVDA, AMC, GME, BBBY, TSLA, AMD, PLTR",
+            key="mgmt_squeeze_input",
+            help="Add tickers you want to scan for squeeze potential",
+        )
+    with _sc_c2:
+        _sc_min = st.number_input("Min score", 0, 100, 40,
+                                    key="mgmt_squeeze_minscore")
+
+    if st.button("🔍 Scan for Squeezes", key="mgmt_squeeze_btn", type="primary"):
+        _tickers = [t.strip().upper() for t in _sc_input.split(",") if t.strip()]
+        if _tickers:
+            with st.spinner(f"Scanning {len(_tickers)} tickers..."):
+                _results = ts.SqueezeScanner.scan_many(_tickers, conn=conn, min_score=_sc_min)
+            if _results:
+                st.success(f"Found {len(_results)} candidate(s) ≥ {_sc_min}", icon="🎯")
+                for r in _results:
+                    _cat = r["category"]
+                    _meta = {
+                        "EXPLOSIVE":  ("#f85149", "🔥", r["upside_estimate"]),
+                        "HIGH":       ("#e3b341", "⚡", r["upside_estimate"]),
+                        "MODERATE":   ("#58a6ff", "📊", r["upside_estimate"]),
+                        "LOW":        ("#8b949e", "⚪", r["upside_estimate"]),
+                    }
+                    _col, _ic, _up = _meta.get(_cat, ("#8b949e", "⚪", ""))
+                    with st.expander(f"{_ic} **{r['ticker']}** — Score {r['squeeze_score']}/100  ·  "
+                                      f"{_cat}  ·  {_up}",
+                                      expanded=(_cat in ("EXPLOSIVE","HIGH"))):
+                        st.markdown(
+                            f"<div style='background:#161b22;border-left:4px solid {_col};"
+                            f"border-radius:6px;padding:10px 14px'>"
+                            f"{r.get('recommendation','')}"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                        _kf1, _kf2, _kf3, _kf4 = st.columns(4)
+                        _kf1.metric("Short %", f"{r.get('shortable_float_pct') or 0:.1f}%")
+                        _kf2.metric("Days to Cover", f"{r.get('days_to_cover') or 0:.1f}")
+                        _kf3.metric("Float", f"{(r.get('float_shares') or 0)/1e6:.1f}M")
+                        _kf4.metric("Avg Volume", f"{(r.get('avg_volume') or 0)/1e6:.1f}M")
+
+                        # Component breakdown bars
+                        st.markdown("**Component breakdown:**")
+                        for cn, cv in r.get("components", {}).items():
+                            _pts = cv.get("pts", 0)
+                            _mx  = cv.get("max", 1)
+                            _pct = int(_pts / _mx * 100) if _mx else 0
+                            _bc  = ("#3fb950" if _pct >= 70 else
+                                    "#e3b341" if _pct >= 40 else "#f85149"
+                                    if _pct > 0 else "#30363d")
+                            st.markdown(
+                                f"<div style='display:flex;gap:8px;align-items:center;margin:2px 0'>"
+                                f"<div style='width:140px;font-size:0.78em;color:#8b949e'>"
+                                f"{cn.replace('_',' ').title()}</div>"
+                                f"<div style='flex:1;background:#21262d;border-radius:3px;height:8px'>"
+                                f"<div style='width:{_pct}%;background:{_bc};height:8px;border-radius:3px'></div></div>"
+                                f"<div style='width:48px;font-size:0.78em;text-align:right'>{_pts}/{_mx}</div>"
+                                f"</div>"
+                                f"<div style='font-size:0.72em;color:#6e7681;margin-left:148px'>{cv.get('label','')}</div>",
+                                unsafe_allow_html=True,
+                            )
+                        if r.get("bb_squeeze"):
+                            bb = r["bb_squeeze"]
+                            st.caption(
+                                f"📐 BB width {bb.get('bb_width_pct')}%  ·  "
+                                f"pct rank {bb.get('pct_rank'):.0f}  ·  "
+                                f"strength {bb.get('squeeze_strength')}  ·  "
+                                f"{bb.get('days_in_squeeze')} days in squeeze"
+                            )
+            else:
+                st.info(f"No tickers met the threshold of {_sc_min}. Try lower threshold or add more tickers.",
+                        icon="📭")
+
+    st.divider()
+
     # ── SECTION 4 — DIAGNOSTICS & MANUAL TRIGGERS ────────────────────────────
     st.markdown("### 🩺 Engine Diagnostics & Manual Triggers")
     _diag_cols = st.columns(4)

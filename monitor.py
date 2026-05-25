@@ -486,6 +486,33 @@ def auto_enter_stocks(conn, paper, session, quality,
         except Exception:
             pass
 
+        # ── CRITIC AGENT (Trading Memory Agent) ─────────────────────────
+        # Final sanity check against episodic memory of past similar trades.
+        # Can soft-veto setups where 80%+ of similar past trades lost.
+        try:
+            from trading_memory import TradingMemoryAgent as _TMA
+            _critic = _TMA(conn, ai_analyst=_AI).critic_review(
+                candidate={
+                    "ticker":         ticker,
+                    "master_score":   m_score,
+                    "sector":         sector,
+                    "pattern":        pattern,
+                    "wyckoff_phase":  master["components"].get("wyckoff", {}).get("label", ""),
+                    "market_regime":  (market_regime or {}).get("regime", ""),
+                    "vix_regime":     "",
+                },
+                master_result=master,
+            )
+            _verdict = _critic.get("verdict", "BUY")
+            _reason  = _critic.get("reasoning", "")
+            print(f"    {ticker:8s} — Critic: {_verdict} ({_critic.get('n_similar', 0)} similar past, "
+                  f"WR {(_critic.get('similar_win_rate') or 0)*100:.0f}%) — {_reason[:80]}")
+            if _verdict == "SKIP":
+                print(f"    {ticker:8s} — 🛑 CRITIC VETO: {_reason}")
+                continue
+        except Exception:
+            pass
+
         signal = {
             "price":           live_price,
             "stop_price":      stop,
@@ -1002,6 +1029,23 @@ def main():
                       f"closed trades ({_lc['n_wins']}W / {_lc['n_losses']}L)")
         except Exception as _cle:
             print(f"  WARN continuous learning failed: {_cle}")
+
+        # ── Episodic memory: record new opens, reflect on new closes ─────
+        # The Trading Memory Agent stores rich context per trade and uses
+        # AI reflection to learn from each close.  Idempotent watermarks
+        # so re-running the cycle is safe.
+        try:
+            from trading_memory import TradingMemoryAgent
+            _tma = TradingMemoryAgent(conn, ai_analyst=_AI)
+            _ml = _tma.process_lifecycle_events(generate_reflections=True,
+                                                   max_per_cycle=20)
+            if (_ml.get("opens_recorded", 0) > 0
+                    or _ml.get("closes_updated", 0) > 0):
+                print(f"  Memory agent: +{_ml['opens_recorded']} opens, "
+                      f"{_ml['closes_updated']} closes, "
+                      f"{_ml['reflections']} reflections generated")
+        except Exception as _me:
+            print(f"  WARN memory agent failed: {_me}")
 
         le_state = learning_engine.check_state(paper, opts_for_reset)
         learning_adjustments = le_state.get("adjustments", learning_adjustments)

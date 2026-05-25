@@ -8932,10 +8932,55 @@ def compute_master_score(ticker, expiry, bias, conn,
             "multiplier": 1.0,
         }
 
-    # ── Final score: base × TV × news × duration × squeeze, clamped 0-100 ───
+    # ── 13. Memory confidence multiplier (TradingMemoryAgent) ──────────────
+    # Looks at similar past closed trades — if 70%+ won, boost score 12%;
+    # if <30% won, cut score 15%. Only activates with ≥3 similar past trades.
+    memory_mult = 1.0
+    memory_data = {}
+    if not skip_slow_checks:
+        try:
+            from trading_memory import TradingMemoryAgent
+            tma = TradingMemoryAgent(conn, ai_analyst=None)
+            # Build candidate context from what we already computed
+            _cand = {
+                "ticker":         ticker,
+                "master_score":   max(0, total),       # pre-multipliers
+                "explosive_score": components.get("breakout_scan", {}).get("pts", 0),
+                "breakout_prob":  0,
+                "sector":         "",
+                "pattern":        "",
+                "wyckoff_phase":  components.get("wyckoff", {}).get("label", ""),
+                "market_regime":  components.get("market_regime", {}).get("label", ""),
+                "vix_regime":     (vix_data or {}).get("regime", "")
+                                   if vix_data else "",
+            }
+            memory_data = tma.memory_confidence(_cand) or {}
+            memory_mult = float(memory_data.get("multiplier", 1.0) or 1.0)
+        except Exception:
+            memory_mult = 1.0
+    if memory_data and memory_data.get("n_similar", 0) >= 3:
+        components["memory"] = {
+            "max":         "×",
+            "pts":         f"{memory_mult:.2f}",
+            "label":       (f"Memory: {memory_data.get('wins', 0)}W/"
+                            f"{memory_data.get('losses', 0)}L of "
+                            f"{memory_data.get('n_similar', 0)} similar past → "
+                            f"{memory_mult:.2f}×"),
+            "multiplier":  memory_mult,
+            "raw":         memory_data,
+        }
+    else:
+        components["memory"] = {
+            "max":   "×",
+            "pts":   "1.00",
+            "label": "Memory: building (need 3+ similar past trades)",
+            "multiplier": 1.0,
+        }
+
+    # ── Final score: base × TV × news × duration × squeeze × memory ─────────
     raw_score = max(0, total)
     score = round(min(100, raw_score * tv_mult * news_mult *
-                       duration_mult * squeeze_mult), 1)
+                       duration_mult * squeeze_mult * memory_mult), 1)
 
     # ── Grade + decision ──────────────────────────────────────────────────────
     if score >= 85:
@@ -8972,6 +9017,8 @@ def compute_master_score(ticker, expiry, bias, conn,
         "duration_multiplier": duration_mult,
         "squeeze_data":        squeeze_data,
         "squeeze_multiplier":  squeeze_mult,
+        "memory_data":         memory_data,
+        "memory_multiplier":   memory_mult,
         "base_score":          round(raw_score, 1),
     }
 

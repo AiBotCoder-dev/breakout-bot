@@ -1545,6 +1545,136 @@ with tab_mgmt:
 
     st.divider()
 
+    # ── SECTION 3.6 — TRADING MEMORY AGENT (AI episodic memory + critic) ─────
+    st.markdown("### 🧠 Trading Memory Agent")
+    st.caption(
+        "Episodic memory of every closed trade · AI reflection after each close · "
+        "pre-trade critic that vetoes setups where similar past trades have a "
+        "high loss rate. Plugs into the Master Score as a 13th multiplier."
+    )
+
+    try:
+        from trading_memory import TradingMemoryAgent
+        _mgmt_tma = TradingMemoryAgent(conn, ai_analyst=_AI)
+
+        _tms = _mgmt_tma.get_memory_stats()
+        _m1, _m2, _m3, _m4, _m5 = st.columns(5)
+        _m1.metric("Trades in memory", _tms.get("n_total_memories", 0))
+        _m2.metric("Closed (learnable)", _tms.get("n_closed", 0))
+        _m3.metric("AI Reflections", _tms.get("n_reflections", 0))
+        _m4.metric("Critic Reviews",   _tms.get("n_critic_reviews", 0))
+        _m5.metric("Critic Vetoes",    _tms.get("n_critic_skips", 0))
+
+        _mc1, _mc2 = st.columns([1, 1])
+        with _mc1:
+            if st.button("🔄 Sync Memory Lifecycle",
+                         key="mgmt_mem_sync",
+                         help="Record any new opens and reflect on new closes (idempotent)"):
+                with st.spinner("Syncing memory + generating reflections..."):
+                    _r = _mgmt_tma.process_lifecycle_events(
+                        generate_reflections=True, max_per_cycle=100
+                    )
+                    st.success(
+                        f"+{_r['opens_recorded']} opens · "
+                        f"{_r['closes_updated']} closes · "
+                        f"{_r['reflections']} reflections",
+                        icon="✅",
+                    )
+                    st.rerun()
+        with _mc2:
+            _test_ticker = st.text_input(
+                "Test critic on ticker", value="SPY",
+                key="mgmt_mem_test_ticker",
+                help="Ask the critic about a hypothetical entry",
+            )
+            if st.button("🧪 Run Critic", key="mgmt_mem_critic_btn"):
+                with st.spinner(f"Critic reviewing {_test_ticker}..."):
+                    _critic_test = _mgmt_tma.critic_review(
+                        candidate={
+                            "ticker": _test_ticker.upper(),
+                            "master_score": 70,
+                            "sector": "Technology",
+                            "pattern": "Cup and Handle",
+                            "wyckoff_phase": "ACCUMULATION",
+                        },
+                        master_result={"grade": "B", "decision": "BUY"},
+                    )
+                    _v = _critic_test.get("verdict", "?")
+                    _vc = {"BUY": "#3fb950", "WATCH": "#e3b341",
+                           "SKIP": "#f85149"}.get(_v, "#8b949e")
+                    st.markdown(
+                        f"<div style='background:#161b22;border-left:4px solid {_vc};"
+                        f"padding:10px 14px;border-radius:4px'>"
+                        f"<b style='color:{_vc};font-size:1.2em'>{_v}</b>  "
+                        f"(confidence {_critic_test.get('confidence', 0):.2f})<br>"
+                        f"<small>{_critic_test.get('reasoning', '')}</small><br>"
+                        f"<small style='color:#8b949e'>"
+                        f"Based on {_critic_test.get('n_similar', 0)} similar past trades · "
+                        f"WR {(_critic_test.get('similar_win_rate') or 0)*100:.0f}% · "
+                        f"AI call: {_critic_test.get('was_ai_call', False)}"
+                        f"</small></div>",
+                        unsafe_allow_html=True,
+                    )
+
+        # ── Recent AI reflections ─────────────────────────────────────────
+        _refls = _mgmt_tma.get_recent_reflections(limit=8)
+        if _refls:
+            with st.expander(f"💭 Recent AI Reflections ({len(_refls)})",
+                              expanded=False):
+                for r in _refls:
+                    _w   = bool(r.get("won"))
+                    _ic  = "✅" if _w else "🛑"
+                    _col = "#3fb950" if _w else "#f85149"
+                    _tk  = r.get("ticker", "?")
+                    _pnl = float(r.get("net_pnl", 0) or 0)
+                    _refl = (r.get("reflection") or "")[:400]
+                    _ts  = str(r.get("reflection_at") or "")[:19]
+                    st.markdown(
+                        f"<div style='background:#0d1117;border-left:3px solid {_col};"
+                        f"padding:8px 12px;margin:4px 0;border-radius:4px'>"
+                        f"<div style='font-size:0.78em;color:#8b949e'>"
+                        f"{_ic} <b>{_tk}</b>  ·  ${_pnl:+.2f}  ·  "
+                        f"{r.get('pattern', '?')} / {r.get('sector', '?')}  ·  "
+                        f"{_ts}</div>"
+                        f"<div style='margin-top:4px;font-size:0.9em'>{_refl}</div>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+        # ── Recent critic reviews ────────────────────────────────────────
+        _critics = _mgmt_tma.get_recent_critic_reviews(limit=10)
+        if _critics:
+            with st.expander(f"⚖️ Recent Critic Reviews ({len(_critics)})",
+                              expanded=False):
+                for c in _critics:
+                    _v   = c.get("verdict", "?")
+                    _col = {"BUY": "#3fb950", "WATCH": "#e3b341",
+                            "SKIP": "#f85149"}.get(_v, "#8b949e")
+                    _ic  = {"BUY": "✅", "WATCH": "👁",
+                            "SKIP": "🛑"}.get(_v, "?")
+                    _tk  = c.get("ticker", "?")
+                    _ms  = float(c.get("master_score_pre", 0) or 0)
+                    _ns  = int(c.get("n_similar", 0) or 0)
+                    _wr  = float(c.get("similar_win_rate", 0) or 0)
+                    _rsn = (c.get("reasoning") or "")[:300]
+                    _ts  = str(c.get("reviewed_at") or "")[:19]
+                    st.markdown(
+                        f"<div style='border-left:3px solid {_col};"
+                        f"padding:6px 10px;margin:3px 0;font-size:0.85em'>"
+                        f"{_ic} <b>{_tk}</b>  ·  Master {_ms:.0f}/100  ·  "
+                        f"<span style='color:{_col}'><b>{_v}</b></span>  ·  "
+                        f"{_ns} similar (WR {_wr*100:.0f}%)<br>"
+                        f"<small style='color:#8b949e'>{_rsn}</small>  "
+                        f"<small style='color:#6e7681'>· {_ts}</small>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+    except Exception as _tme:
+        st.warning(f"Memory agent unavailable: {_tme}")
+
+    st.divider()
+
     # ── SECTION 3.5 — SQUEEZE SCANNER (2-10x hunter) ─────────────────────────
     st.markdown("### 🚀 Squeeze Scanner — 2-10× Hunter")
     st.caption(

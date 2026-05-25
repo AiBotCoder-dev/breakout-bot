@@ -4375,9 +4375,9 @@ def _intraday_volume_pace(ticker: str) -> float:
 
 
 _PAPER_BUDGET        = 1_000.0
-_PAPER_MAX_POSITIONS = 5
-_PAPER_MAX_PCT       = 0.20
-_PAPER_MIN_CASH      = 100.0
+_PAPER_MAX_POSITIONS = 10        # ← raised from 5 to give the bot more room
+_PAPER_MAX_PCT       = 0.15      # ← lowered from 0.20 to suit smaller slot sizes
+_PAPER_MIN_CASH      = 50.0      # ← lowered from 100 so the 10th slot can fill
 
 
 class PaperTradingEngine:

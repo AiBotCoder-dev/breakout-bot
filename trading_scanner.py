@@ -2528,6 +2528,21 @@ class BreakoutScanner:
 
     # ── Main entry ────────────────────────────────────────────────────────────
 
+    def _emit_progress(self, phase: int, current: int, total: int, message: str = ""):
+        """Invoke an optional progress callback for UI updates.
+
+        Set self.progress_callback = fn(phase, current, total, message) before
+        calling run() to receive live progress updates.  Phases are 1-4 mapping
+        to Universe / Filter / Catalyst / Analysis.
+        """
+        cb = getattr(self, "progress_callback", None)
+        if cb is None:
+            return
+        try:
+            cb(phase, current, total, message)
+        except Exception:
+            pass   # never let UI errors break the scan
+
     def run(self):
         args = self.args or argparse.Namespace(
             pattern=None, watchlist=None, min_prob=0, no_earnings=False,
@@ -2540,8 +2555,10 @@ class BreakoutScanner:
         self._universe_raw      = 0
         self._universe_filtered = 0
         self._universe_advanced = 0
+        self._emit_progress(1, 0, 1, "Starting scan...")
 
         # ── Phase 1: Universe ──────────────────────────────────────────────
+        self._emit_progress(1, 0, 1, "Building universe...")
         if getattr(args, "watchlist", None):
             tickers_info = [{"ticker": t.strip().upper(), "info": {},
                              "market_cap": 0, "price": 0, "avg_vol": 0,
@@ -2551,6 +2568,7 @@ class BreakoutScanner:
             n = len(tickers_info)
             self._universe_raw = self._universe_filtered = n
             print(f"\n[Phase 1/4] Custom watchlist: {n} tickers")
+            self._emit_progress(1, 1, 1, f"Custom watchlist: {n} tickers")
         else:
             print("\n[Phase 1/4] Building universe...")
             ub      = UniverseBuilder()
@@ -2560,18 +2578,25 @@ class BreakoutScanner:
             )
             self._universe_raw = len(raw_t)
             print(f"  Raw universe: {len(raw_t)} tickers")
+            self._emit_progress(1, 1, 1, f"Raw universe: {len(raw_t)} tickers")
 
             # ── Phase 2: Quick filter ──────────────────────────────────────
+            self._emit_progress(2, 0, 1, f"Filtering {len(raw_t)} tickers...")
             print(f"[Phase 2/4] Quick filtering {len(raw_t)} tickers...")
             tickers_info = ub.quick_filter(raw_t, args)
             self._universe_filtered = len(tickers_info)
             print(f"  {len(tickers_info)} stocks passed quick filter\n")
+            self._emit_progress(2, 1, 1,
+                                 f"{len(tickers_info)}/{len(raw_t)} passed filter")
 
         # ── Phase 3: News catalyst ─────────────────────────────────────────
         cat_threshold = 20 if getattr(args, "catalyst_only", False) else 0
         print(f"[Phase 3/4] News catalyst scan ({len(tickers_info)} stocks)...")
+        self._emit_progress(3, 0, len(tickers_info),
+                             f"News catalyst scan on {len(tickers_info)} tickers")
         nce      = NewsCatalystEngine()
         catalyst_map: dict = {}
+        _cat_done = 0
         with ThreadPoolExecutor(max_workers=12) as ex:
             futs = {ex.submit(nce.scan, item["ticker"]): item["ticker"]
                     for item in tickers_info}
@@ -2581,6 +2606,11 @@ class BreakoutScanner:
                     r = fut.result()
                     catalyst_map[r["ticker"]] = r
                     bar.update(1)
+                    _cat_done += 1
+                    # Throttle UI updates to every 5 tickers to avoid spam
+                    if _cat_done % 5 == 0 or _cat_done == len(tickers_info):
+                        self._emit_progress(3, _cat_done, len(tickers_info),
+                                             f"Catalyst: {r['ticker']} ({_cat_done}/{len(tickers_info)})")
 
         if getattr(args, "biotech", False):
             BIOTECH_KWS = ["biotech","pharma","therapeutics","biosciences","oncology","health"]
@@ -2595,12 +2625,18 @@ class BreakoutScanner:
 
         # ── Phase 4: Full pattern detection ───────────────────────────────
         print(f"[Phase 4/4] Pattern detection + scoring ({len(advanced)} stocks)...")
+        self._emit_progress(4, 0, len(advanced),
+                             f"Fetching SPY market data...")
         print("Fetching SPY market data...")
         self.spy    = self._fetch_spy()
         self.regime = MarketRegimeDetector.detect(self.spy)
         print(f"  Market regime: {self.regime['regime']}  |  {self.regime['advice']}")
         self._init_sector_rotation()
+        self._emit_progress(4, 0, len(advanced),
+                             f"Analyzing {len(advanced)} candidates "
+                             f"(regime: {self.regime['regime']})")
 
+        _analyzed = 0
         with ThreadPoolExecutor(max_workers=self.cfg["max_workers"]) as ex:
             futs = {ex.submit(self._process_with_info, item,
                               catalyst_map.get(item["ticker"])): item["ticker"]
@@ -2608,6 +2644,11 @@ class BreakoutScanner:
             with tqdm(total=len(advanced), desc="  Analyzing",
                       unit="stock", ncols=80) as bar:
                 for fut in as_completed(futs):
+                    _analyzed += 1
+                    # Surface progress every ticker so the user sees live activity.
+                    _tk_done = futs.get(fut, "?")
+                    self._emit_progress(4, _analyzed, len(advanced),
+                                         f"Analyzed {_tk_done} ({_analyzed}/{len(advanced)})")
                     try:
                         r = fut.result()
                         if r is None:
@@ -2637,6 +2678,8 @@ class BreakoutScanner:
                         bar.update(1)
 
         elapsed = (datetime.now() - t0).total_seconds()
+        self._emit_progress(4, len(advanced), len(advanced),
+                             f"Complete: {len(self.results)} qualified in {elapsed:.1f}s")
 
         # ── RS Rating: rank 1-99 by 12-month return vs all results ───────────
         if self.results:

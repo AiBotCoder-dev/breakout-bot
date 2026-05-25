@@ -1058,7 +1058,33 @@ if run_btn:
 
     status = st.sidebar.status("Running scan…", expanded=True)
     with status:
-        st.write("Fetching universe…")
+        # ── Progress bar widget that updates live as the scanner progresses ──
+        _scan_bar = st.progress(0, text="🚀 Starting scan…")
+        _scan_log = st.empty()
+
+        # Phase-weighted progress ranges (each phase gets a slice of 0-100%):
+        #   Phase 1 (Universe):   0 → 10 %
+        #   Phase 2 (Filter):    10 → 20 %
+        #   Phase 3 (Catalyst):  20 → 50 %
+        #   Phase 4 (Analysis):  50 → 99 %
+        _phase_ranges = {1: (0, 10), 2: (10, 20), 3: (20, 50), 4: (50, 99)}
+        _phase_names  = {1: "Universe", 2: "Filter", 3: "News Catalyst", 4: "Analysis"}
+
+        def _on_scan_progress(phase: int, current: int, total: int, message: str):
+            lo, hi = _phase_ranges.get(phase, (0, 100))
+            if total and total > 0:
+                frac = max(0.0, min(1.0, current / total))
+            else:
+                frac = 0.0
+            pct = int(lo + (hi - lo) * frac)
+            label = f"Phase {phase}/4 · {_phase_names.get(phase, '?')}: {message}"
+            try:
+                _scan_bar.progress(pct, text=label[:200])
+            except Exception:
+                pass
+
+        scanner.progress_callback = _on_scan_progress
+
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             try:
@@ -1066,6 +1092,10 @@ if run_btn:
             except Exception as e:
                 st.error(f"Scan error: {e}")
 
+        try:
+            _scan_bar.progress(100, text=f"✓ Scan complete — {len(scanner.results)} stocks qualified")
+        except Exception:
+            pass
         st.write(f"Done — {len(scanner.results)} stocks qualified")
 
     status.update(label="Scan complete ✓", state="complete", expanded=False)

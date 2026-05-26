@@ -4472,6 +4472,16 @@ class PaperTradingEngine:
                 ("paper_portfolio", "highest_since_t1",  "REAL"),
                 ("paper_portfolio", "atr_value",         "REAL"),
                 ("paper_portfolio", "sector",            "TEXT"),
+                # ── Rich context columns for Memory Agent + Learning Engine ──
+                # These were previously computed at trade-open then thrown away,
+                # leaving the engines starved of similarity signals. Persisting
+                # them lets the Memory Agent match new candidates against past
+                # trades by Wyckoff phase, market regime, VIX regime, etc.
+                ("paper_portfolio", "master_score",      "REAL"),
+                ("paper_portfolio", "wyckoff_phase",     "TEXT"),
+                ("paper_portfolio", "market_regime",     "TEXT"),
+                ("paper_portfolio", "vix_regime",        "TEXT"),
+                ("paper_portfolio", "vix_level",         "REAL"),
             ]
             for _tbl, _col, _typ in _new_cols:
                 try:
@@ -4617,17 +4627,29 @@ class PaperTradingEngine:
         _atr    = signal.get("atr_value") or _risk / 2.0
         _sector = signal.get("sector", "") or ""
 
+        # ── Rich context for Memory Agent + Learning Engine ──────────────────
+        # These were previously computed at trade-open then discarded; now
+        # they're persisted so the engines can use them for similarity matching.
+        _master_score   = float(signal.get("master_score",   0) or 0)
+        _wyckoff_phase  = str(  signal.get("wyckoff_phase",  "") or "")[:64]
+        _market_regime  = str(  signal.get("market_regime",  "") or "")[:64]
+        _vix_regime     = str(  signal.get("vix_regime",     "") or "")[:32]
+        _vix_level      = float(signal.get("vix_level",      0) or 0)
+
         self.conn.execute("""
             INSERT INTO paper_portfolio
             (ticker, entry_price, entry_date, shares, gross_invested, buy_fee,
              stop_loss, target_price, fee_adj_rr, pattern, explosive_score,
-             breakout_prob, t1_price, trailing_stop, atr_value, sector)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             breakout_prob, t1_price, trailing_stop, atr_value, sector,
+             master_score, wyckoff_phase, market_regime, vix_regime, vix_level)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (ticker, price, today, buy_calc["shares"], gross, buy_calc["fee"],
               _stop, signal.get("tgt_price", 0),
               signal.get("fee_adj_rr", 0), signal.get("pattern", ""),
               signal.get("explosive_score", 0), signal.get("probability", 0),
-              _t1, _stop, _atr, _sector))
+              _t1, _stop, _atr, _sector,
+              _master_score, _wyckoff_phase, _market_regime,
+              _vix_regime, _vix_level))
 
         self.conn.execute("""
             INSERT INTO fees
@@ -10780,17 +10802,27 @@ CREATE TABLE IF NOT EXISTS paper_learning_log (
 
             # Bump every signal dimension we have on the trade
             for sig_type, sig_value in [
-                ("sector",       trade.get("sector",  "")),
-                ("pattern",      trade.get("pattern", "")),
-                ("score_bucket", self._bucket_score(trade.get("explosive_score", 0))),
-                ("prob_bucket",  self._bucket_prob (trade.get("breakout_prob",   0))),
-                ("exit_reason",  trade.get("exit_reason", "")),
+                ("sector",         trade.get("sector",        "")),
+                ("pattern",        trade.get("pattern",       "")),
+                ("score_bucket",   self._bucket_score(trade.get("explosive_score", 0))),
+                ("master_bucket",  self._bucket_score(trade.get("master_score",    0))),
+                ("prob_bucket",    self._bucket_prob (trade.get("breakout_prob",   0))),
+                ("exit_reason",    trade.get("exit_reason",   "")),
+                ("wyckoff_phase",  trade.get("wyckoff_phase", "")),
+                ("market_regime",  trade.get("market_regime", "")),
+                ("vix_regime",     trade.get("vix_regime",    "")),
             ]:
-                self._bump_signal_perf(sig_type, str(sig_value or ""),
-                                        is_win, pnl)
+                # Skip empty values to keep stats clean
+                v = str(sig_value or "")
+                if v and v != "Unknown":
+                    self._bump_signal_perf(sig_type, v, is_win, pnl)
 
-            # ── Adaptive blacklisting per sector / pattern ──────────────────
-            for sig_type, kind in [("sector", "sector"), ("pattern", "pattern")]:
+            # ── Adaptive blacklisting (sector + pattern + wyckoff) ──────────
+            for sig_type, kind in [
+                ("sector",         "sector"),
+                ("pattern",        "pattern"),
+                ("wyckoff_phase",  "wyckoff"),
+            ]:
                 self._maybe_promote_blacklist(sig_type, kind,
                                               str(trade.get(sig_type, "") or ""))
 
@@ -10934,10 +10966,12 @@ CREATE TABLE IF NOT EXISTS paper_learning_log (
         last_id = int(st.get("last_processed_trade_id", 0) or 0)
 
         try:
+            # SELECT * is intentional — record_trade_outcome reads multiple
+            # context columns (master_score, wyckoff_phase, market_regime,
+            # vix_regime) and we don't want to forget to add a column to the
+            # SELECT every time we add a new dimension.
             rows = self.conn.execute(
-                "SELECT id, ticker, pattern, sector, explosive_score, "
-                "breakout_prob, net_pnl, exit_reason "
-                "FROM paper_portfolio "
+                "SELECT * FROM paper_portfolio "
                 "WHERE status='CLOSED' AND id > ? "
                 "ORDER BY id ASC LIMIT ?",
                 (last_id, int(max_per_cycle))

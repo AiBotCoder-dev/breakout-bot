@@ -513,6 +513,26 @@ def auto_enter_stocks(conn, paper, session, quality,
         except Exception:
             pass
 
+        # Capture rich context at trade-open time so the Memory Agent and
+        # Learning Engine can use it for similarity matching later.
+        _wyckoff_label = master["components"].get("wyckoff", {}).get("label", "")
+        # Extract the phase name (e.g. "Wyckoff: ACCUMULATION" → "ACCUMULATION")
+        _wyckoff_phase = ""
+        if ":" in _wyckoff_label:
+            _wyckoff_phase = _wyckoff_label.split(":", 1)[1].strip()
+        else:
+            _wyckoff_phase = _wyckoff_label
+        _regime_label  = (market_regime or {}).get("regime", "") if market_regime else ""
+        _vix_regime    = ""
+        _vix_level     = 0.0
+        try:
+            _vix_data_local = ts.get_vix_level()
+            if _vix_data_local:
+                _vix_regime = _vix_data_local.get("regime", "")
+                _vix_level  = float(_vix_data_local.get("vix", 0))
+        except Exception:
+            pass
+
         signal = {
             "price":           live_price,
             "stop_price":      stop,
@@ -521,6 +541,12 @@ def auto_enter_stocks(conn, paper, session, quality,
             "probability":     prob,
             "pattern":         pattern,
             "sector":          sector,
+            # Rich context for Memory Agent + Learning Engine
+            "master_score":    m_score,
+            "wyckoff_phase":   _wyckoff_phase,
+            "market_regime":   _regime_label,
+            "vix_regime":      _vix_regime,
+            "vix_level":       _vix_level,
         }
         result = paper.open_position(ticker, signal)
 

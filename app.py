@@ -1586,6 +1586,126 @@ with tab_mgmt:
 
     st.divider()
 
+    # ── SECTION 3.55 — WHALE INTELLIGENCE (follow the money) ─────────────────
+    st.markdown("### 🐋 Whale Intelligence")
+    st.caption(
+        "Five free sources of institutional/insider/political activity: "
+        "Quiver Quant (Congressional trades) · SEC EDGAR (13D/13G/Form 4) · "
+        "USASpending.gov (federal contracts) · StockTwits (trader sentiment). "
+        "Feeds into Master Score as a 14th multiplier (1.00× to 1.10×)."
+    )
+
+    _wi_c1, _wi_c2 = st.columns([3, 1])
+    with _wi_c1:
+        _wi_ticker = st.text_input("Ticker to investigate",
+                                     value="NVDA",
+                                     key="mgmt_whale_input",
+                                     placeholder="e.g. AAPL, NVDA, GME")
+    with _wi_c2:
+        _wi_run = st.button("🔍 Investigate",
+                              key="mgmt_whale_btn",
+                              type="primary",
+                              use_container_width=True)
+
+    if _wi_run and _wi_ticker:
+        with st.spinner(f"Querying SEC EDGAR + Quiver + StockTwits + USASpending for {_wi_ticker.upper()}…"):
+            try:
+                from whale_intelligence import WhaleIntelligence
+                _wi_report = WhaleIntelligence().full_report(_wi_ticker.upper())
+
+                # ── Composite score banner ────────────────────────────────
+                _ws = _wi_report.get("whale_score", 0)
+                _wc = ("#3fb950" if _ws >= 60 else
+                        "#58a6ff" if _ws >= 35 else
+                        "#e3b341" if _ws >= 15 else "#8b949e")
+                st.markdown(
+                    f"<div style='background:#161b22;border:2px solid {_wc};"
+                    f"border-radius:8px;padding:14px 18px;margin:8px 0'>"
+                    f"<div style='font-size:0.85em;color:#8b949e'>WHALE SCORE</div>"
+                    f"<div style='font-size:2em;font-weight:bold;color:{_wc}'>"
+                    f"{_ws}/100</div>"
+                    f"</div>", unsafe_allow_html=True,
+                )
+
+                # ── Flags row ─────────────────────────────────────────────
+                if _wi_report.get("flags"):
+                    st.markdown("**🚩 Detected signals:**")
+                    for f in _wi_report["flags"][:10]:
+                        st.markdown(f"- {f}")
+
+                # ── Four-column sub-panels ────────────────────────────────
+                _wp1, _wp2 = st.columns(2)
+
+                # Congressional
+                with _wp1:
+                    with st.container(border=True):
+                        st.markdown("**🏛️ Congressional Trading**")
+                        _cg = _wi_report["congress"]
+                        st.metric("Congress score", f"{_cg.get('congress_score', 0)}/35")
+                        st.caption(f"{_cg.get('n_buyers_30d', 0)} unique buyers in last 30 days")
+                        if _cg.get("cluster_detected"):
+                            st.success("🏛️ CLUSTER BUY DETECTED")
+                        for p in (_cg.get("purchases") or [])[:4]:
+                            st.markdown(
+                                f"- **{p.get('representative','?')}** "
+                                f"({p.get('party','?')}) — "
+                                f"`{p.get('amount','?')}` on {p.get('date','?')}"
+                            )
+                        if _cg.get("sales"):
+                            st.warning(f"⚠️ {len(_cg['sales'])} recent SALE(s)")
+
+                # SEC Filings
+                with _wp2:
+                    with st.container(border=True):
+                        st.markdown("**📑 SEC EDGAR Filings**")
+                        _sec = _wi_report["sec_filings"]
+                        st.metric("SEC score", f"{_sec.get('sec_score', 0)}/50")
+                        _sm1, _sm2 = st.columns(2)
+                        _sm1.metric("13D filings", _sec.get("n_13d_30d", 0))
+                        _sm2.metric("13G filings", _sec.get("n_13g_30d", 0))
+                        _sm3, _sm4 = st.columns(2)
+                        _sm3.metric("Form 4s", _sec.get("n_form4_30d", 0))
+                        _sm4.metric("Unique insiders", _sec.get("n_unique_insiders", 0))
+                        if _sec.get("has_activist"):
+                            st.success(f"🐋 **ACTIVIST:** {_sec.get('activist_name', '?')[:60]}")
+                        for f in (_sec.get("recent_filings") or [])[:3]:
+                            st.caption(f"• {f.get('form','?')} · {f.get('filed_at','?')} · "
+                                        f"{f.get('filer','?')[:50]}")
+
+                _wp3, _wp4 = st.columns(2)
+
+                # Gov contracts
+                with _wp3:
+                    with st.container(border=True):
+                        st.markdown("**🇺🇸 Government Contracts**")
+                        _gov = _wi_report["gov_contracts"]
+                        st.metric("Gov score", f"{_gov.get('gov_score', 0)}/35")
+                        if _gov.get("biggest_value", 0) > 0:
+                            st.metric("Biggest contract",
+                                       f"${_gov['biggest_value']/1e6:.1f}M")
+                        for c in (_gov.get("contracts") or [])[:3]:
+                            st.caption(f"• ${c.get('amount', 0)/1e6:.2f}M · "
+                                        f"{c.get('agency','?')[:30]} · "
+                                        f"{c.get('date','?')}")
+
+                # StockTwits
+                with _wp4:
+                    with st.container(border=True):
+                        st.markdown("**📱 StockTwits Sentiment**")
+                        _st = _wi_report["stocktwits"]
+                        _bp = float(_st.get("bull_pct", 0) or 0)
+                        st.metric("Bull %",
+                                    f"{_bp*100:.0f}%",
+                                    f"{_st.get('n_messages', 0)} msgs")
+                        _v = float(_st.get("velocity_ratio", 1) or 1)
+                        st.metric("Velocity", f"{_v:.1f}× normal",
+                                    "Going viral 🔥" if _v >= 3 else None)
+                        st.caption(_st.get("summary", ""))
+
+            except Exception as _we:
+                st.error(f"Whale investigation failed: {_we}")
+    st.divider()
+
     # ── SECTION 3.6 — TRADING MEMORY AGENT (AI episodic memory + critic) ─────
     st.markdown("### 🧠 Trading Memory Agent")
     st.caption(

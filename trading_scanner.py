@@ -9076,10 +9076,39 @@ def compute_master_score(ticker, expiry, bias, conn,
             "multiplier": 1.0,
         }
 
-    # ── Final score: base × TV × news × duration × squeeze × memory ─────────
+    # ── 14. Whale Intelligence multiplier (congress + SEC + gov + StockTwits) —
+    # The "follow the money" signal. Only applies on bullish trades.
+    whale_mult = 1.0
+    whale_data = {}
+    if not skip_slow_checks and str(bias).lower() != "bearish":
+        try:
+            from whale_intelligence import WhaleIntelligence
+            _wi = WhaleIntelligence()
+            whale_data = _wi.score_multiplier(ticker) or {}
+            whale_mult = float(whale_data.get("multiplier", 1.0) or 1.0)
+        except Exception:
+            whale_mult = 1.0
+    if whale_data and whale_data.get("whale_score", 0) > 0:
+        components["whale"] = {
+            "max":         "×",
+            "pts":         f"{whale_mult:.2f}",
+            "label":       (f"Whales: score {whale_data.get('whale_score', 0)}/100"
+                             f" → {whale_mult:.2f}×"),
+            "multiplier":  whale_mult,
+            "raw":         whale_data,
+        }
+    else:
+        components["whale"] = {
+            "max":   "×",
+            "pts":   "1.00",
+            "label": "Whale data unavailable (1.00×)",
+            "multiplier": 1.0,
+        }
+
+    # ── Final score: base × TV × news × duration × squeeze × memory × whale ─
     raw_score = max(0, total)
-    score = round(min(100, raw_score * tv_mult * news_mult *
-                       duration_mult * squeeze_mult * memory_mult), 1)
+    score = round(min(100, raw_score * tv_mult * news_mult * duration_mult *
+                       squeeze_mult * memory_mult * whale_mult), 1)
 
     # ── Grade + decision ──────────────────────────────────────────────────────
     if score >= 85:
@@ -9118,6 +9147,8 @@ def compute_master_score(ticker, expiry, bias, conn,
         "squeeze_multiplier":  squeeze_mult,
         "memory_data":         memory_data,
         "memory_multiplier":   memory_mult,
+        "whale_data":          whale_data,
+        "whale_multiplier":    whale_mult,
         "base_score":          round(raw_score, 1),
     }
 

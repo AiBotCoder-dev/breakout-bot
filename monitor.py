@@ -63,6 +63,20 @@ OPTIONS_MIN_PROB         = 55    # breakout_prob (%) threshold for options auto-
 AUTO_MAX_ENTRIES_PER_RUN = 2     # max NEW entries per monitor run (each category)
 STOCK_CHASE_LIMIT_PCT    = 3.0   # skip stock entry if price > scan entry by this %
 
+# Always-on options watchlist — tickers with reliable weekly options + high
+# liquidity. The options auto-entry checks these EVERY cycle regardless of
+# whether they're in the breakout scan. They go through the same Master
+# Score gate, so weak setups still get skipped — but the bot won't go idle
+# just because the scan happens to be sparse.
+OPTIONS_AUTO_WATCHLIST = [
+    "SPY", "QQQ", "IWM",                       # major indices (cheap, liquid)
+    "AAPL", "NVDA", "TSLA", "AMD", "MSFT",     # top tech
+    "META", "GOOG", "AMZN",                     # mega-cap tech
+    "PLTR", "AMC", "GME",                       # high-vol small caps
+    "F", "BAC", "T",                            # cheap-premium liquid stocks
+]
+OPTIONS_MIN_CASH = 20.0   # minimum free cash to consider an options entry
+
 # ── PostgreSQL adapter (identical copy from app.py) ───────────────────────────
 try:
     import psycopg2
@@ -627,35 +641,67 @@ def auto_enter_options(conn, vix_data, session, quality,
     ops_summary = ops_engine.get_summary()
     cash_avail  = ops_summary.get("available_cash", 0)
 
-    if cash_avail < 50:
-        print(f"  Options cash too low (${cash_avail:.2f}) — skipping.")
+    if cash_avail < OPTIONS_MIN_CASH:
+        print(f"  Options cash too low (${cash_avail:.2f} < ${OPTIONS_MIN_CASH}) — skipping.")
         return
 
-    # ── Load scan plays ───────────────────────────────────────────────────────
+    # ── Build merged candidate list: scan plays + always-on watchlist ───────
+    # The watchlist guarantees the bot has tickers to evaluate even when the
+    # breakout scan is sparse. They still have to pass the same Master Score
+    # gate — bad setups get rejected, but the bot doesn't go idle.
+    scan_plays  = []
     try:
-        scan_plays = ts.get_scan_options_plays(conn, top_n=10)
+        scan_plays = ts.get_scan_options_plays(conn, top_n=10) or []
     except Exception as e:
-        print(f"  ERROR loading options plays: {e}")
-        return
-
-    if not scan_plays:
-        print("  No scan plays available — skipping options auto-entry.")
-        return
-
-    candidates = [
-        p for p in scan_plays
-        if float(p.get("explosive_score", 0)) >= OPTIONS_MIN_SCORE
-        and float(p.get("breakout_prob",   0)) >= OPTIONS_MIN_PROB
-    ]
-    print(f"  Options plays: {len(scan_plays)} tickers | "
-          f"{len(candidates)} above thresholds "
-          f"(score≥{OPTIONS_MIN_SCORE}, prob≥{OPTIONS_MIN_PROB}%)")
+        print(f"  WARN loading scan plays: {e}")
 
     held_opt_tickers = {
         str(p.get("ticker", "")).upper()
         for p in ops_engine.get_positions("OPEN")
     }
     closed_hist = ops_engine.get_positions("CLOSED")
+
+    # ── Filter scan plays by pre-thresholds ──────────────────────────────────
+    scan_candidates = [
+        p for p in scan_plays
+        if float(p.get("explosive_score", 0)) >= OPTIONS_MIN_SCORE
+        and float(p.get("breakout_prob",   0)) >= OPTIONS_MIN_PROB
+    ]
+    print(f"  Scan plays: {len(scan_plays)} total | "
+          f"{len(scan_candidates)} above thresholds "
+          f"(score≥{OPTIONS_MIN_SCORE}, prob≥{OPTIONS_MIN_PROB}%)")
+
+    # ── Build watchlist candidates (always evaluated) ────────────────────────
+    # For each watchlist ticker, generate fresh strategy suggestions on the fly.
+    # These don't have explosive_score from a scan — we set neutral defaults and
+    # let the Master Score gate be the real quality check.
+    print(f"  Watchlist: evaluating {len(OPTIONS_AUTO_WATCHLIST)} always-on tickers")
+    _strat_engine = ts.OptionsStrategyEngine()
+    watchlist_candidates = []
+    seen_tickers = {str(p.get("ticker", "")).upper() for p in scan_candidates}
+    for tk in OPTIONS_AUTO_WATCHLIST:
+        tk = tk.upper()
+        if tk in seen_tickers or tk in held_opt_tickers:
+            continue
+        try:
+            sugs = _strat_engine.suggest(tk, bias="bullish")
+        except Exception:
+            sugs = []
+        if not sugs:
+            continue   # no weekly options available
+        watchlist_candidates.append({
+            "ticker":          tk,
+            "explosive_score": 0,      # placeholder; Master Score is the real gate
+            "breakout_prob":   0,
+            "suggestions":     sugs,
+            "source":          "watchlist",
+        })
+
+    # ── Merge & deduplicate (scan candidates win when overlapping) ──────────
+    candidates = list(scan_candidates) + watchlist_candidates
+    print(f"  Total candidates: {len(candidates)} "
+          f"({len(scan_candidates)} from scan + {len(watchlist_candidates)} watchlist)")
+
     new_entries = 0
 
     for play in candidates:
@@ -672,11 +718,47 @@ def auto_enter_options(conn, vix_data, session, quality,
             print(f"    {ticker:8s} — no strategy suggestions, skip")
             continue
 
-        # Prefer Weekly ATM (highest-probability play)
-        sg = next(
-            (s for s in suggestions if s.get("strategy") == "Weekly ATM"),
-            suggestions[0]
-        )
+        # ── SMART STRATEGY SELECTION with affordability fallback ────────────
+        # Try Weekly ATM first (highest probability), then Weekly OTM
+        # (cheaper, needs bigger move), then Mid-Week ATM as last resort.
+        # If ALL suggestions cost more than available cash, skip this ticker.
+        _strategy_order = ["Weekly ATM", "Weekly OTM", "Mid-Week ATM"]
+        sg = None
+        for _strat_name in _strategy_order:
+            _candidate = next(
+                (s for s in suggestions if s.get("strategy") == _strat_name),
+                None,
+            )
+            if not _candidate:
+                continue
+            _mid_test = float(_candidate.get("mid", 0) or 0)
+            if _mid_test <= 0:
+                continue
+            _cost_one = _mid_test * 100
+            if _cost_one <= cash_avail:
+                sg = _candidate
+                if _strat_name != "Weekly ATM":
+                    print(f"    {ticker:8s} — Weekly ATM unaffordable, "
+                          f"fell back to {_strat_name}")
+                break
+
+        # Last resort: try ANY suggestion that fits the cash budget
+        if sg is None:
+            for s in suggestions:
+                _mid_test = float(s.get("mid", 0) or 0)
+                if _mid_test > 0 and _mid_test * 100 <= cash_avail:
+                    sg = s
+                    break
+
+        if sg is None:
+            _cheapest = min(
+                (float(s.get("mid", 0) or 0) for s in suggestions
+                  if float(s.get("mid", 0) or 0) > 0),
+                default=0,
+            )
+            print(f"    {ticker:8s} — all suggestions exceed cash (cheapest "
+                  f"${_cheapest*100:.0f}, cash ${cash_avail:.2f}) — skip")
+            continue
 
         mid      = float(sg.get("mid",      0) or 0)
         expiry   = str(sg.get("expiry",    "") or "")
@@ -698,11 +780,12 @@ def auto_enter_options(conn, vix_data, session, quality,
         )
         contracts = max(1, sizing.get("contracts", 1))
 
-        # Ensure we can afford it; try falling back to 1 contract
+        # Ensure we can afford it; fall back to 1 contract
         cost_total = round(mid * 100 * contracts, 2)
         if cost_total > cash_avail:
             cost_total = round(mid * 100, 2)
             if cost_total > cash_avail:
+                # Should be unreachable thanks to the fallback above, but safe
                 print(f"    {ticker:8s} — 1 contract costs ${cost_total:.2f}, "
                       f"cash=${cash_avail:.2f} — skip")
                 continue

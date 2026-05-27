@@ -1359,6 +1359,41 @@ def main():
         traceback.print_exc()
         send_telegram(f"⚠️ <b>Auto-Entry Options Error</b>\n{str(exc)[:300]}")
 
+    # ── Options Callout Tracker — aggregate social call/put ideas + track P&L ──
+    # Research-only: pulls options callouts from StockTwits (+ Reddit if creds),
+    # snapshots the called option's premium NOW, and tracks forward P&L so we
+    # build a leaderboard of which callers are actually profitable.
+    print(f"\n  {'─'*50}")
+    print(f"  OPTIONS CALLOUTS — Social call/put aggregator")
+    try:
+        from options_callouts import OptionsCalloutTracker
+        _oct = OptionsCalloutTracker(conn)
+        # First update outcomes on existing open callouts (cheap, bounded)
+        _trk = _oct.track_outcomes(max_per_cycle=40)
+        # Then ingest fresh callouts (snapshots premium for new ones)
+        _ing = _oct.ingest_callouts(include_reddit=True)
+        print(f"  Ingest : {_ing.get('new_stored',0)} new "
+              f"(fetched {_ing.get('fetched',0)}, "
+              f"dup {_ing.get('skipped_duplicate',0)}, "
+              f"no-premium {_ing.get('skipped_no_premium',0)})")
+        print(f"  Track  : {_trk.get('updated',0)} updated, "
+              f"{_trk.get('expired',0)} closed/expired")
+        # Surface any standout winners to Telegram (open callouts up big)
+        try:
+            for w in (_oct.get_recent_winners(hours=24, limit=2) or []):
+                send_telegram(
+                    f"📢 <b>Hot Options Callout</b>\n"
+                    f"<b>${w.get('ticker','')}</b> "
+                    f"{str(w.get('option_type','')).upper()} "
+                    f"{('$'+str(w.get('strike'))) if w.get('strike') else 'ATM'}\n"
+                    f"P&L: {w.get('pnl_pct',0):+.0f}% since called\n"
+                    f"By @{w.get('username','?')} on {w.get('source','')}"
+                )
+        except Exception:
+            pass
+    except Exception as exc:
+        print(f"  WARN options callout tracker failed: {exc}")
+
     print(f"\n  Done (session={quality}).\n")
     conn.close()
 

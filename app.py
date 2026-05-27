@@ -2219,6 +2219,118 @@ with tab_mgmt:
 
     st.divider()
 
+    # ── SECTION 3.5 — OPTIONS CALLOUTS (SOCIAL AGGREGATOR) ───────────────────
+    st.markdown("### 📢 Options Callouts — Social Watchlist")
+    st.caption(
+        "Aggregates call/put ideas from StockTwits (+ Reddit if configured), "
+        "snapshots the option's premium when called, then tracks forward P&L. "
+        "**Research only — not auto-traded.** Builds a leaderboard of which "
+        "callers are actually profitable."
+    )
+    try:
+        from options_callouts import OptionsCalloutTracker
+        _oct = OptionsCalloutTracker(conn)
+        _oc_stats = _oct.get_stats()
+
+        _ocm = st.columns(5)
+        _ocm[0].metric("Total Tracked", _oc_stats.get("n_total", 0))
+        _ocm[1].metric("Open", _oc_stats.get("n_open", 0))
+        _ocm[2].metric("Closed", _oc_stats.get("n_closed", 0))
+        _ocm[3].metric("Wins", _oc_stats.get("n_wins", 0))
+        _ocm[4].metric("Win Rate", f"{_oc_stats.get('overall_win_rate', 0):.0f}%")
+
+        _oc_btns = st.columns(2)
+        with _oc_btns[0]:
+            if st.button("📥 Pull Latest Callouts", key="mgmt_oc_pull",
+                          use_container_width=True):
+                with st.spinner("Fetching social callouts + snapshotting premiums..."):
+                    try:
+                        _trk = _oct.track_outcomes(max_per_cycle=40)
+                        _ing = _oct.ingest_callouts(include_reddit=True)
+                        st.success(
+                            f"Ingested {_ing.get('new_stored',0)} new "
+                            f"(fetched {_ing.get('fetched',0)}, "
+                            f"dup {_ing.get('skipped_duplicate',0)}, "
+                            f"no-premium {_ing.get('skipped_no_premium',0)}). "
+                            f"Tracked {_trk.get('updated',0)}, "
+                            f"closed {_trk.get('expired',0)}."
+                        )
+                        st.rerun()
+                    except Exception as _pe:
+                        st.error(f"Pull failed: {_pe}")
+        with _oc_btns[1]:
+            if st.button("🔄 Refresh P&L Only", key="mgmt_oc_track",
+                          use_container_width=True):
+                with st.spinner("Updating live premiums on open callouts..."):
+                    try:
+                        _trk = _oct.track_outcomes(max_per_cycle=60)
+                        st.success(f"Updated {_trk.get('updated',0)}, "
+                                   f"closed {_trk.get('expired',0)}.")
+                        st.rerun()
+                    except Exception as _te:
+                        st.error(f"Refresh failed: {_te}")
+
+        # ── Active callouts (live P&L) ───────────────────────────────────────
+        _active = _oct.get_active_callouts(limit=40)
+        if _active:
+            st.markdown("**🟢 Active Callouts (live P&L):**")
+            _ac_rows = []
+            for c in _active:
+                _pnl = float(c.get("pnl_pct", 0) or 0)
+                _ac_rows.append({
+                    "Ticker":  c.get("ticker", ""),
+                    "Type":    str(c.get("option_type", "")).upper(),
+                    "Strike":  f"${float(c['strike']):.0f}" if c.get("strike") else "ATM",
+                    "Expiry":  str(c.get("expiry", "") or "—"),
+                    "Caller":  f"@{c.get('username','?')}",
+                    "Source":  c.get("source", ""),
+                    "Entry $": f"${float(c.get('entry_premium',0) or 0):.2f}",
+                    "Now $":   f"${float(c.get('last_premium',0) or 0):.2f}",
+                    "P&L %":   f"{_pnl:+.0f}%",
+                })
+            st.dataframe(pd.DataFrame(_ac_rows), hide_index=True,
+                          use_container_width=True)
+        else:
+            st.info("No active callouts yet. Click **Pull Latest Callouts** to "
+                    "scan StockTwits now (the monitor also does this every cycle).")
+
+        # ── Recent winners + Leaderboard side by side ────────────────────────
+        _oc_lr = st.columns(2)
+        with _oc_lr[0]:
+            st.markdown("**🔥 Recent Winners (last 24h, open & up >10%):**")
+            _winners = _oct.get_recent_winners(hours=24, limit=10)
+            if _winners:
+                _w_rows = [{
+                    "Ticker": w.get("ticker", ""),
+                    "Type":   str(w.get("option_type", "")).upper(),
+                    "P&L %":  f"{float(w.get('pnl_pct',0) or 0):+.0f}%",
+                    "Caller": f"@{w.get('username','?')}",
+                } for w in _winners]
+                st.dataframe(pd.DataFrame(_w_rows), hide_index=True,
+                              use_container_width=True)
+            else:
+                st.caption("No standout winners in the last 24h.")
+        with _oc_lr[1]:
+            st.markdown("**🏆 Caller Leaderboard (closed callouts):**")
+            _lb = _oct.get_leaderboard(min_callouts=3)
+            if _lb:
+                _lb_rows = [{
+                    "Caller":   f"@{l.get('username','?')}",
+                    "Source":   l.get("source", ""),
+                    "Calls":    l.get("n_total", 0),
+                    "Win %":    f"{l.get('win_rate_pct',0):.0f}%",
+                    "Avg P&L":  f"{float(l.get('avg_pnl_pct',0) or 0):+.0f}%",
+                } for l in _lb[:10]]
+                st.dataframe(pd.DataFrame(_lb_rows), hide_index=True,
+                              use_container_width=True)
+            else:
+                st.caption("Leaderboard builds as callouts close (need 3+ "
+                           "closed callouts per caller). Give it a few days.")
+    except Exception as _oce:
+        st.warning(f"Options callouts unavailable: {_oce}")
+
+    st.divider()
+
     # ── SECTION 4 — DIAGNOSTICS & MANUAL TRIGGERS ────────────────────────────
     st.markdown("### 🩺 Engine Diagnostics & Manual Triggers")
     _diag_cols = st.columns(4)

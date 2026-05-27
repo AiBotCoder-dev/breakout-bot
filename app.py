@@ -1586,6 +1586,104 @@ with tab_mgmt:
 
     st.divider()
 
+    # ── SECTION 3.45 — EARLY MOMENTUM SCANNER (pre-explosion detector) ───────
+    st.markdown("### 🔮 Pre-Explosion Scanner")
+    st.caption(
+        "Catches stocks in the 1-3 day window BEFORE they explode. "
+        "Looks for: coiled spring (BB compression building) · volume base · "
+        "StockTwits velocity acceleration · MTF transition · short covering · "
+        "fresh catalyst. Each individual signal is noisy — the edge comes from clusters."
+    )
+
+    _em_c1, _em_c2 = st.columns([3, 1])
+    with _em_c1:
+        _em_input = st.text_area(
+            "Universe to scan (comma-separated)",
+            value="UPS, SOFI, HIMS, KLAR, SPY, QQQ, AAPL, NVDA, TSLA, AMD, "
+                  "PLTR, AMC, GME, F, T, BAC, MSFT, META, AMZN, GOOG",
+            key="mgmt_early_input",
+            height=80,
+        )
+    with _em_c2:
+        _em_min = st.number_input("Min score", 0, 100, 30,
+                                    key="mgmt_early_minscore")
+        _em_run = st.button("🔮 Scan for Pre-Explosion",
+                              key="mgmt_early_btn",
+                              type="primary",
+                              use_container_width=True)
+
+    if _em_run:
+        _tickers = [t.strip().upper() for t in _em_input.split(",") if t.strip()]
+        if _tickers:
+            with st.spinner(f"Scanning {len(_tickers)} tickers for pre-explosion signals…"):
+                try:
+                    from early_momentum import EarlyMomentumScanner
+                    _ems = EarlyMomentumScanner(conn=conn)
+                    _em_results = _ems.scan_universe(_tickers, min_score=_em_min)
+                except Exception as _eme:
+                    st.error(f"Scanner error: {_eme}")
+                    _em_results = []
+
+            if _em_results:
+                st.success(f"Found {len(_em_results)} candidate(s) ≥ {_em_min}",
+                           icon="🎯")
+                for r in _em_results:
+                    _tier = r.get("tier", "QUIET")
+                    _meta = {
+                        "IMMINENT": ("#f85149", "🚨", "Move 1-2d likely"),
+                        "BUILDING": ("#e3b341", "🔥", "3-5d setup"),
+                        "WATCH":    ("#58a6ff", "👀", "Early signals"),
+                        "QUIET":    ("#8b949e", "⚪", "No signal"),
+                    }
+                    _col, _ic, _sub = _meta.get(_tier, ("#8b949e", "⚪", ""))
+                    with st.expander(
+                            f"{_ic} **{r['ticker']}** — {r['score']}/100  ·  "
+                            f"{_tier}  ·  {r['n_signals']} signal(s) firing",
+                            expanded=(_tier in ("IMMINENT", "BUILDING")),
+                    ):
+                        st.markdown(
+                            f"<div style='background:#161b22;border-left:4px solid {_col};"
+                            f"border-radius:6px;padding:10px 14px;margin-bottom:8px'>"
+                            f"<b style='color:{_col}'>{_tier}</b>: {r['outlook']}"
+                            f"</div>", unsafe_allow_html=True,
+                        )
+                        # Per-signal breakdown bars
+                        _sig_names = {
+                            "coiled_spring":   "🌀 Coiled Spring",
+                            "volume_base":     "💼 Volume Base",
+                            "velocity":        "🚀 Velocity",
+                            "mtf_transition":  "🔄 MTF Transition",
+                            "short_covering":  "🔥 Short Covering",
+                            "fresh_catalyst":  "📰 Fresh Catalyst",
+                        }
+                        _max_pts = {"coiled_spring": 18, "volume_base": 18,
+                                    "velocity": 18, "mtf_transition": 15,
+                                    "short_covering": 15, "fresh_catalyst": 16}
+                        for sk, sv in (r.get("signals") or {}).items():
+                            _pts = sv.get("score", 0)
+                            _mx  = _max_pts.get(sk, 18)
+                            _pct = int(_pts / _mx * 100) if _mx else 0
+                            _bc  = ("#3fb950" if _pct >= 60 else
+                                    "#e3b341" if _pct >= 30 else
+                                    "#30363d" if _pct == 0 else "#58a6ff")
+                            st.markdown(
+                                f"<div style='display:flex;gap:8px;align-items:center;margin:2px 0'>"
+                                f"<div style='width:160px;font-size:0.8em;color:#8b949e'>"
+                                f"{_sig_names.get(sk, sk)}</div>"
+                                f"<div style='flex:1;background:#21262d;border-radius:3px;height:8px'>"
+                                f"<div style='width:{_pct}%;background:{_bc};height:8px;border-radius:3px'></div></div>"
+                                f"<div style='width:48px;font-size:0.78em;text-align:right'>{_pts}/{_mx}</div>"
+                                f"</div>"
+                                f"<div style='font-size:0.72em;color:#6e7681;margin-left:168px'>"
+                                f"{sv.get('label', '')}</div>",
+                                unsafe_allow_html=True,
+                            )
+            else:
+                st.info(f"No tickers scored ≥ {_em_min}. Try lower threshold or different universe.",
+                        icon="📭")
+
+    st.divider()
+
     # ── SECTION 3.55 — WHALE INTELLIGENCE (follow the money) ─────────────────
     st.markdown("### 🐋 Whale Intelligence")
     st.caption(

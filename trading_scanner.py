@@ -9105,10 +9105,42 @@ def compute_master_score(ticker, expiry, bias, conn,
             "multiplier": 1.0,
         }
 
-    # ── Final score: base × TV × news × duration × squeeze × memory × whale ─
+    # ── 15. Early Momentum multiplier (pre-explosion detection) ─────────────
+    # The "catch it BEFORE it runs" signal.  Combines BB compression building,
+    # volume base, StockTwits velocity acceleration, MTF transition, short
+    # covering velocity, fresh catalyst.  Bullish-only.
+    early_mult = 1.0
+    early_data = {}
+    if not skip_slow_checks and str(bias).lower() != "bearish":
+        try:
+            from early_momentum import EarlyMomentumScanner
+            _em = EarlyMomentumScanner(conn=conn)
+            early_data = _em.early_momentum_multiplier(ticker) or {}
+            early_mult = float(early_data.get("multiplier", 1.0) or 1.0)
+        except Exception:
+            early_mult = 1.0
+    if early_data and early_data.get("score", 0) > 0:
+        components["early_momentum"] = {
+            "max":         "×",
+            "pts":         f"{early_mult:.2f}",
+            "label":       (f"Early Momentum: {early_data.get('score', 0)}/100 "
+                            f"({early_data.get('tier', '?')}) → {early_mult:.2f}×"),
+            "multiplier":  early_mult,
+            "raw":         early_data,
+        }
+    else:
+        components["early_momentum"] = {
+            "max":   "×",
+            "pts":   "1.00",
+            "label": "Early Momentum unavailable (1.00×)",
+            "multiplier": 1.0,
+        }
+
+    # ── Final: base × all 7 multipliers, clamped 0-100 ──────────────────────
     raw_score = max(0, total)
     score = round(min(100, raw_score * tv_mult * news_mult * duration_mult *
-                       squeeze_mult * memory_mult * whale_mult), 1)
+                       squeeze_mult * memory_mult * whale_mult *
+                       early_mult), 1)
 
     # ── Grade + decision ──────────────────────────────────────────────────────
     if score >= 85:
@@ -9149,6 +9181,8 @@ def compute_master_score(ticker, expiry, bias, conn,
         "memory_multiplier":   memory_mult,
         "whale_data":          whale_data,
         "whale_multiplier":    whale_mult,
+        "early_momentum":      early_data,
+        "early_multiplier":    early_mult,
         "base_score":          round(raw_score, 1),
     }
 

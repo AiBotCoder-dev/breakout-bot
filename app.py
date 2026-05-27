@@ -2084,23 +2084,40 @@ with tab_mgmt:
                     _rep.append((f"Watchlist ({len(OPTIONS_AUTO_WATCHLIST)} tickers)",
                                   True,
                                   f"Always evaluated: {', '.join(OPTIONS_AUTO_WATCHLIST[:6])}…"))
-                    # Gate 6: at least one suggestion fits cash
-                    _affordable = []
-                    _strat_e    = ts.OptionsStrategyEngine()
-                    for _tk in OPTIONS_AUTO_WATCHLIST[:6]:
+                    # Gate 6: check ALL watchlist tickers, not just first 6
+                    _affordable    = []
+                    _too_expensive = []
+                    _yf_failed     = []
+                    _strat_e       = ts.OptionsStrategyEngine()
+                    _cash_now      = _opx_summ.get("available_cash", 0)
+                    for _tk in OPTIONS_AUTO_WATCHLIST:
                         try:
                             _sugs = _strat_e.suggest(_tk, "bullish")
-                            for _s in (_sugs or []):
-                                _mid = float(_s.get("mid", 0) or 0)
-                                if 0 < _mid * 100 <= _opx_summ.get("available_cash", 0):
-                                    _affordable.append((_tk, _s.get("strategy"),
-                                                          _mid * 100))
-                                    break
+                            if not _sugs:
+                                _yf_failed.append(_tk)
+                                continue
+                            _cheapest = min(
+                                (float(s.get("mid", 0) or 0) for s in _sugs
+                                  if float(s.get("mid", 0) or 0) > 0),
+                                default=0
+                            )
+                            if _cheapest <= 0:
+                                _yf_failed.append(_tk)
+                                continue
+                            _cost = _cheapest * 100
+                            if _cost <= _cash_now:
+                                _affordable.append((_tk, _cost))
+                            else:
+                                _too_expensive.append((_tk, _cost))
                         except Exception:
-                            pass
-                    _rep.append(("Affordable watchlist plays exist",
-                                  len(_affordable) > 0,
-                                  f"{len(_affordable)} affordable on first 6 watchlist"))
+                            _yf_failed.append(_tk)
+                    _rep.append((
+                        f"Affordable watchlist plays (full {len(OPTIONS_AUTO_WATCHLIST)})",
+                        len(_affordable) > 0,
+                        f"{len(_affordable)} affordable · "
+                        f"{len(_too_expensive)} too expensive · "
+                        f"{len(_yf_failed)} yfinance unavailable",
+                    ))
 
                     # Render
                     for label, ok, detail in _rep:
@@ -2110,24 +2127,45 @@ with tab_mgmt:
                     # Verdict
                     st.divider()
                     if not _rep[0][1]:
-                        st.error("**Bottleneck:** Options cash < $20.", icon="💰")
+                        st.error(f"**Bottleneck:** Options cash ${_cash_now:.2f} "
+                                  f"is below the ${OPTIONS_MIN_CASH:.0f} minimum.",
+                                  icon="💰")
                     elif not _rep[1][1]:
                         st.warning("**Bottleneck:** VIX is EXTREME, options auto-entry paused.",
                                     icon="⚡")
                     elif not _rep[5][1]:
-                        st.error("**Bottleneck:** No watchlist plays affordable on your cash. "
-                                  "Consider reducing options budget if you want to trade more.",
-                                  icon="❌")
+                        if len(_yf_failed) >= len(OPTIONS_AUTO_WATCHLIST) - 2:
+                            st.error(
+                                "**Bottleneck:** yfinance failed for nearly all watchlist "
+                                "tickers — likely rate-limiting Streamlit Cloud's IP.  "
+                                "This is temporary; Alpaca live data isn't affected.  "
+                                "The next GitHub Actions monitor cycle should work.",
+                                icon="🌐",
+                            )
+                        else:
+                            st.error(
+                                f"**Bottleneck:** No watchlist plays affordable on ${_cash_now:.2f}.  "
+                                "All 31 tickers in the watchlist need ≥$6 to enter. "
+                                "Either reset the options account (Paper Trades tab) or wait for "
+                                "existing positions to close.",
+                                icon="❌",
+                            )
                     elif not _rep[2][1] and not _rep[5][1]:
                         st.warning("**Bottleneck:** No candidates anywhere.", icon="📭")
                     else:
                         st.success(
-                            "✅ All gates show GREEN.  Auto-entry should trigger on next "
-                            "monitor cycle (within 5 min during market hours).  "
-                            "If you're seeing this DURING market hours and the bot still "
-                            "isn't trading, check GitHub Actions Position Monitor runs.",
+                            f"✅ All gates show GREEN.  **{len(_affordable)} watchlist tickers** "
+                            f"are affordable on your ${_cash_now:.2f} cash.  Auto-entry should "
+                            f"trigger on next monitor cycle (within 5 min during market hours).",
                             icon="✅",
                         )
+                        # Show specific affordable tickers
+                        if _affordable:
+                            _afford_str = ", ".join(
+                                f"{tk} (${c:.0f})" for tk, c in
+                                sorted(_affordable, key=lambda x: x[1])[:12]
+                            )
+                            st.caption(f"**Cheapest affordable:** {_afford_str}")
 
         with _od_c2:
             if st.button("🧪 Dry-Run Auto-Entry Now",

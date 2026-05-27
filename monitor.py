@@ -68,14 +68,50 @@ STOCK_CHASE_LIMIT_PCT    = 3.0   # skip stock entry if price > scan entry by thi
 # whether they're in the breakout scan. They go through the same Master
 # Score gate, so weak setups still get skipped — but the bot won't go idle
 # just because the scan happens to be sparse.
+#
+# IMPORTANT: List is ORDERED by typical contract cost (cheap → expensive).
+# The diagnostic checks affordability in this order, and auto_enter_options
+# also iterates in this order — so if cash is tight, cheap tickers get
+# priority and don't get crowded out by mega-caps that won't fit anyway.
 OPTIONS_AUTO_WATCHLIST = [
-    "SPY", "QQQ", "IWM",                       # major indices (cheap, liquid)
-    "AAPL", "NVDA", "TSLA", "AMD", "MSFT",     # top tech
-    "META", "GOOG", "AMZN",                     # mega-cap tech
-    "PLTR", "AMC", "GME",                       # high-vol small caps
-    "F", "BAC", "T",                            # cheap-premium liquid stocks
+    # ── Cheap-premium tier (≤ $35 / contract typical) ────────────────────
+    "SNAP",    # ~$6/contract
+    "AMC",     # ~$10/contract
+    "SPY",     # ~$12/contract (Weekly OTM — major index)
+    "GME",     # ~$16/contract
+    "SOFI",    # ~$20/contract
+    "RIVN",    # ~$21/contract
+    "T",       # ~$21/contract
+    "AAL",     # ~$26/contract
+    "F",       # ~$29/contract
+    "LCID",    # ~$30/contract
+    "NIO",     # ~$31/contract
+    "MARA",    # ~$34/contract
+    "BAC",     # ~$35/contract
+    # ── Medium-premium tier ($35-100) ────────────────────────────────────
+    "PINS",    # ~$37/contract
+    "DKNG",    # ~$44/contract
+    "CCL",     # ~$44/contract
+    "UBER",    # ~$70/contract
+    "IWM",     # ~$70/contract
+    "RIOT",    # ~$80/contract
+    # ── Mid-cap tier ($100-200) ──────────────────────────────────────────
+    "QQQ",     # ~$108/contract
+    "AAPL",    # ~$114/contract
+    "RBLX",    # ~$120/contract
+    "AMZN",    # ~$169/contract
+    "HOOD",    # ~$172/contract
+    "NVDA",    # ~$182/contract
+    # ── Premium tier ($200+) ─────────────────────────────────────────────
+    "PLTR",    # ~$227/contract
+    "MSFT",    # ~$238/contract
+    "INTC",    # ~$335/contract
+    "META",    # ~$420/contract
+    "GOOG",    # ~$420/contract
+    "TSLA",    # ~$500/contract  (often on edge of affordability)
 ]
-OPTIONS_MIN_CASH = 20.0   # minimum free cash to consider an options entry
+OPTIONS_MIN_CASH = 5.0   # minimum free cash to consider an options entry
+                          # (lowered from $20 — SNAP/AMC contracts are $6-$10)
 
 # ── PostgreSQL adapter (identical copy from app.py) ───────────────────────────
 try:

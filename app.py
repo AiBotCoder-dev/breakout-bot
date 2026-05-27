@@ -2021,6 +2021,166 @@ with tab_mgmt:
 
     st.divider()
 
+    # ── SECTION 3.7 — OPTIONS ENGINE STATUS + DIAGNOSTIC ─────────────────────
+    st.markdown("### 💰 Options Engine Status")
+    try:
+        _opx_ops    = ts.OptionsPaperEngine(conn)
+        _opx_summ   = _opx_ops.get_summary()
+        _opx_open   = _opx_ops.get_positions("OPEN")
+        _opx_closed = _opx_ops.get_positions("CLOSED")
+
+        _ox1, _ox2, _ox3, _ox4 = st.columns(4)
+        _ox1.metric("Options Cash", f"${_opx_summ.get('available_cash', 0):,.2f}")
+        _ox2.metric("Open Positions", _opx_summ.get("n_open", 0))
+        _ox3.metric("Closed", len(_opx_closed))
+        _ox4.metric("Total Trades", _opx_summ.get("trades_made", 0))
+
+        if _opx_summ.get("trades_made", 0) == 0:
+            st.warning(
+                "⚠️ Options engine hasn't traded yet. Click **🩺 Diagnose** "
+                "below to see exactly which gate is blocking it.",
+                icon="⚠️",
+            )
+
+        _od_c1, _od_c2 = st.columns(2)
+        with _od_c1:
+            if st.button("🩺 Diagnose Why No Options Trades",
+                          key="mgmt_diag_options_btn",
+                          type="primary",
+                          use_container_width=True):
+                with st.spinner("Walking through every gate the auto-entry uses…"):
+                    _rep = []
+                    # Gate 1: cash
+                    _ok = _opx_summ.get("available_cash", 0) >= 20
+                    _rep.append(("Cash ≥ $20", _ok,
+                                  f"${_opx_summ.get('available_cash', 0):.2f}"))
+                    # Gate 2: VIX
+                    try:
+                        _vix = ts.get_vix_level()
+                        _vr  = (_vix or {}).get("regime", "?")
+                        _rep.append(("VIX not EXTREME", _vr != "EXTREME",
+                                      f"VIX {(_vix or {}).get('vix','?')} ({_vr})"))
+                    except Exception as _e:
+                        _rep.append(("VIX check", True, f"err: {_e}"))
+                    # Gate 3: scan plays
+                    try:
+                        _plays = ts.get_scan_options_plays(conn, top_n=10)
+                        _rep.append(("Scan plays exist (≥1)", len(_plays) > 0,
+                                      f"{len(_plays)} from latest scan"))
+                    except Exception:
+                        _plays = []
+                        _rep.append(("Scan plays exist", False, "load failed"))
+                    # Gate 4: pre-filter on scan
+                    from monitor import OPTIONS_MIN_SCORE, OPTIONS_MIN_PROB
+                    _passing = [p for p in _plays
+                                if float(p.get("explosive_score", 0)) >= OPTIONS_MIN_SCORE
+                                and float(p.get("breakout_prob",   0)) >= OPTIONS_MIN_PROB]
+                    _rep.append((f"Scan plays pass pre-filter "
+                                  f"(score≥{OPTIONS_MIN_SCORE}, prob≥{OPTIONS_MIN_PROB}%)",
+                                  len(_passing) > 0,
+                                  f"{len(_passing)} of {len(_plays)}"))
+                    # Gate 5: watchlist available
+                    from monitor import OPTIONS_AUTO_WATCHLIST
+                    _rep.append((f"Watchlist ({len(OPTIONS_AUTO_WATCHLIST)} tickers)",
+                                  True,
+                                  f"Always evaluated: {', '.join(OPTIONS_AUTO_WATCHLIST[:6])}…"))
+                    # Gate 6: at least one suggestion fits cash
+                    _affordable = []
+                    _strat_e    = ts.OptionsStrategyEngine()
+                    for _tk in OPTIONS_AUTO_WATCHLIST[:6]:
+                        try:
+                            _sugs = _strat_e.suggest(_tk, "bullish")
+                            for _s in (_sugs or []):
+                                _mid = float(_s.get("mid", 0) or 0)
+                                if 0 < _mid * 100 <= _opx_summ.get("available_cash", 0):
+                                    _affordable.append((_tk, _s.get("strategy"),
+                                                          _mid * 100))
+                                    break
+                        except Exception:
+                            pass
+                    _rep.append(("Affordable watchlist plays exist",
+                                  len(_affordable) > 0,
+                                  f"{len(_affordable)} affordable on first 6 watchlist"))
+
+                    # Render
+                    for label, ok, detail in _rep:
+                        _icon = "✅" if ok else "🛑"
+                        st.markdown(f"{_icon}  **{label}** — {detail}")
+
+                    # Verdict
+                    st.divider()
+                    if not _rep[0][1]:
+                        st.error("**Bottleneck:** Options cash < $20.", icon="💰")
+                    elif not _rep[1][1]:
+                        st.warning("**Bottleneck:** VIX is EXTREME, options auto-entry paused.",
+                                    icon="⚡")
+                    elif not _rep[5][1]:
+                        st.error("**Bottleneck:** No watchlist plays affordable on your cash. "
+                                  "Consider reducing options budget if you want to trade more.",
+                                  icon="❌")
+                    elif not _rep[2][1] and not _rep[5][1]:
+                        st.warning("**Bottleneck:** No candidates anywhere.", icon="📭")
+                    else:
+                        st.success(
+                            "✅ All gates show GREEN.  Auto-entry should trigger on next "
+                            "monitor cycle (within 5 min during market hours).  "
+                            "If you're seeing this DURING market hours and the bot still "
+                            "isn't trading, check GitHub Actions Position Monitor runs.",
+                            icon="✅",
+                        )
+
+        with _od_c2:
+            if st.button("🧪 Dry-Run Auto-Entry Now",
+                          key="mgmt_dryrun_opts",
+                          use_container_width=True,
+                          help="Simulate what auto_enter_options would do RIGHT NOW"):
+                with st.spinner("Running auto_enter_options() in test mode…"):
+                    import io as _io
+                    import contextlib as _cl
+                    _buf = _io.StringIO()
+                    try:
+                        import monitor as _mo
+                        from trading_scanner import LearningEngine as _LE
+                        _le_local = _LE(conn)
+                        _vn = ts.get_vix_level()
+                        _ses = ts.MarketClock.get_session()
+                        with _cl.redirect_stdout(_buf):
+                            _mo.auto_enter_options(
+                                conn, _vn, _ses,
+                                _ses.get("quality", "NORMAL"),
+                                risk_mult=1.0,
+                                market_regime=None,
+                                learning_adjustments=_le_local.get_active_adjustments(),
+                            )
+                        st.code(_buf.getvalue() or "(no output)", language="text")
+                    except Exception as _dre:
+                        st.error(f"Dry-run failed: {_dre}")
+
+        # Open options positions table
+        if _opx_open:
+            st.markdown("**Open Options Positions:**")
+            _opt_rows = []
+            for p in _opx_open[:10]:
+                _opt_rows.append({
+                    "Ticker":   p.get("ticker"),
+                    "Strategy": p.get("strategy", "?"),
+                    "Strike":   f"${float(p.get('strike', 0) or 0):.0f}",
+                    "Type":     str(p.get("option_type", "?")).upper(),
+                    "Expiry":   str(p.get("expiry", "")),
+                    "Entry":    f"${float(p.get('entry_price', 0) or 0):.2f}",
+                    "Current":  f"${float(p.get('current_price', 0) or 0):.2f}" if p.get('current_price') else "—",
+                    "Unr P&L":  (f"${float(p.get('unrealized_pnl', 0) or 0):+.2f} "
+                                   f"({float(p.get('unrealized_pct', 0) or 0):+.1f}%)"
+                                   if p.get('unrealized_pnl') is not None else "—"),
+                })
+            st.dataframe(pd.DataFrame(_opt_rows), hide_index=True,
+                          use_container_width=True)
+
+    except Exception as _oxe:
+        st.warning(f"Options engine unavailable: {_oxe}")
+
+    st.divider()
+
     # ── SECTION 4 — DIAGNOSTICS & MANUAL TRIGGERS ────────────────────────────
     st.markdown("### 🩺 Engine Diagnostics & Manual Triggers")
     _diag_cols = st.columns(4)

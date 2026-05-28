@@ -1586,6 +1586,102 @@ with tab_mgmt:
 
     st.divider()
 
+    # ── SECTION 3.40 — UNIFIED SCANNER (one brain, every universe) ───────────
+    st.markdown("### 🎯 Unified Scanner")
+    st.caption(
+        "ONE orchestrator that feeds every universe into the same Master-Score brain "
+        "(it already fuses breakout · entry-quality · Wyckoff · MTF · news · squeeze · "
+        "whale · early-momentum). Picks up catalyst plays — earnings & news gaps like "
+        "SNOW, RCAT, UMAC — that the technical breakout scan never sees."
+    )
+
+    _us_modes = {
+        "⚡ Smart (movers + watchlist + breakout)": "smart",
+        "🚀 Top Movers only (today's real gainers)": "movers",
+        "📈 Latest breakout scan": "breakout",
+        "🌍 Universal (ALL exchanges — slow)": "universal",
+    }
+    _usc1, _usc2, _usc3 = st.columns([3, 1, 1])
+    with _usc1:
+        _us_mode_lbl = st.selectbox("Universe", list(_us_modes.keys()),
+                                    key="mgmt_unified_mode")
+    with _usc2:
+        _us_min = st.number_input("Min score", 0, 100, 55, key="mgmt_unified_min")
+    with _usc3:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        _us_run = st.button("🎯 Run Scan", key="mgmt_unified_btn",
+                            type="primary", use_container_width=True)
+
+    _us_mode = _us_modes[_us_mode_lbl]
+    if _us_mode == "universal":
+        st.warning(
+            "Universal mode scans every US + Canadian + OTC ticker. It can take "
+            "several minutes and is rate-limited by yfinance — best run occasionally, "
+            "not every refresh.", icon="⏳",
+        )
+
+    if _us_run:
+        try:
+            from unified_scanner import run_unified_scan
+            try:
+                from monitor import OPTIONS_AUTO_WATCHLIST as _US_WL
+            except Exception:
+                _US_WL = []
+            _prog = st.progress(0.0, text="Building universe…")
+            def _us_cb(i, total, tk):
+                _prog.progress(min(i / max(total, 1), 1.0),
+                               text=f"Scoring {tk}  ({i}/{total})")
+            with st.spinner(f"Running {_us_mode} scan…"):
+                _us_res = run_unified_scan(
+                    conn, mode=_us_mode, min_score=int(_us_min),
+                    market_regime=None, watchlist=_US_WL, progress=_us_cb,
+                )
+            _prog.empty()
+            st.session_state["_unified_last"] = _us_res
+        except Exception as _use:
+            st.error(f"Unified scan error: {_use}")
+
+    # Show latest persisted snapshot (survives reruns)
+    _us_show = st.session_state.get("_unified_last")
+    if _us_show is None:
+        try:
+            from unified_scanner import get_latest_unified
+            _us_show = get_latest_unified(conn, limit=60)
+        except Exception:
+            _us_show = []
+
+    if _us_show:
+        _n_buy = sum(1 for r in _us_show if r.get("decision") == "BUY")
+        st.success(f"{len(_us_show)} candidate(s) ≥ score · {_n_buy} BUY", icon="🎯")
+        for r in _us_show[:30]:
+            _dec = r.get("decision", "SKIP")
+            _col = {"BUY": "#3fb950", "WATCH": "#e3b341"}.get(_dec, "#8b949e")
+            _bias = r.get("bias", "bullish")
+            _bias_ic = "🟢" if _bias == "bullish" else "🔴"
+            _pct = r.get("pct_change")
+            _pct_txt = f"{_pct:+.1f}% today" if _pct not in (None, "") else ""
+            _srcs = r.get("sources") or []
+            _src_txt = " · ".join(s for s in _srcs if s)
+            with st.expander(
+                    f"{_bias_ic} **{r.get('ticker','?')}** — {r.get('score',0)}/100  "
+                    f"({r.get('grade','?')})  ·  {_dec}  {('· ' + _pct_txt) if _pct_txt else ''}",
+                    expanded=False,
+            ):
+                st.markdown(
+                    f"<div style='background:#161b22;border-left:4px solid {_col};"
+                    f"border-radius:6px;padding:8px 12px;margin-bottom:6px'>"
+                    f"<b style='color:{_col}'>{_dec}</b> · bias <b>{_bias}</b> · "
+                    f"size ×{r.get('size_multiplier',0):.2f} · sources: "
+                    f"<code>{_src_txt or 'n/a'}</code><br>"
+                    f"<span style='color:#8b949e;font-size:0.85em'>"
+                    f"{r.get('summary','')}</span></div>",
+                    unsafe_allow_html=True,
+                )
+    else:
+        st.info("No unified scan run yet. Pick a universe and hit **Run Scan**.", icon="📭")
+
+    st.divider()
+
     # ── SECTION 3.45 — EARLY MOMENTUM SCANNER (pre-explosion detector) ───────
     st.markdown("### 🔮 Pre-Explosion Scanner")
     st.caption(

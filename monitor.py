@@ -62,6 +62,9 @@ OPTIONS_MIN_SCORE        = 55    # explosive_score threshold for options auto-en
 OPTIONS_MIN_PROB         = 55    # breakout_prob (%) threshold for options auto-entry
 AUTO_MAX_ENTRIES_PER_RUN = 2     # max NEW entries per monitor run (each category)
 STOCK_CHASE_LIMIT_PCT    = 3.0   # skip stock entry if price > scan entry by this %
+UNIFIED_MOVER_CHASE_PCT  = 20.0  # skip a unified MOVER candidate already up >this% today
+                                 # (avoids buying parabolic tops like ASTC +147%; we want
+                                 #  to catch the early +8-20% movers, not chase blow-offs)
 
 # Always-on options watchlist — tickers with reliable weekly options + high
 # liquidity. The options auto-entry checks these EVERY cycle regardless of
@@ -414,6 +417,45 @@ def auto_enter_stocks(conn, paper, session, quality,
 
     held_tickers = {p["ticker"] for p in paper.open_positions}
     new_entries  = 0
+
+    # ── Merge in Unified Scanner movers/catalyst candidates ────────────────────
+    # Stocks that ALREADY exploded on a fresh catalyst (earnings, drone news, etc.)
+    # never appear in the technical breakout `calls` table. The unified scan
+    # (movers mode) scores them with the SAME Master-Score brain and persists the
+    # BUY names — pull them in so they're eligible for auto-entry too. They still
+    # get re-validated by the Master-Score gate + critic below.
+    try:
+        from unified_scanner import get_latest_unified
+        existing = {str(c.get("ticker") or "").upper() for c in candidates}
+        merged = 0
+        for u in get_latest_unified(conn, decisions=("BUY",), limit=25):
+            tk = str(u.get("ticker") or "").upper()
+            if not tk or tk in existing or tk in held_tickers:
+                continue
+            # Chase guard for movers: don't buy a name that already ran parabolic
+            # today (no scan-entry exists for movers, so the normal drift guard
+            # can't protect us — gate on intraday % move instead).
+            _pct = u.get("pct_change")
+            if _pct is not None and abs(float(_pct)) > UNIFIED_MOVER_CHASE_PCT:
+                print(f"    {tk:8s} — unified mover already {_pct:+.0f}% today "
+                      f"(> {UNIFIED_MOVER_CHASE_PCT:.0f}% chase cap), skip")
+                continue
+            candidates.append({
+                "ticker":           tk,
+                "explosive_score":  u.get("score") or 0,
+                "breakout_prob":    u.get("score") or 0,
+                "pattern_detected": "unified:" + ",".join(u.get("sources") or []),
+                "entry_price":      None,
+                "target_price":     None,
+                "stop_loss":        None,
+            })
+            existing.add(tk)
+            merged += 1
+        if merged:
+            print(f"  + Merged {merged} Unified-Scanner BUY candidate(s) "
+                  f"→ {len(candidates)} total")
+    except Exception as _ue:
+        print(f"  [unified] candidate merge skipped: {_ue}")
 
     for r in candidates:
         if new_entries >= AUTO_MAX_ENTRIES_PER_RUN:
@@ -1333,6 +1375,28 @@ def main():
     combined_mult = portfolio_size_mult * regime_size_mult
     print(f"  Combined sizing multiplier: {combined_mult:.2f}× "
           f"(portfolio {portfolio_size_mult:.2f} × regime {regime_size_mult:.2f})")
+
+    # ── Unified Scanner — feed catalyst movers into the Master-Score brain ─────
+    # Runs the day's REAL top movers (Finviz signal + yfinance) through the same
+    # compute_master_score() used everywhere, persisting BUY/WATCH names so the
+    # stock auto-entry below can pick up catalyst plays (earnings/news gaps) that
+    # the technical breakout scan never sees. Bounded + cloud-safe (movers mode).
+    print(f"\n  {'─'*50}")
+    print(f"  UNIFIED SCANNER — Catalyst movers → Master Score")
+    try:
+        from unified_scanner import run_unified_scan
+        _uni = run_unified_scan(
+            conn, mode="movers", min_score=55,
+            market_regime=market_regime, watchlist=OPTIONS_AUTO_WATCHLIST,
+        )
+        _buys = [u for u in _uni if u.get("decision") == "BUY"]
+        print(f"  Scored {len(_uni)} movers ≥55 | {len(_buys)} BUY")
+        for u in _uni[:8]:
+            print(f"    {u['ticker']:6s} {u['score']:5.1f} {u['grade']:<2} "
+                  f"{u['decision']:<5} {u.get('pct_change') or 0:+6.1f}% "
+                  f"[{','.join(u['sources'])}]")
+    except Exception as exc:
+        print(f"  WARN unified scan failed: {exc}")
 
     # ── Auto-entry: stocks ────────────────────────────────────────────────────
     try:

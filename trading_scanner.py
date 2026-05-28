@@ -4697,7 +4697,8 @@ class PaperTradingEngine:
         """, (ticker, "SELL", today, sell["gross"],
               sell["fee"], sell["net"], self._fees_paid))
         self._save_state()
-        return {"success": True, "exit_price": exit_price,
+        return {"success": True, "ticker": ticker, "exit_reason": reason,
+                "exit_price": exit_price,
                 "sell_fee": round(sell["fee"], 2),
                 "gross_pnl": round(gross_pnl, 2),
                 "net_pnl": round(net_pnl, 2), "net_pnl_pct": round(net_pct, 1)}
@@ -4725,12 +4726,18 @@ class PaperTradingEngine:
                 atr_v  = float(pos.get("atr_value")    or (entry * 0.02))
 
                 # ── 1-min data (fallback chain: 1m → 5m → 1d) ─────────────
+                intraday_ok = True
                 raw = yf.download(ticker, period="2d", interval="1m",
                                   progress=False, auto_adjust=True)
                 if raw is None or raw.empty:
                     raw = yf.download(ticker, period="5d", interval="5m",
                                       progress=False, auto_adjust=True)
                 if raw is None or raw.empty:
+                    # No intraday available (common for thin / foreign .TO tickers).
+                    # Daily candles can be STALE, so don't trust them for the precise
+                    # per-candle stop/target scan — fall back to the live-quote
+                    # backstop below instead.
+                    intraday_ok = False
                     raw = yf.download(ticker, period="5d", interval="1d",
                                       progress=False, auto_adjust=True)
                 if raw is None or raw.empty:
@@ -4762,6 +4769,21 @@ class PaperTradingEngine:
                 reason     = None
                 exit_price = None
                 last_close = float(raw["Close"].dropna().iloc[-1])
+
+                # ── Authoritative live quote (fast_info) ───────────────────
+                # yf.download daily OHLC can be STALE or WRONG for thin / foreign
+                # (.TO) tickers — it may report a price well ABOVE a stop that has
+                # actually been blown through (e.g. BITF.TO download says $7 while
+                # the real quote is $2.76). fast_info is the same source the
+                # dashboard uses, so cross-check it: a real breach can't hide.
+                live_q = None
+                try:
+                    _fi = yf.Ticker(ticker).fast_info
+                    live_q = float(_fi["last_price"])
+                    if live_q and live_q > 0:
+                        last_close = live_q   # trust the live quote over stale daily
+                except Exception:
+                    live_q = None
 
                 # ── T1 / trailing stop updates (before exit check) ─────────
                 t1_hit     = bool(pos.get("t1_hit"))
@@ -4802,20 +4824,26 @@ class PaperTradingEngine:
                         stop = trail
 
                 # ── Scan candles for exact stop / target hits ──────────────
-                for _, row in raw.iterrows():
-                    low   = float(row.get("Low",   row.get("Close", 0)))
-                    high  = float(row.get("High",  row.get("Close", 0)))
+                # Only trust this precise scan when we have INTRADAY candles —
+                # daily candles for thin / foreign tickers can be stale and would
+                # false-trigger in either direction.
+                if intraday_ok:
+                    for _, row in raw.iterrows():
+                        low   = float(row.get("Low",   row.get("Close", 0)))
+                        high  = float(row.get("High",  row.get("Close", 0)))
 
-                    if target and high >= target:
-                        reason     = "TARGET_HIT"
-                        exit_price = target
-                        break
-                    if stop and low <= stop:
-                        reason     = "STOP_HIT"
-                        exit_price = stop
-                        break
+                        if target and high >= target:
+                            reason     = "TARGET_HIT"
+                            exit_price = target
+                            break
+                        if stop and low <= stop:
+                            reason     = "STOP_HIT"
+                            exit_price = stop
+                            break
 
-                # Gap / EOD backstop
+                # Live-quote / gap / EOD backstop — uses the authoritative live
+                # quote (last_close was set to fast_info above when available), so
+                # a stale daily download can't mask a real stop breach.
                 if not reason:
                     if stop   and last_close <= stop:
                         reason = "STOP_HIT";   exit_price = last_close

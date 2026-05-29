@@ -211,12 +211,19 @@ def _download(ticker: str) -> pd.DataFrame | None:
 
 
 def run_mcpt(tickers: list, n_perm: int = 200, hold: int = 20, days: int = 120,
-             min_prob: int = 50, seed: int = 42, progress=None) -> dict:
+             min_prob: int = 50, seed: int = 42, progress=None, trades_fn=None) -> dict:
     """
     Run the permutation test pooled across `tickers`.
     Returns a dict with the real metrics, null distributions, and p-values.
+
+    trades_fn: optional callable(df)->list[float] of realized trade returns. If
+    omitted, uses the breakout pattern strategy. Pass momentum_strategy's
+    trend_following_trades to validate the new momentum pivot.
     """
     scanner = BreakoutScanner()
+    if trades_fn is None:
+        def trades_fn(df):
+            return strategy_trades(scanner, df, hold, days, min_prob)
 
     # ── load real data once ──────────────────────────────────────────────────
     data = {}
@@ -231,7 +238,7 @@ def run_mcpt(tickers: list, n_perm: int = 200, hold: int = 20, days: int = 120,
     # ── real strategy metric (pooled) ─────────────────────────────────────────
     real_trades = []
     for t, df in data.items():
-        real_trades += strategy_trades(scanner, df, hold, days, min_prob)
+        real_trades += trades_fn(df)
     real = metric_from_trades(real_trades)
 
     # ── null distribution ──────────────────────────────────────────────────────
@@ -240,7 +247,7 @@ def run_mcpt(tickers: list, n_perm: int = 200, hold: int = 20, days: int = 120,
         ptrades = []
         for ti, (t, df) in enumerate(data.items()):
             perm_df = get_permutation(df, start_index=0, seed=seed + p * 1000 + ti)
-            ptrades += strategy_trades(scanner, perm_df, hold, days, min_prob)
+            ptrades += trades_fn(perm_df)
         m = metric_from_trades(ptrades)
         null_pf.append(m["profit_factor"])
         null_mean.append(m["mean_return"])

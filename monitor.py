@@ -691,6 +691,138 @@ def auto_enter_stocks(conn, paper, session, quality,
         print(f"  {new_entries} new stock position(s) opened.")
 
 
+# ── Liquidity guard ───────────────────────────────────────────────────────────
+def _is_liquid_us(ticker: str) -> bool:
+    """
+    Reject the illiquid names that bled the account: any foreign/exchange suffix
+    (.TO/.V/.NE/.CN/.AX...) is a non-US listing with thin volume + unreliable data.
+    US tickers have no dot (BRK.B etc. are not in our momentum universe).
+    """
+    t = str(ticker or "").upper()
+    return bool(t) and ("." not in t)
+
+
+# ── Auto-entry: MOMENTUM (the validated strategy) ─────────────────────────────
+def auto_enter_momentum(conn, paper, session, quality,
+                        risk_mult=1.0, market_regime=None,
+                        learning_adjustments=None):
+    """
+    PRIMARY stock entry path. Buys the strongest-momentum LIQUID names that are in
+    a confirmed uptrend (price > 50- & 200-SMA). This is the only stock strategy
+    we MCPT-validated with a real edge (cross-sectional momentum, p=0.004, beats
+    pure beta by ~93%). The old chart-pattern path is retired (no edge: p≈0.23-0.81).
+    """
+    print(f"\n  {'─'*50}")
+    print(f"  AUTO-ENTRY — Momentum (liquid trend leaders)")
+
+    summary    = paper.get_summary()
+    n_open     = len(paper.open_positions)
+    cash_avail = summary.get("available_cash", 0)
+    max_pos    = summary.get("max_positions", 10)
+    slots      = max_pos - n_open
+    if slots <= 0:
+        print(f"  Portfolio full ({n_open}/{max_pos}) — no new momentum entries.")
+        return
+    if cash_avail < 100:
+        print(f"  Cash too low (${cash_avail:.2f}) — skipping momentum entry.")
+        return
+
+    # In a confirmed BEAR regime, momentum crashes — stand down on new longs.
+    if market_regime and market_regime.get("regime") == "BEAR":
+        print("  BEAR regime — momentum stands down (no new longs).")
+        return
+
+    try:
+        from momentum_strategy import MomentumStrategy
+        ranked = MomentumStrategy(conn).rank(top_n=12, min_mom_6m=0.05)
+    except Exception as exc:
+        print(f"  ERROR ranking momentum universe: {exc}")
+        return
+    print(f"  {len(ranked)} liquid uptrend leaders ranked.")
+
+    held_tickers = {p["ticker"] for p in paper.open_positions}
+    held_sectors = {}
+    for p in paper.open_positions:
+        s = str(p.get("sector", "") or "Unknown")
+        held_sectors[s] = held_sectors.get(s, 0) + 1
+
+    new_entries = 0
+    for r in ranked:
+        if new_entries >= AUTO_MAX_ENTRIES_PER_RUN:
+            print(f"  Reached max new entries ({AUTO_MAX_ENTRIES_PER_RUN}).")
+            break
+        ticker = r["ticker"]
+        if ticker in held_tickers or not _is_liquid_us(ticker):
+            continue
+
+        live = _get_live_price(ticker) or r["entry"]
+        if not live:
+            continue
+
+        # News veto — skip on major fresh negative news.
+        try:
+            from news_agent import NewsAgent as _NA
+            _ni = _NA(conn, ai_analyst=None).get_news_impact(ticker, hours=24)
+            if _ni.get("should_skip"):
+                print(f"    {ticker:8s} — NEWS VETO, skip")
+                continue
+        except Exception:
+            pass
+
+        # Sector concentration cap (avoid 5 semis at once).
+        sector = ""
+        try:
+            import yfinance as _yf
+            sector = str((_yf.Ticker(ticker).info or {}).get("sector", "") or "")
+        except Exception:
+            pass
+        sect_key = sector or "Unknown"
+        if held_sectors.get(sect_key, 0) >= 4:
+            print(f"    {ticker:8s} — sector '{sect_key}' already at cap, skip")
+            continue
+
+        signal = {
+            "price":         live,
+            "stop_price":    r["stop"],
+            "tgt_price":     r["target"],
+            "pattern":       "Momentum",
+            "explosive_score": round(r["score"] * 100, 1),
+            "probability":   0,
+            "sector":        sector,
+            "master_score":  round(min(100, 50 + r["mom_6m"] * 100), 1),
+            "market_regime": (market_regime or {}).get("regime", "") if market_regime else "",
+        }
+        result = paper.open_position(ticker, signal)
+        if result.get("success"):
+            new_entries += 1
+            held_tickers.add(ticker)
+            held_sectors[sect_key] = held_sectors.get(sect_key, 0) + 1
+            shares = result.get("shares", 0)
+            gross  = result.get("gross", 0)
+            print(f"    ✅ AUTO-BUY {ticker:8s}  6m={r['mom_6m']*100:+.0f}% "
+                  f"3m={r['mom_3m']*100:+.0f}% RSI={r['rsi']:.0f}  "
+                  f"px=${live:.2f} stop=${r['stop']:.2f}  shares={shares:.2f} ${gross:.0f}")
+            summ_now = paper.get_summary()
+            send_telegram(
+                f"🚀 <b>AUTO-BUY (Momentum): {ticker}</b>\n"
+                f"6-mo momentum : {r['mom_6m']*100:+.0f}%   3-mo: {r['mom_3m']*100:+.0f}%\n"
+                f"RSI           : {r['rsi']:.0f}{'  ⚠️extended' if r['extended'] else ''}\n"
+                f"Entry  : ${live:.2f}\n"
+                f"Stop   : ${r['stop']:.2f} (trend / 2×ATR)\n"
+                f"Sector : {sector or '—'}\n"
+                f"Shares : {shares:.2f}  |  Cost: ${gross:.0f}\n"
+                f"Cash   : ${summ_now.get('available_cash',0):,.2f}\n"
+                f"Session: {quality}"
+            )
+        else:
+            print(f"    ✗ {ticker:8s} — {result.get('reason','failed')}")
+
+    if new_entries == 0:
+        print("  No new momentum positions opened this run.")
+    else:
+        print(f"  {new_entries} new momentum position(s) opened.")
+
+
 # ── Auto-entry: options ───────────────────────────────────────────────────────
 
 def auto_enter_options(conn, vix_data, session, quality,
@@ -1130,6 +1262,33 @@ def main():
         else:
             print(f"\n  All positions within bounds — no exits triggered.")
 
+        # ── Trend-break exit for MOMENTUM positions ───────────────────────────
+        # A momentum trade is over when the trend breaks: close below the 50-day
+        # SMA. This is the natural exit for the validated strategy (the fixed ATR
+        # stop is just a disaster backstop). Only applies to liquid US names.
+        try:
+            from momentum_strategy import MomentumStrategy as _MS
+            _ms = _MS(conn)
+            for p in list(paper.open_positions):
+                tk = p["ticker"]
+                if str(p.get("pattern", "")) != "Momentum" or not _is_liquid_us(tk):
+                    continue
+                chk = _ms.should_exit(tk)
+                if chk and chk.get("exit"):
+                    px = chk.get("price") or _get_live_price(tk)
+                    if px:
+                        res = paper.close_position(tk, px, "TREND_BREAK_50SMA")
+                        if res.get("success"):
+                            print(f"    📉 TREND-BREAK EXIT {tk:8s} @ ${px:.2f} "
+                                  f"(below 50SMA ${chk.get('sma50',0):.2f})  "
+                                  f"net ${res.get('net_pnl',0):+.2f}")
+                            send_telegram(
+                                f"📉 <b>{tk}</b> closed — TREND BREAK\n"
+                                f"Below 50-SMA (${chk.get('sma50',0):.2f})\n"
+                                f"Exit ${px:.2f}  |  Net ${res.get('net_pnl',0):+.2f}")
+        except Exception as _te:
+            print(f"  WARN trend-break exit check failed: {_te}")
+
         # ── Trailing stop update notification ─────────────────────────────────
         # Re-read positions after any stop updates to show new stop levels
         updated = paper.open_positions
@@ -1398,12 +1557,26 @@ def main():
     except Exception as exc:
         print(f"  WARN unified scan failed: {exc}")
 
-    # ── Auto-entry: stocks ────────────────────────────────────────────────────
+    # ── Auto-entry: stocks (MOMENTUM is now primary — the validated strategy) ──
+    # The old chart-pattern path (auto_enter_stocks) is RETIRED: MCPT showed it has
+    # no edge (p≈0.23 small caps / 0.81 large caps) and it was filling illiquid
+    # micro-caps. Cross-sectional momentum on liquid names is validated (p=0.004,
+    # beats pure beta by ~93%). Set ENABLE_LEGACY_PATTERN_ENTRY=1 to re-enable.
     try:
+        auto_enter_momentum(conn, paper, session, quality,
+                            risk_mult=combined_mult, market_regime=market_regime,
+                            learning_adjustments=learning_adjustments)
+    except Exception as exc:
+        print(f"\n  ERROR in auto_enter_momentum: {exc}")
+        traceback.print_exc()
+        send_telegram(f"⚠️ <b>Auto-Entry Momentum Error</b>\n{str(exc)[:300]}")
+
+    if os.environ.get("ENABLE_LEGACY_PATTERN_ENTRY") == "1":
+      try:
         auto_enter_stocks(conn, paper, session, quality,
                           risk_mult=combined_mult, market_regime=market_regime,
                           learning_adjustments=learning_adjustments)
-    except Exception as exc:
+      except Exception as exc:
         print(f"\n  ERROR in auto_enter_stocks: {exc}")
         traceback.print_exc()
         send_telegram(f"⚠️ <b>Auto-Entry Stock Error</b>\n{str(exc)[:300]}")

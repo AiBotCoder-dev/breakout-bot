@@ -1586,6 +1586,60 @@ with tab_mgmt:
 
     st.divider()
 
+    # ── SECTION 3.38 — MOMENTUM LEADERS (the active, MCPT-validated strategy) ─
+    st.markdown("### 🚀 Momentum Leaders — Active Strategy")
+    st.caption(
+        "The bot's PRIMARY stock strategy after MCPT validation: buy the strongest "
+        "liquid names in a confirmed uptrend (above 50- & 200-day SMA). "
+        "Cross-sectional momentum tested at p=0.004 — beats pure beta by ~93% and "
+        "random selection 99.6% of the time. Exits on a close below the 50-day SMA."
+    )
+    _mc1, _mc2 = st.columns([3, 1])
+    with _mc1:
+        st.markdown(
+            "<div style='background:#0d2818;border-left:4px solid #3fb950;"
+            "border-radius:6px;padding:8px 12px;font-size:0.85em'>"
+            "✅ <b>Replaced</b> the chart-pattern engine (no edge: p≈0.23–0.81) and "
+            "the illiquid micro-cap universe. Trades liquid US large-caps + ETFs only."
+            "</div>", unsafe_allow_html=True,
+        )
+    with _mc2:
+        _mom_run = st.button("🚀 Rank Leaders", key="mgmt_mom_btn",
+                             type="primary", use_container_width=True)
+
+    if _mom_run:
+        try:
+            from momentum_strategy import MomentumStrategy
+            _mp = st.progress(0.0, text="Scanning liquid universe…")
+            def _mom_cb(i, total, t):
+                _mp.progress(min(i / max(total, 1), 1.0), text=f"Scoring {t} ({i}/{total})")
+            with st.spinner("Ranking momentum leaders…"):
+                _mom_res = MomentumStrategy(conn).rank(top_n=15, min_mom_6m=0.0,
+                                                       progress=_mom_cb)
+            _mp.empty()
+            st.session_state["_mom_last"] = _mom_res
+        except Exception as _me:
+            st.error(f"Momentum scan error: {_me}")
+
+    _mom_show = st.session_state.get("_mom_last")
+    if _mom_show:
+        st.success(f"{len(_mom_show)} liquid uptrend leaders", icon="🚀")
+        import pandas as _pdm
+        _rows = [{
+            "Ticker": r["ticker"],
+            "6-mo %": f"{r['mom_6m']*100:+.0f}%",
+            "3-mo %": f"{r['mom_3m']*100:+.0f}%",
+            "RSI": f"{r['rsi']:.0f}",
+            "Price": f"${r['price']:.2f}",
+            "Stop": f"${r['stop']:.2f}",
+            "Flag": "⚠️ extended" if r["extended"] else "",
+        } for r in _mom_show]
+        st.dataframe(_pdm.DataFrame(_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("Hit **Rank Leaders** to see the current momentum leaders.", icon="📊")
+
+    st.divider()
+
     # ── SECTION 3.40 — UNIFIED SCANNER (one brain, every universe) ───────────
     st.markdown("### 🎯 Unified Scanner")
     st.caption(

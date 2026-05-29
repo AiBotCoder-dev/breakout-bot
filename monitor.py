@@ -1201,6 +1201,13 @@ def main():
     print(f"    Realized P&L   : ${summary['realized_pnl']:+,.2f}")
     print(f"    Open positions : {len(positions)}/{summary['max_positions']}")
 
+    # ── Benchmark snapshot — forward momentum-vs-SPY scorecard (once/day) ───────
+    try:
+        from benchmark_tracker import BenchmarkTracker
+        BenchmarkTracker(conn).snapshot(paper)
+    except Exception as _be:
+        print(f"  WARN benchmark snapshot failed: {_be}")
+
     if not positions:
         print("\n  No open positions to monitor.")
     else:

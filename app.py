@@ -1640,6 +1640,49 @@ with tab_mgmt:
 
     st.divider()
 
+    # ── SECTION 3.39 — MOMENTUM vs SPY SCORECARD (live forward edge) ──────────
+    st.markdown("### 📊 Momentum vs SPY — Live Scorecard")
+    st.caption(
+        "The real test: since the momentum pivot went live, is the bot beating a "
+        "simple buy-and-hold of SPY? Updated once per day from true mark-to-market "
+        "equity. This is forward, out-of-sample evidence — the backtest's promissory note."
+    )
+    try:
+        from benchmark_tracker import BenchmarkTracker
+        _bsc = BenchmarkTracker(conn).get_scorecard()
+    except Exception as _bse:
+        _bsc = None
+        st.warning(f"Scorecard unavailable: {_bse}")
+
+    if _bsc:
+        _c1, _c2, _c3 = st.columns(3)
+        _c1.metric("Bot (momentum)", f"{_bsc['bot_return_pct']:+.2f}%")
+        _c2.metric("SPY (buy & hold)", f"{_bsc['spy_return_pct']:+.2f}%")
+        _alpha = _bsc["alpha_pct"]
+        _c3.metric("Alpha vs SPY", f"{_alpha:+.2f}%",
+                   delta=("beating SPY" if _bsc["winning"] else "trailing SPY"),
+                   delta_color=("normal" if _bsc["winning"] else "inverse"))
+        st.caption(f"Since {_bsc['inception']} · {_bsc['days_tracked']} day(s) tracked "
+                   f"· equity ${_bsc['current_equity']:,.0f}")
+
+        _ser = _bsc.get("series") or []
+        if len(_ser) >= 2:
+            import pandas as _pdb
+            _df = _pdb.DataFrame({
+                "date": [s["date"] for s in _ser],
+                "Bot (momentum)": [round(s["bot_ret_pct"], 2) for s in _ser],
+                "SPY": [round(s["spy_ret_pct"], 2) for s in _ser],
+            }).set_index("date")
+            st.line_chart(_df)
+        else:
+            st.caption("📈 Equity curve appears once 2+ daily snapshots exist.")
+    else:
+        st.info("No snapshots yet. The monitor records one per day during market "
+                "hours — the scorecard fills in starting the next trading session.",
+                icon="⏳")
+
+    st.divider()
+
     # ── SECTION 3.40 — UNIFIED SCANNER (one brain, every universe) ───────────
     st.markdown("### 🎯 Unified Scanner")
     st.caption(

@@ -1204,6 +1204,89 @@ with tab_mgmt:
     _mgmt_le    = ts.LearningEngine(conn)
 
     # ── SECTION 1 — SYSTEM STATUS OVERVIEW ───────────────────────────────────
+    # ── DISCIPLINED PATH — goal-progress scoreboard ───────────────────────────
+    st.markdown("### 🎯 Disciplined Path — $500 → $1,500 (12 mo)")
+    st.caption(
+        "The disciplined-plan scoreboard. Reads the paper portfolio's % return "
+        "and applies it to your real account. The single most important question "
+        "each day: am I on pace to hit my goal? Configure your real numbers "
+        "below — defaults are $500 → $1,500 over 365 days (~9%/month compound)."
+    )
+
+    _gcfg1, _gcfg2, _gcfg3, _gcfg4 = st.columns(4)
+    with _gcfg1:
+        _g_start = st.number_input("Start capital ($)", 100.0, 100000.0, 500.0,
+                                   step=50.0, key="g_start")
+    with _gcfg2:
+        _g_goal = st.number_input("Goal ($)", 100.0, 1000000.0, 1500.0,
+                                  step=100.0, key="g_goal")
+    with _gcfg3:
+        _g_days = st.number_input("Horizon (days)", 30, 730, 365,
+                                  step=30, key="g_days")
+    with _gcfg4:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        _g_apply = st.button("💾 Apply", key="g_apply", use_container_width=True)
+
+    try:
+        from goal_tracker import GoalTracker
+        import trading_scanner as _ts_gt
+        _paper_gt = _ts_gt.PaperTradingEngine(conn)
+        _gt = GoalTracker(conn, start_capital=_g_start, goal_capital=_g_goal,
+                          horizon_days=int(_g_days))
+        if _g_apply:
+            _gt.update_config(_g_start, _g_goal, int(_g_days))
+            st.toast("Goal configuration saved.", icon="✅")
+        _sc = _gt.scorecard(_paper_gt)
+    except Exception as _gte:
+        _sc = None
+        st.warning(f"Goal tracker unavailable: {_gte}")
+
+    if _sc:
+        # Big stat row
+        _cA, _cB, _cC, _cD = st.columns(4)
+        _cA.metric("Real value now", f"${_sc['real_value_now']:,.0f}",
+                   delta=f"{_sc['paper_return_pct']:+.1f}% since start")
+        _cB.metric("Goal", f"${_sc['goal_capital']:,.0f}",
+                   delta=f"{_sc['pct_of_goal']:.0f}% of journey")
+        _cC.metric("Monthly pace",  f"{_sc['actual_monthly_pct']:+.2f}%",
+                   delta=f"need {_sc['required_monthly_pct']:+.2f}%")
+        _proj_diff = _sc["projected_end_value"] - _sc["goal_capital"]
+        _cD.metric("Projected end", f"${_sc['projected_end_value']:,.0f}",
+                   delta=f"{'+' if _proj_diff >= 0 else ''}${_proj_diff:,.0f} vs goal",
+                   delta_color=("normal" if _proj_diff >= 0 else "inverse"))
+
+        # Pace banner
+        _status_color = {"ahead": "#3fb950", "on_pace": "#58a6ff",
+                         "behind": "#f85149"}.get(_sc["status"], "#8b949e")
+        _status_text = {"ahead": "AHEAD OF PACE",
+                        "on_pace": "ON PACE",
+                        "behind": "BEHIND PACE"}.get(_sc["status"], "?")
+        _msg = (
+            f"<b>{_status_text}</b> · Day {_sc['days_elapsed']} of "
+            f"{_sc['days_elapsed']+_sc['days_remaining']} · "
+            f"{_sc['days_remaining']} days remaining · "
+            f"+${_sc['real_gain_dollars']:+,.0f} so far"
+        )
+        st.markdown(
+            f"<div style='background:#161b22;border-left:5px solid {_status_color};"
+            f"border-radius:6px;padding:10px 14px;margin:6px 0 12px 0;color:#c9d1d9'>"
+            f"{_msg}</div>", unsafe_allow_html=True,
+        )
+
+        # Honest plan-context reminder
+        with st.expander("📋 Disciplined-plan rules (tap to view)", expanded=False):
+            st.markdown(
+                "- **80% momentum stocks** (top 4–6 from Momentum Leaders, rotated monthly)\n"
+                "- **15% whale-validated swings** (1–2 names from Whale Watch with fresh 13D / cluster / heavy insider)\n"
+                "- **5% catalyst options only** — fire only on tier-1 VIP alerts (Trump posts about a momentum-leader ticker)\n"
+                "- **Max 10–12% per position** · cut at −10–15% · exit on close < 50-SMA\n"
+                "- **Skip options most months.** Skip new trades into the weekend. Stand down in BEAR regime.\n"
+                "- **No FOMO, no averaging down.** The scorecard tells the truth — trust it."
+            )
+        st.caption(f"Baseline: ${_sc['paper_baseline_equity']:,.0f} on "
+                   f"{_sc['start_date']} · paper equity now: ${_sc['paper_equity_now']:,.0f}")
+        st.divider()
+
     st.markdown("### 🚦 System Status Overview")
     _stat_cols = st.columns(6)
 

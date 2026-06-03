@@ -1170,9 +1170,10 @@ if run_btn:
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
-(tab_mgmt, tab_dash, tab_results, tab_chart, tab_analytics,
+(tab_mgmt, tab_whale, tab_dash, tab_results, tab_chart, tab_analytics,
  tab_paper, tab_fees, tab_options) = st.tabs([
     "🎛  Management",
+    "🐋  Whale Watch",
     "📊  Dashboard",
     "🔍  Scan Results",
     "📈  Stock Chart",
@@ -2729,6 +2730,156 @@ with tab_mgmt:
             f"- Hard Reset: <b>≥ {ts.LearningEngine.RESET_THRESHOLD}%</b><br>"
             f"- Recovery band: within <b>{ts.LearningEngine.RECOVERY_BAND_PCT}%</b> of peak",
             unsafe_allow_html=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TAB 0.5 — WHALE WATCH ("follow the money" idea generator)
+#   Public smart-money signals — Congressional disclosures, SEC 13D/13G activist
+#   filings, Form 4 insider buys, federal contracts — aggregated into one ranked
+#   watchlist with concrete entry/stop/target. Forward scorecard measures
+#   whether the picks actually beat SPY.
+# ──────────────────────────────────────────────────────────────────────────────
+with tab_whale:
+    conn, _ww_mode = get_db()
+    st.markdown("## 🐋 Whale Watch — Follow the Public Smart Money")
+    st.caption(
+        "Legal analog to insider info: stocks where smart money has PUBLICLY shown "
+        "their hand — Congressional STOCK-Act disclosures, SEC 13D/13G activist "
+        "filings, Form 4 insider open-market buys, federal contract awards. "
+        "Information is public; the edge is in aggregating it and acting before "
+        "the broader market does. Forward scorecard below tells you whether it "
+        "actually works — don't trust the thesis, trust the data."
+    )
+
+    _wc1, _wc2, _wc3 = st.columns([2, 1, 1])
+    with _wc2:
+        _ww_min = st.number_input("Min whale score", 0, 100, 20, key="ww_min")
+    with _wc3:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        _ww_run = st.button("🐋 Refresh Watchlist", key="ww_refresh",
+                            type="primary", use_container_width=True)
+    with _wc1:
+        st.info(
+            "Refreshing scans ~125 liquid US names through 4 whale sources "
+            "(Quiver, SEC EDGAR, USASpending, StockTwits). Takes a couple of "
+            "minutes on a cold cache; subsequent runs are much faster.",
+            icon="ℹ️",
+        )
+
+    if _ww_run:
+        try:
+            from whale_watch import WhaleWatchlist
+            _wp = st.progress(0.0, text="Scanning whale sources…")
+            def _ww_cb(i, n, t):
+                _wp.progress(min(i / max(n, 1), 1.0),
+                             text=f"{t}  ({i}/{n})")
+            with st.spinner("Aggregating whale signals — this can take a few minutes…"):
+                wl = WhaleWatchlist(conn)
+                rows = wl.build(min_score=int(_ww_min), progress=_ww_cb)
+                wl.persist(rows)
+                wl.update_outcomes()
+            _wp.empty()
+            st.success(f"Watchlist refreshed: {len(rows)} names with whale signal ≥ {_ww_min}",
+                       icon="🐋")
+        except Exception as _wwe:
+            st.error(f"Watchlist refresh failed: {_wwe}")
+
+    # ── Current watchlist ─────────────────────────────────────────────────────
+    try:
+        from whale_watch import WhaleWatchlist
+        _wl = WhaleWatchlist(conn)
+        _rows = _wl.get_latest()
+        _outc = _wl.get_outcomes()
+    except Exception as _wle:
+        _rows, _outc = [], {"picks": [], "summary": {}}
+        st.warning(f"Watchlist unavailable: {_wle}")
+
+    st.markdown("### 📋 Current Watchlist")
+    if _rows:
+        import pandas as _pdw
+        df = _pdw.DataFrame([{
+            "Ticker":     r["ticker"],
+            "Score":      f"{r['whale_score']}/100",
+            "Key signal": r["key_signal"][:60],
+            "Price":      f"${r['price_now']:.2f}",
+            "Entry now":  f"${r['entry_now']:.2f}",
+            "Pullback":   f"${r['entry_pullback']:.2f}",
+            "Stop":       f"${r['stop']:.2f}",
+            "Target":     f"${r['target']:.2f}",
+            "Risk":       f"{r['risk_pct']:.1f}%",
+            "Reward":     f"{r['reward_pct']:.1f}%",
+            "R:R":        f"{r['rr']:.1f}",
+        } for r in _rows])
+        st.dataframe(df, use_container_width=True, hide_index=True, height=420)
+
+        # Per-pick detail expanders
+        st.markdown("### 🔎 Per-Pick Details")
+        for r in _rows[:15]:
+            with st.expander(
+                f"🐋 **{r['ticker']}** — score {r['whale_score']}/100  ·  "
+                f"entry ${r['entry_now']:.2f}  stop ${r['stop']:.2f}  "
+                f"target ${r['target']:.2f}  (R:R {r['rr']:.1f})",
+                expanded=False,
+            ):
+                _flags = [f for f in (r.get("flags") or []) if f]
+                if _flags:
+                    for f in _flags:
+                        st.markdown(f"- {f}")
+                else:
+                    st.caption("No detailed flags captured this run.")
+                st.markdown(
+                    f"<small>"
+                    f"<b>Entry now:</b> ${r['entry_now']:.2f}   |   "
+                    f"<b>Pullback entry:</b> ${r['entry_pullback']:.2f} (EMA20 / 50-SMA)   |   "
+                    f"<b>Stop:</b> ${r['stop']:.2f} (1.5×ATR)   |   "
+                    f"<b>Target:</b> ${r['target']:.2f} (recent high or +3×ATR)"
+                    f"</small>", unsafe_allow_html=True,
+                )
+    else:
+        st.info("Empty watchlist. Hit **Refresh Watchlist** to populate it. "
+                "First run takes ~2 min while the whale-source caches warm up.",
+                icon="📭")
+
+    st.divider()
+
+    # ── Forward scorecard ─────────────────────────────────────────────────────
+    st.markdown("### 📊 Forward Scorecard — Whale Picks vs SPY")
+    _summ = _outc.get("summary") or {}
+    _picks = _outc.get("picks") or []
+    if _summ:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Picks tracked", _summ["n_picks"])
+        c2.metric("Avg pick return", f"{_summ['avg_pick_return']:+.2f}%")
+        c3.metric("Avg SPY return",  f"{_summ['avg_spy_return']:+.2f}%")
+        c4.metric("Alpha vs SPY",    f"{_summ['avg_alpha']:+.2f}%",
+                  delta=(f"{_summ['win_rate']:.0f}% beat SPY"))
+        st.caption("Each pick's entry was snapped at first detection; SPY is "
+                   "snapped at the same moment. Alpha = pick return − SPY return.")
+        import pandas as _pdw2
+        df2 = _pdw2.DataFrame([{
+            "Ticker":   p["ticker"],
+            "Detected": p["detected_at"],
+            "Days":     p["days"],
+            "Entry":    f"${p['entry']:.2f}",
+            "Last":     f"${p['last']:.2f}",
+            "Pick %":   f"{p['ticker_ret']:+.2f}%",
+            "SPY %":    f"{p['spy_ret']:+.2f}%",
+            "Alpha":    f"{p['alpha']:+.2f}%",
+        } for p in _picks])
+        st.dataframe(df2, use_container_width=True, hide_index=True)
+    else:
+        st.info("No picks tracked yet — refresh the watchlist once and the "
+                "forward scorecard starts accumulating from that snapshot.",
+                icon="⏳")
+
+    st.markdown(
+        "<small style='color:#8b949e'>"
+        "Honest caveat: post-STOCK-Act studies are MIXED on whether "
+        "Congressional-trade-following still beats the market; 13D activist "
+        "filings and Form 4 insider buys have firmer documented edges. The "
+        "scorecard above is the only thing that settles it for your bot."
+        "</small>", unsafe_allow_html=True,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────

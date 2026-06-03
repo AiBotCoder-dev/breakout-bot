@@ -1208,6 +1208,18 @@ def main():
     except Exception as _be:
         print(f"  WARN benchmark snapshot failed: {_be}")
 
+    # ── Whale-watch outcomes — cheap forward P&L update (every cycle) ──────────
+    # The expensive `build()` (4 APIs × ~125 tickers) is dashboard-button only;
+    # here we just refresh live prices for already-detected picks so the
+    # scorecard accumulates.
+    try:
+        from whale_watch import WhaleWatchlist
+        n_upd = WhaleWatchlist(conn).update_outcomes()
+        if n_upd:
+            print(f"  [whale-watch] outcomes refreshed for {n_upd} pick(s)")
+    except Exception as _we:
+        print(f"  WARN whale-watch outcomes failed: {_we}")
+
     if not positions:
         print("\n  No open positions to monitor.")
     else:

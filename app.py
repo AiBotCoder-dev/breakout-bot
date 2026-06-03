@@ -2741,6 +2741,95 @@ with tab_mgmt:
 # ──────────────────────────────────────────────────────────────────────────────
 with tab_whale:
     conn, _ww_mode = get_db()
+
+    # ── VIP FEED — Trump / Fed instant-alert section ──────────────────────────
+    st.markdown("## 📣 VIP Feed — Trump · Fed (instant Telegram alerts)")
+    st.caption(
+        "Polls Trump's Truth Social and the Federal Reserve press feed every "
+        "monitor cycle. When a post mentions a stock (cashtag or known company "
+        "name) — or any Fed release lands — a Telegram alert fires in real time. "
+        "All posts persist below so you can scroll the recent feed and see "
+        "which were market-relevant."
+    )
+
+    _vc1, _vc2, _vc3 = st.columns([2, 1, 1])
+    with _vc2:
+        _vip_tonly = st.toggle("Only posts with tickers", value=False, key="vip_tonly")
+    with _vc3:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        _vip_poll = st.button("🔄 Poll Now", key="vip_poll",
+                              type="primary", use_container_width=True)
+    with _vc1:
+        st.info(
+            "Auto-polls every cycle. Hit **Poll Now** to fetch immediately. "
+            "Telegram alerts fire for: (a) any Trump post that mentions a stock, "
+            "(b) every Fed press release.",
+            icon="📡",
+        )
+
+    if _vip_poll:
+        try:
+            from vip_news_monitor import VipNewsMonitor
+            # Re-use monitor's send_telegram via env if configured
+            def _vip_tg(msg):
+                tok  = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+                chat = os.environ.get("TELEGRAM_CHAT_ID",   "").strip()
+                if not tok or not chat:
+                    return False
+                try:
+                    import requests as _rq
+                    r = _rq.post(
+                        f"https://api.telegram.org/bot{tok}/sendMessage",
+                        data={"chat_id": chat, "text": msg,
+                              "parse_mode": "HTML",
+                              "disable_web_page_preview": True},
+                        timeout=10)
+                    return r.status_code == 200
+                except Exception:
+                    return False
+            with st.spinner("Polling Trump + Fed feeds…"):
+                _rep = VipNewsMonitor(conn).run_cycle(telegram_sender=_vip_tg)
+            for h, s in _rep.items():
+                st.success(f"{h}: fetched {s['fetched']} · "
+                           f"new {s['new']} · alerted {s['alerted']}", icon="📡")
+        except Exception as _vpe:
+            st.error(f"Poll failed: {_vpe}")
+
+    try:
+        from vip_news_monitor import VipNewsMonitor as _VNM
+        _vip_recent = _VNM(conn).get_recent(limit=80, ticker_only=_vip_tonly)
+    except Exception as _vre:
+        _vip_recent = []
+        st.warning(f"VIP feed unavailable: {_vre}")
+
+    if _vip_recent:
+        for p in _vip_recent[:40]:
+            _sent_emoji = {"bullish": "🟢", "bearish": "🔴",
+                           "neutral": "⚪"}.get(p["sentiment"], "⚪")
+            _src_emoji  = "🚨" if p["vip_handle"] == "DJT" else "🏦"
+            _alert_tag  = "🔔" if p.get("alerted") else "·"
+            _tickers    = " ".join(f"`${t}`" for t in p["tickers"]) or "—"
+            with st.container():
+                st.markdown(
+                    f"{_src_emoji} **{p['vip_name']}**  {_sent_emoji} "
+                    f"{_alert_tag}  · {p['posted_at'] or p['fetched_at'][:19]}",
+                )
+                _snippet = (p["title"] or p["text"])[:380]
+                st.markdown(f"<div style='color:#c9d1d9;font-size:0.92em;"
+                            f"padding:4px 0'>{_snippet}</div>",
+                            unsafe_allow_html=True)
+                cols = st.columns([3, 2])
+                cols[0].markdown(f"Tickers: {_tickers}")
+                if p["url"]:
+                    cols[1].markdown(f"[Open ↗]({p['url']})")
+                st.markdown("<hr style='margin:6px 0;border:0;"
+                            "border-top:1px solid #21262d'>", unsafe_allow_html=True)
+    else:
+        st.info("No VIP posts yet — hit **Poll Now** or wait for the next monitor "
+                "cycle.", icon="📭")
+
+    st.divider()
+
     st.markdown("## 🐋 Whale Watch — Follow the Public Smart Money")
     st.caption(
         "Legal analog to insider info: stocks where smart money has PUBLICLY shown "

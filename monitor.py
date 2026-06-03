@@ -1363,6 +1363,20 @@ def main():
         _news_agent = None
 
     # ══════════════════════════════════════════════════════════════════════════
+    # VIP FEED — instant Telegram on market-moving public-figure posts
+    # ══════════════════════════════════════════════════════════════════════════
+    print(f"\n  {'─'*50}")
+    print(f"  VIP FEED — Trump (Truth Social) + Fed press releases")
+    try:
+        from vip_news_monitor import VipNewsMonitor
+        _vip_report = VipNewsMonitor(conn).run_cycle(telegram_sender=send_telegram)
+        for h, s in _vip_report.items():
+            print(f"    {h:6s}  fetched={s['fetched']:3d}  "
+                  f"new={s['new']:2d}  alerted={s['alerted']}")
+    except Exception as _ve:
+        print(f"  WARN VIP monitor failed: {_ve}")
+
+    # ══════════════════════════════════════════════════════════════════════════
     # PORTFOLIO-LEVEL RISK GATES
     #   These run BEFORE any auto-entry to halt trading on drawdown / regime risk
     # ══════════════════════════════════════════════════════════════════════════

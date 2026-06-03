@@ -1683,6 +1683,80 @@ with tab_mgmt:
 
     st.divider()
 
+    # ── SECTION 3.395 — MOMENTUM CALLS (cheap-leverage version of the edge) ───
+    st.markdown("### 🎰 Momentum Calls — Cheap Leverage")
+    st.caption(
+        "The options bot: slightly-OTM (5–15%) calls, 1–6 weeks to expiry, "
+        "premium ≤ $5, ONLY on names that pass the validated momentum rank. "
+        "Auto-exits at +100% take profit / −50% stop / DTE ≤ 2 (theta cliff). "
+        "Lottery sizing — expect most to lose 100%, the winners pay for the misses."
+    )
+
+    _moc1, _moc2 = st.columns([3, 1])
+    with _moc2:
+        _mo_btn = st.button("🔎 Scan Setups", key="mgmt_mopt_btn",
+                            type="primary", use_container_width=True)
+
+    if _mo_btn:
+        try:
+            from momentum_options import MomentumOptionsStrategy
+            _mp = st.progress(0.0, text="Searching option chains…")
+            def _mo_cb(i, n, t):
+                _mp.progress(min(i / max(n, 1), 1.0), text=f"Checking {t} ({i}/{n})")
+            with st.spinner("Finding lottery setups on momentum leaders…"):
+                _mo_res = MomentumOptionsStrategy(conn).find_setups(
+                    top_n_underlyings=8, progress=_mo_cb)
+            _mp.empty()
+            st.session_state["_mopt_last"] = _mo_res
+        except Exception as _me:
+            st.error(f"Setup scan error: {_me}")
+
+    _mo_show = st.session_state.get("_mopt_last")
+    if _mo_show:
+        import pandas as _pdo
+        _rows = [{
+            "Ticker": s["ticker"],
+            "Strike": f"${s['strike']:.2f}",
+            "Expiry": s["expiry"],
+            "DTE": s["dte"],
+            "OTM%": f"{s['otm_pct']*100:+.1f}%",
+            "Prem": f"${s['premium']:.2f}",
+            "IV": f"{s['iv']*100:.0f}%",
+            "Vol/OI": f"{s['volume']}/{s['open_interest']}",
+            "Mom 6m": f"{s.get('mom_6m',0)*100:+.0f}%",
+        } for s in _mo_show]
+        st.success(f"{len(_mo_show)} clean lottery setup(s)", icon="🎰")
+        st.dataframe(_pdo.DataFrame(_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("Hit **Scan Setups** to see today's momentum-aligned call candidates.", icon="🔎")
+
+    # Open momentum-options positions table
+    try:
+        _rows = conn.execute(
+            "SELECT ticker, strike, expiry, entry_price, contracts, entry_date, "
+            "gross_invested FROM options_positions "
+            "WHERE status='OPEN' AND strategy='momentum_call' "
+            "ORDER BY entry_date DESC"
+        ).fetchall()
+    except Exception:
+        _rows = []
+    if _rows:
+        def _g(r, k, i): return r.get(k) if hasattr(r, "get") else r[i]
+        import pandas as _pdo2
+        _data = [{
+            "Ticker":   _g(r, "ticker", 0),
+            "Strike":   f"${float(_g(r, 'strike', 1) or 0):.2f}",
+            "Expiry":   _g(r, "expiry", 2),
+            "Entry $":  f"${float(_g(r, 'entry_price', 3) or 0):.2f}",
+            "×":        int(_g(r, "contracts", 4) or 0),
+            "Opened":   _g(r, "entry_date", 5),
+            "Cost":     f"${float(_g(r, 'gross_invested', 6) or 0):.0f}",
+        } for r in _rows]
+        st.markdown("**Open momentum-call positions:**")
+        st.dataframe(_pdo2.DataFrame(_data), use_container_width=True, hide_index=True)
+
+    st.divider()
+
     # ── SECTION 3.40 — UNIFIED SCANNER (one brain, every universe) ───────────
     st.markdown("### 🎯 Unified Scanner")
     st.caption(

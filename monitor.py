@@ -1603,6 +1603,25 @@ def main():
         traceback.print_exc()
         send_telegram(f"⚠️ <b>Auto-Entry Options Error</b>\n{str(exc)[:300]}")
 
+    # ── Momentum-aligned call buyer (cheap calls on validated mom leaders) ─────
+    # Buys slightly-OTM calls (5-15%, 14-42 DTE, premium ≤ $5) ONLY on names that
+    # pass the validated cross-sectional momentum rank. Auto-exits at +100% TP /
+    # -50% SL / DTE ≤ 2 (theta cliff). Lottery sizing (~5% per ticket). All paper.
+    print(f"\n  {'─'*50}")
+    print(f"  MOMENTUM CALLS — Cheap leverage on the validated edge")
+    try:
+        from momentum_options import MomentumOptionsStrategy
+        _mopt = MomentumOptionsStrategy(conn)
+        _opt_engine = ts.OptionsPaperEngine(conn)
+        _opt_engine.expire_check()              # housekeeping: close expired worthless
+        n_closed = _mopt.auto_exit(_opt_engine)
+        n_opened = _mopt.auto_enter(_opt_engine, market_regime=market_regime)
+        print(f"  Momentum calls: closed {n_closed}, opened {n_opened}")
+    except Exception as exc:
+        print(f"  ERROR in momentum options: {exc}")
+        traceback.print_exc()
+        send_telegram(f"⚠️ <b>Momentum Options Error</b>\n{str(exc)[:300]}")
+
     # ── Options Callout Tracker — aggregate social call/put ideas + track P&L ──
     # Research-only: pulls options callouts from StockTwits (+ Reddit if creds),
     # snapshots the called option's premium NOW, and tracks forward P&L so we

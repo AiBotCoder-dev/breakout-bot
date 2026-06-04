@@ -1680,6 +1680,22 @@ def main():
     except Exception as _oe:
         print(f"  WARN options scanner failed: {_oe}")
 
+    # ── PANIC DETECTOR — fires high-conviction buy signal on extreme fear ──────
+    # Backed by 12y of SPY+VIX data (panic_backtest.py):
+    #   VIX>=40 close   → 100% win rate, +19.8% mean over 60d (40 events)
+    #   SPY -5% day     → 100% win rate, +24.1% mean over 60d (6 events)
+    #   COMBO_HARD      → 88.5% win rate, +12.7% mean over 60d (26 events)
+    # Deduped via panic_signals table — won't re-alert until conditions normalize.
+    try:
+        from panic_detector import PanicDetector
+        _pan_alerts = PanicDetector(conn).check(telegram_sender=send_telegram)
+        if _pan_alerts:
+            print(f"  PANIC SIGNAL fired: {len(_pan_alerts)} new alert(s) sent.")
+            for a in _pan_alerts:
+                print(f"    -> {a['signature']}")
+    except Exception as _pde:
+        print(f"  WARN panic detector failed: {_pde}")
+
     # ── EVENT-DRIVEN OPTIONS EXITS — close on external risk BEFORE new entries ─
     # External factors that should close an open options position regardless of
     # P&L: bearish VIP post about the underlying, high-impact negative news,

@@ -1287,6 +1287,72 @@ with tab_mgmt:
                    f"{_sc['start_date']} · paper equity now: ${_sc['paper_equity_now']:,.0f}")
         st.divider()
 
+    # ── PANIC DETECTOR — "blood in the streets" buy signal ────────────────────
+    st.markdown("### 🚨 Panic Detector — Buy-Fear Signal")
+    st.caption(
+        "12y of SPY+VIX backtested signatures. When fear hits documented panic "
+        "levels, history says: buy. Each row shows current vs trigger, plus the "
+        "historical edge if the signature fires. Telegram alerts fire automatically "
+        "on first activation; reset when conditions normalize."
+    )
+    try:
+        from panic_detector import PanicDetector
+        _ps = PanicDetector(conn).status()
+    except Exception as _pe:
+        _ps = None
+        st.warning(f"Panic detector unavailable: {_pe}")
+
+    if _ps and _ps.get("snap"):
+        _snap = _ps["snap"]
+        _c1, _c2, _c3, _c4 = st.columns(4)
+        _c1.metric("SPY", f"${_snap['spy']:.2f}",
+                   delta=f"{_snap['spy_ret_1d']*100:+.2f}% today")
+        _c2.metric("VIX", f"{_snap['vix']:.1f}",
+                   delta=("LOW"     if _snap['vix'] < 15 else
+                          "NORMAL"  if _snap['vix'] < 20 else
+                          "ELEVATED" if _snap['vix'] < 30 else
+                          "FEAR"    if _snap['vix'] < 40 else "EXTREME"),
+                   delta_color=("normal" if _snap['vix'] < 30 else "inverse"))
+        _c3.metric("RSI (14d)", f"{_snap['spy_rsi14']:.0f}",
+                   delta=("oversold" if _snap['spy_rsi14'] < 30 else
+                          "neutral"  if _snap['spy_rsi14'] < 70 else "overbought"))
+        _fires = sum(1 for s in _ps["signatures"] if s["currently_fired"])
+        _c4.metric("Signatures firing", f"{_fires} of {len(_ps['signatures'])}",
+                   delta=("🚨 BUY-FEAR" if _fires else "no panic signal"),
+                   delta_color=("normal" if _fires else "off"))
+
+        import pandas as _pdpn
+        rows = []
+        for s in _ps["signatures"]:
+            status = "🚨 ACTIVE" if s["currently_fired"] else "—"
+            rows.append({
+                "Status": status,
+                "Signature": s["label"],
+                "Historical n": s["n_historical"],
+                "20d Win%": f"{s['win_rate_20d']:.0f}%",
+                "20d Mean": f"{s['mean_return_20d']:+.1f}%",
+                "60d Win%": f"{s['win_rate_60d']:.0f}%",
+                "60d Mean": f"{s['mean_return_60d']:+.1f}%",
+                "60d worst (p10)": f"{s['worst_60d_p10']:+.1f}%",
+            })
+        st.dataframe(_pdpn.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        if _fires:
+            st.markdown(
+                f"<div style='background:#3d0e0e;border-left:5px solid #f85149;"
+                f"border-radius:6px;padding:10px 14px;margin:6px 0;color:#c9d1d9'>"
+                f"<b>🚨 PANIC SIGNAL ACTIVE.</b> Historical edge has been strong "
+                f"every time this fired. Consider scaling INTO momentum leaders, "
+                f"SPY, or quality call options on a 20–60 day horizon. "
+                f"Telegram alert sent.</div>", unsafe_allow_html=True)
+        else:
+            st.caption("No panic signature currently firing. Detector watches each "
+                       "cycle; you'll get a Telegram alert the moment one trips.")
+    else:
+        st.info("Loading panic detector...", icon="⏳")
+
+    st.divider()
+
     st.markdown("### 🚦 System Status Overview")
     _stat_cols = st.columns(6)
 

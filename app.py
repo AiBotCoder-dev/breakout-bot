@@ -3346,7 +3346,13 @@ with tab_dash:
                      help="Fetches live prices for all open virtual positions (~30s for 100 tickers)"):
             with st.spinner("Refreshing live prices for all open positions…"):
                 try:
-                    _n = logger.update_calls()
+                    # Build a CallLogger bound to this tab's connection. `logger`
+                    # was previously referenced here but only ever existed as a
+                    # local inside get_db(), so this raised NameError on click.
+                    _logger = ts.CallLogger.__new__(ts.CallLogger)
+                    _logger.conn = conn
+                    _logger._init_schema()
+                    _n = _logger.update_calls()
                     st.session_state["virtual_pos_refreshed_at"] = (
                         datetime.utcnow().strftime("%H:%M:%S UTC")
                     )

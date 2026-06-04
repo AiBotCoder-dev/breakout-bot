@@ -372,6 +372,83 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# ── Bulletproof sidebar-reopen button (JS, version-independent) ───────────────
+# CSS alone proved unreliable (Streamlit's collapsed-control testid changes
+# between versions and the dark theme hides the icon). This injects a floating
+# "☰" button into the PARENT document that is always visible when the sidebar
+# is collapsed; clicking it programmatically clicks Streamlit's real expand
+# button (a JS .click() works even if that button is visually hidden). A polling
+# loop keeps our button alive across Streamlit reruns.
+st.components.v1.html(
+    """
+<script>
+(function () {
+  const doc = window.parent && window.parent.document ? window.parent.document : document;
+  const BTN_ID = "ccd-sidebar-reopen";
+
+  function findExpandButton() {
+    const sels = [
+      '[data-testid="stExpandSidebarButton"]',
+      '[data-testid="stSidebarCollapsedControl"] button',
+      '[data-testid="stSidebarCollapsedControl"]',
+      '[data-testid="collapsedControl"] button',
+      '[data-testid="collapsedControl"]',
+      '[aria-label="expandSidebar"]',
+      'button[title="Expand sidebar"]'
+    ];
+    for (const s of sels) { const el = doc.querySelector(s); if (el) return el; }
+    return null;
+  }
+
+  function sidebarIsCollapsed() {
+    const sb = doc.querySelector('[data-testid="stSidebar"]');
+    if (!sb) return true;
+    const w = sb.getBoundingClientRect().width;
+    if (w < 40) return true;
+    const ariaExp = sb.getAttribute('aria-expanded');
+    if (ariaExp === 'false') return true;
+    return false;
+  }
+
+  function ensureButton() {
+    let b = doc.getElementById(BTN_ID);
+    if (!b) {
+      b = doc.createElement('button');
+      b.id = BTN_ID;
+      b.textContent = '\\u2630 Menu';
+      b.title = 'Open sidebar';
+      Object.assign(b.style, {
+        position: 'fixed', top: '10px', left: '10px', zIndex: '2147483647',
+        background: '#1c2333', color: '#e6edf3', border: '1px solid #30363d',
+        borderRadius: '8px', padding: '7px 13px', fontSize: '15px',
+        fontWeight: '600', cursor: 'pointer', lineHeight: '1',
+        boxShadow: '0 2px 8px rgba(0,0,0,0.4)'
+      });
+      b.addEventListener('click', function () {
+        const exp = findExpandButton();
+        if (exp) { exp.click(); }
+      });
+      doc.body.appendChild(b);
+    }
+    return b;
+  }
+
+  function tick() {
+    try {
+      const b = ensureButton();
+      b.style.display = sidebarIsCollapsed() ? 'inline-block' : 'none';
+    } catch (e) { /* ignore */ }
+  }
+
+  setInterval(tick, 400);
+  tick();
+})();
+</script>
+    """,
+    height=0,
+)
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def kpi(label: str, value: str, colour: str = "blue"):
     st.markdown(

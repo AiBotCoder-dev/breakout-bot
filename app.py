@@ -4525,8 +4525,9 @@ with tab_options:
                                         max_value=50, value=1, step=1,
                                         key="opt_contracts_input")
 
-    ot_best, ot_lab, ot_chain, ot_unusual, ot_strategy, ot_paper, ot_smart = st.tabs([
+    ot_best, ot_perf, ot_lab, ot_chain, ot_unusual, ot_strategy, ot_paper, ot_smart = st.tabs([
         "🎯  Best Trades NOW",
+        "📊  Performance",
         "🧪  Options Lab",
         "⛓  Chain Viewer",
         "🔥  Unusual Activity",
@@ -4534,6 +4535,123 @@ with tab_options:
         "💰  Paper Trades",
         "🏛  Smart Money",
     ])
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SUB-TAB 1 — OPTIONS PERFORMANCE TRACKER + EMPIRICAL PROBABILITY
+    # ─────────────────────────────────────────────────────────────────────────
+    with ot_perf:
+        st.markdown("### 📊 Options Performance — Honest Scorecard")
+        st.caption(
+            "Every bot-originated options trade tracked: live %P&L, days held, "
+            "and — critically — return vs the underlying-only hold over the "
+            "same period. If the leverage isn't adding alpha, the scorecard "
+            "tells you. Empirical win rate from closed trades becomes the "
+            "PROBABILITY badge for new setups."
+        )
+
+        try:
+            from options_performance import OptionsPerformanceTracker
+            _opt = OptionsPerformanceTracker(conn)
+            _opens  = _opt.get_open(strategies=["momentum_call"])
+            _closed = _opt.get_closed(strategies=["momentum_call"], limit=100)
+            _summ   = _opt.summary(strategies=["momentum_call"])
+            _emp    = _opt.empirical_probability("momentum_call")
+        except Exception as _oe:
+            _opens, _closed, _summ, _emp = [], [], {}, None
+            st.warning(f"Performance tracker unavailable: {_oe}")
+
+        # ── Aggregate scoreboard ─────────────────────────────────────────────
+        if _summ and _summ.get("n_closed", 0) > 0:
+            c1, c2, c3, c4 = st.columns(4)
+            wr = _summ.get("win_rate") or 0
+            c1.metric("Win rate", f"{wr:.0f}%",
+                      delta=f"{_summ.get('n_winners',0)}W / {_summ.get('n_losers',0)}L")
+            c2.metric("Avg winner", f"{_summ.get('avg_winner') or 0:+.0f}%")
+            c3.metric("Avg loser",  f"{_summ.get('avg_loser')  or 0:+.0f}%")
+            exp = _summ.get("expectancy")
+            c4.metric("Expectancy/trade",
+                      f"{exp:+.1f}%" if exp is not None else "—",
+                      delta=(f"Total P&L ${_summ.get('total_pnl',0):+.0f}"
+                             if _summ.get("total_pnl") is not None else None),
+                      delta_color=("normal" if (_summ.get('total_pnl') or 0) >= 0 else "inverse"))
+            best = _summ.get("best_trade") or {}
+            worst = _summ.get("worst_trade") or {}
+            st.caption(f"Best: {best.get('ticker','—')} {best.get('ret_pct',0):+.0f}%  ·  "
+                       f"Worst: {worst.get('ticker','—')} {worst.get('ret_pct',0):+.0f}%  ·  "
+                       f"ROI on capital: "
+                       f"{(_summ.get('roi_pct') if _summ.get('roi_pct') is not None else 0):+.1f}%")
+        else:
+            st.info("No closed trades yet. Stats appear once the bot has "
+                    "completed its first options trade.", icon="📭")
+
+        # ── Empirical probability badge for NEW setups ───────────────────────
+        if _emp:
+            warning = f" ({_emp['warning']})" if _emp.get("warning") else ""
+            st.markdown(
+                f"<div style='background:#161b22;border-left:5px solid #58a6ff;"
+                f"border-radius:6px;padding:10px 14px;margin:6px 0;color:#c9d1d9'>"
+                f"<b>Empirical probability for new momentum_call setups:</b> "
+                f"win rate <b>{_emp['win_rate']}%</b> · avg winner "
+                f"<b>{_emp['avg_winner']:+.0f}%</b> · avg loser "
+                f"<b>{_emp['avg_loser']:+.0f}%</b> · expectancy "
+                f"<b>{_emp['expectancy']:+.1f}%</b> per trade · n={_emp['n']}{warning}"
+                f"</div>", unsafe_allow_html=True)
+        elif _summ.get("n_closed", 0) > 0:
+            st.caption(f"Empirical probability appears after 5+ closed trades "
+                       f"(currently {_summ['n_closed']}).")
+
+        # ── Open positions table ────────────────────────────────────────────
+        st.markdown("### 🟢 Open Options Positions")
+        if _opens:
+            import pandas as _pdop
+            df = _pdop.DataFrame([{
+                "Ticker":     o["ticker"],
+                "Contract":   f"${o['strike']:.0f}{o['option_type'][0].upper()}",
+                "Expiry":     o["expiry"],
+                "DTE":        o["dte_remaining"],
+                "Days held":  o["days_held"],
+                "Entry":      f"${o['entry_price']:.2f}",
+                "Now":        f"${o['current_premium']:.2f}",
+                "%P&L":       f"{o['ret_pct']:+.1f}%",
+                "$P&L":       f"${o['pnl_dollars']:+.0f}",
+                "Underlying %": f"{o['underlying_ret_pct']:+.1f}%",
+                "Leverage α": f"{o['leverage_alpha_pct']:+.1f}pt",
+            } for o in _opens])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.caption("**Leverage α** = how much the option position is "
+                       "outperforming just owning the stock. Negative means "
+                       "you'd have been better off in the underlying.")
+        else:
+            st.info("No open options positions.", icon="📭")
+
+        # ── Closed positions table ──────────────────────────────────────────
+        st.markdown("### 📜 Closed Options Trades")
+        if _closed:
+            import pandas as _pdcl
+            df = _pdcl.DataFrame([{
+                "Entry":     c["entry_date"],
+                "Exit":      c["exit_date"],
+                "Held":      c["hold_days"],
+                "Ticker":    c["ticker"],
+                "Contract":  f"${c['strike']:.0f}{c['option_type'][0].upper()}",
+                "Entry$":    f"${c['entry_price']:.2f}",
+                "Exit$":     f"${c['exit_price']:.2f}",
+                "%P&L":      f"{c['ret_pct']:+.1f}%",
+                "$P&L":      f"${c['net_pnl']:+.0f}",
+                "Reason":    c["exit_reason"],
+            } for c in _closed])
+            st.dataframe(df, use_container_width=True, hide_index=True, height=300)
+        else:
+            st.info("No closed trades yet.", icon="📭")
+
+        st.divider()
+        st.markdown(
+            "<small style='color:#8b949e'>"
+            "<b>Event exits ON:</b> the monitor closes options on these external "
+            "factors → VIP negative post · high-impact negative news · earnings "
+            "within 5 days (creep) · underlying breaks 50-SMA · VIX spike to "
+            "FEAR (≥25). Each exit fires a Telegram alert with the reason."
+            "</small>", unsafe_allow_html=True)
 
     # ─────────────────────────────────────────────────────────────────────────
     # SUB-TAB 0 — BEST OPTIONS TRADES NOW (the meta-scanner)

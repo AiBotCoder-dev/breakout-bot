@@ -1680,6 +1680,21 @@ def main():
     except Exception as _oe:
         print(f"  WARN options scanner failed: {_oe}")
 
+    # ── EVENT-DRIVEN OPTIONS EXITS — close on external risk BEFORE new entries ─
+    # External factors that should close an open options position regardless of
+    # P&L: bearish VIP post about the underlying, high-impact negative news,
+    # earnings creeping into the window, trend break on the underlying, VIX
+    # spike to FEAR regime. Runs BEFORE the auto-entry block so freshly-closed
+    # capital is available for new setups.
+    try:
+        from options_event_exits import EventDrivenExitEngine
+        _eo = ts.OptionsPaperEngine(conn)
+        _evx = EventDrivenExitEngine(conn).check_all_open(_eo, telegram_sender=send_telegram)
+        if _evx:
+            print(f"  Event-driven options exits: {len(_evx)}")
+    except Exception as _eve:
+        print(f"  WARN event-exit engine failed: {_eve}")
+
     # ── Momentum-aligned call buyer (cheap calls on validated mom leaders) ─────
     # Buys slightly-OTM calls (5-15%, 14-42 DTE, premium ≤ $5) ONLY on names that
     # pass the validated cross-sectional momentum rank. Auto-exits at +100% TP /

@@ -1709,6 +1709,33 @@ with tab_mgmt:
     if _mom_show:
         st.success(f"{len(_mom_show)} liquid uptrend leaders", icon="🚀")
         import pandas as _pdm
+        # Earnings badges (read cached only — no API calls per row)
+        try:
+            from earnings_engine import EarningsCalendar as _EC
+            _ec = _EC(conn)
+        except Exception:
+            _ec = None
+
+        def _earn_cell(tkr):
+            if _ec is None:
+                return "—"
+            row = _ec.get(tkr)
+            if not row or not row.get("next_earnings"):
+                return "—"
+            try:
+                from datetime import date as _dt
+                d = _dt.fromisoformat(row["next_earnings"][:10])
+                dd = (d - _dt.today()).days
+                if dd < 0:
+                    return "—"
+                if dd <= 7:
+                    return f"⚠️ {dd}d"
+                if dd <= 21:
+                    return f"📅 {dd}d"
+                return f"{dd}d"
+            except Exception:
+                return "—"
+
         _rows = [{
             "Ticker": r["ticker"],
             "6-mo %": f"{r['mom_6m']*100:+.0f}%",
@@ -1716,9 +1743,13 @@ with tab_mgmt:
             "RSI": f"{r['rsi']:.0f}",
             "Price": f"${r['price']:.2f}",
             "Stop": f"${r['stop']:.2f}",
+            "Earnings": _earn_cell(r["ticker"]),
             "Flag": "⚠️ extended" if r["extended"] else "",
         } for r in _mom_show]
         st.dataframe(_pdm.DataFrame(_rows), use_container_width=True, hide_index=True)
+        st.caption("**Earnings col:** `⚠️ Xd` = within 7d (IV-crush risk on long calls) · "
+                   "`📅 Xd` = within 21d · plain `Xd` = far out · `—` = no cached date "
+                   "(refresh PEAD scanner in 🐋 Whale Watch tab to populate)")
     else:
         st.info("Hit **Rank Leaders** to see the current momentum leaders.", icon="📊")
 
@@ -2910,6 +2941,68 @@ with tab_whale:
     else:
         st.info("No VIP posts yet — hit **Poll Now** or wait for the next monitor "
                 "cycle.", icon="📭")
+
+    st.divider()
+
+    # ── PEAD SCANNER (the actual earnings edge) ────────────────────────────────
+    st.markdown("## 📅 PEAD Scanner — Post-Earnings Drift")
+    st.caption(
+        "Trades AFTER earnings, not INTO them. PEAD (Post-Earnings Announcement "
+        "Drift) is the academically-documented anomaly where stocks that BEAT + "
+        "GAPPED UP keep drifting up for 2–12 weeks. This is the safe, validated "
+        "earnings edge — none of the IV-crush risk of buying calls into the print."
+    )
+
+    _pc1, _pc2 = st.columns([3, 1])
+    with _pc2:
+        _pead_btn = st.button("📅 Refresh PEAD", key="pead_btn",
+                              type="primary", use_container_width=True)
+    with _pc1:
+        st.info(
+            "Refreshes the earnings calendar for the liquid universe (~125 names) "
+            "then scores each on PEAD criteria: beat magnitude × post-earnings "
+            "gap × trend-intact × days-since (sweet spot 7–21d). Takes a couple "
+            "of minutes on first run; cached after that.",
+            icon="ℹ️",
+        )
+
+    if _pead_btn:
+        try:
+            from earnings_engine import PEADScanner
+            _pp = st.progress(0.0, text="Refreshing earnings calendar…")
+            def _pead_cb(i, n, t):
+                _pp.progress(min(i / max(n, 1), 1.0), text=f"{t} ({i}/{n})")
+            with st.spinner("Scanning PEAD setups…"):
+                _pead_rows = PEADScanner(conn).scan(progress=_pead_cb)
+            _pp.empty()
+            st.success(f"PEAD scan complete: {len(_pead_rows)} candidate(s)", icon="📅")
+        except Exception as _pee:
+            st.error(f"PEAD scan failed: {_pee}")
+
+    try:
+        from earnings_engine import PEADScanner as _PS
+        _pead_show = _PS(conn).get_latest()
+    except Exception:
+        _pead_show = []
+
+    if _pead_show:
+        import pandas as _pdpe
+        df = _pdpe.DataFrame([{
+            "Ticker":   r["ticker"],
+            "Score":    r["score"],
+            "Beat":     f"{r['surprise_pct']:+.1f}%",
+            "Gap":      f"{r['gap_pct']:+.1f}%",
+            "Days":     r["days_since"],
+            "Trend":    "✓ intact" if r["trend_intact"] else "wobbly",
+            "Entry":    f"${r['entry_now']:.2f}",
+            "Stop":     f"${r['stop']:.2f}",
+            "Target":   f"${r['target']:.2f}",
+        } for r in _pead_show])
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.caption("Score ≥ 80 = strong PEAD setup · 60–79 = solid · 50–59 = marginal. "
+                   "Higher = better confluence of beat, gap, trend, and timing.")
+    else:
+        st.info("No PEAD candidates cached. Hit **Refresh PEAD** to scan.", icon="📭")
 
     st.divider()
 

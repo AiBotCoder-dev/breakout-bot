@@ -488,22 +488,69 @@ def options_trade_score(conn, ticker: str, contract: dict,
         pts["iv_rv_spread"] = {"pts": 8, "max": 20, "label": "IV-RV unavailable"}
     total += pts["iv_rv_spread"]["pts"]
 
-    # ── Expected move vs thesis — up to 20 pts ────────────────────────────────
+    # ── Expected move vs thesis — up to 25 pts ────────────────────────────────
+    # MUCH stricter: zero credit unless thesis is meaningfully BIGGER than what
+    # the market is already pricing in. A thesis equal to implied is no edge —
+    # the option is correctly priced and buying it is a coin flip with negative EV.
     em = expected_move(ticker, contract.get("expiry"))
-    if em and thesis_move_pct is not None:
-        if thesis_move_pct > em["exp_move_pct"] * 1.3:
-            s, msg = 20, f"thesis {thesis_move_pct:.1f}% >> implied {em['exp_move_pct']:.1f}%"
-        elif thesis_move_pct > em["exp_move_pct"]:
-            s, msg = 12, f"thesis {thesis_move_pct:.1f}% > implied {em['exp_move_pct']:.1f}%"
+    if em and thesis_move_pct is not None and em["exp_move_pct"] > 0:
+        edge_x = thesis_move_pct / em["exp_move_pct"]
+        if edge_x >= 3.0:
+            s, msg = 25, f"thesis {thesis_move_pct:.1f}% = {edge_x:.1f}× implied {em['exp_move_pct']:.1f}% — STRONG EDGE"
+        elif edge_x >= 2.0:
+            s, msg = 18, f"thesis {thesis_move_pct:.1f}% = {edge_x:.1f}× implied {em['exp_move_pct']:.1f}% — solid edge"
+        elif edge_x >= 1.5:
+            s, msg = 10, f"thesis {thesis_move_pct:.1f}% = {edge_x:.1f}× implied {em['exp_move_pct']:.1f}% — marginal edge"
+        elif edge_x >= 1.0:
+            s, msg = 3,  f"thesis {thesis_move_pct:.1f}% ≈ implied {em['exp_move_pct']:.1f}% — NO real edge"
         else:
-            s, msg = 3, f"thesis {thesis_move_pct:.1f}% ≤ implied {em['exp_move_pct']:.1f}%"
-        pts["expected_move"] = {"pts": s, "max": 20, "label": msg}
+            s, msg = 0,  f"thesis {thesis_move_pct:.1f}% < implied {em['exp_move_pct']:.1f}% — SELLER FAVORED"
+        pts["expected_move"] = {"pts": s, "max": 25, "label": msg}
     elif em:
-        pts["expected_move"] = {"pts": 10, "max": 20,
-                                "label": f"implied {em['exp_move_pct']:.1f}% (no thesis)"}
+        pts["expected_move"] = {"pts": 8, "max": 25,
+                                "label": f"implied {em['exp_move_pct']:.1f}% (no thesis given)"}
     else:
-        pts["expected_move"] = {"pts": 8, "max": 20, "label": "expected move n/a"}
+        pts["expected_move"] = {"pts": 8, "max": 25, "label": "expected move n/a"}
     total += pts["expected_move"]["pts"]
+
+    # ── Capital efficiency: expected $ return per day of locked capital ──────
+    # The whole point of options vs stocks is leveraged $/day. If a $400
+    # contract is expected to return $30 over 28 days, that's $1/day per $100
+    # of capital — competitive with stocks. Below ~$0.50/$100/day, the option
+    # isn't justifying the lockup.
+    cap_pts, cap_label = 0, "n/a"
+    try:
+        if (g and em and thesis_move_pct is not None and
+                contract.get("premium") and contract.get("dte")):
+            premium = float(contract["premium"])
+            dte     = max(1, int(contract["dte"]))
+            spot    = float(contract.get("underlying_price", 0) or 0)
+            strike  = float(contract.get("strike", 0) or 0)
+            # Rough expected end-price: spot moves thesis% in option's direction
+            otype = contract.get("option_type", "call")
+            sign  = 1 if otype == "call" else -1
+            target_spot = spot * (1 + sign * thesis_move_pct / 100)
+            intrinsic = max(0.0, sign * (target_spot - strike))
+            # Crude expected premium at expiry: max(intrinsic, premium*0.1)
+            expected_end_prem = max(intrinsic, premium * 0.1)
+            expected_pnl_per_contract = (expected_end_prem - premium) * 100
+            cap_locked = premium * 100
+            if cap_locked > 0:
+                pnl_per_day_per_100 = (expected_pnl_per_contract / cap_locked * 100) / dte
+                cap_label = f"~${pnl_per_day_per_100:+.2f} per $100/day (over {dte}d)"
+                if pnl_per_day_per_100 >= 1.0:
+                    cap_pts = 10
+                elif pnl_per_day_per_100 >= 0.5:
+                    cap_pts = 6
+                elif pnl_per_day_per_100 >= 0.0:
+                    cap_pts = 2
+                else:
+                    cap_pts = 0
+                    cap_label += " — capital DESTRUCTIVE on math"
+    except Exception:
+        pass
+    pts["capital_efficiency"] = {"pts": cap_pts, "max": 10, "label": cap_label}
+    total += cap_pts
 
     # ── Greeks sanity (theta/premium ratio) — up to 15 pts ────────────────────
     g = black_scholes_greeks(
@@ -542,13 +589,19 @@ def options_trade_score(conn, ticker: str, contract: dict,
         pts["uoa"] = {"pts": 0, "max": 10, "label": "no unusual flow"}
     total += pts["uoa"]["pts"]
 
-    grade = ("A+" if total >= 85 else "A" if total >= 75 else
-             "B" if total >= 60 else "C" if total >= 45 else
-             "D" if total >= 30 else "F")
-    decision = ("BUY" if total >= 65 else "WATCH" if total >= 50 else "SKIP")
+    # Normalize to 0-100 (component max changes as we add new ones — the
+    # decision/grade thresholds stay on the 0-100 scale)
+    max_total = sum(p["max"] for p in pts.values()) or 100
+    final = round(total / max_total * 100)
+    grade = ("A+" if final >= 85 else "A" if final >= 75 else
+             "B" if final >= 60 else "C" if final >= 45 else
+             "D" if final >= 30 else "F")
+    decision = ("BUY" if final >= 65 else "WATCH" if final >= 50 else "SKIP")
 
     return {
-        "score": int(total),
+        "score": int(final),
+        "raw_score": int(total),
+        "max_score": int(max_total),
         "grade": grade,
         "decision": decision,
         "components": pts,

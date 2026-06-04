@@ -186,9 +186,16 @@ class OptionsScanner:
             "option_type":      "call",
         })
 
-        # Thesis = monthly equivalent of 6m momentum, default 5% if no momentum
+        # Thesis = expected underlying move over the option's life. Uses the
+        # 3-month-equivalent (mom_6m/3) of the strategy's measured momentum,
+        # floored at 8% so we never surface options on theses too weak to pay
+        # for the strike OTM + theta. A momentum stock putting up +60% over 6m
+        # is genuinely expected to keep ~10%/mo, not 5%/mo (1/6 of cumulative).
+        from momentum_options import MIN_THESIS_PCT
         mom6 = meta.get("mom_6m") or 0.0
-        thesis = max(3.0, abs(mom6) / 6.0 * 100) if mom6 else 5.0
+        thesis = max(MIN_THESIS_PCT, abs(mom6) / 3.0 * 100) if mom6 else MIN_THESIS_PCT
+        if thesis < MIN_THESIS_PCT:
+            return None
 
         try:
             qs = options_trade_score(self.conn, tk, {**c, "iv": c.get("iv", 0)},

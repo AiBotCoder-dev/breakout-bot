@@ -45,9 +45,11 @@ COST_CAP_PER_CONTRACT   = 5.00     # max premium per share ($500 / contract).
                                    # (semis $100-500) had no qualifying contracts.
                                    # $5 keeps the "cheap" character while letting
                                    # 5-15% OTM 2-4wk calls on mid-priced names fit.
-TARGET_DTE_MIN          = 7        # allow shorter expiries to keep contracts cheap
-TARGET_DTE_MAX          = 42
-TARGET_DTE_IDEAL        = 21       # ~3 weeks: theta tolerable, premium still small
+TARGET_DTE_MIN          = 7        # shorter so capital isn't tied up on slow theses
+TARGET_DTE_MAX          = 28       # tightened from 42 — long-dated grind kills $/day ROI
+TARGET_DTE_IDEAL        = 14       # ~2 weeks: catalyst-friendly + bounded theta drag
+MIN_THESIS_PCT          = 8.0      # don't trade options if the expected move is < 8%
+                                   # (the OTM strike + theta math doesn't pay otherwise)
 OTM_PCT_MIN             = 0.05     # 5% OTM minimum
 OTM_PCT_MAX             = 0.15     # 15% OTM maximum
 LOTTERY_SIZE_PCT        = 0.05     # 5% of options cash per ticket (lottery)
@@ -265,12 +267,22 @@ class MomentumOptionsStrategy:
             c["option_type"] = "call"
 
             # ── Quality gate via options_analytics ─────────────────────────
-            # Thesis = momentum strength as a rough proxy for expected move
-            # over the option's life (e.g., 6m mom 60% → ~5% over a month).
+            # Thesis = expected underlying move over the option's life. Uses the
+            # 3-MONTH-equivalent of 6-month momentum (mom_6m/3 ≈ 2-month forward),
+            # because a momentum stock that put up +60% over 6m is more honestly
+            # expected to move at the SAME monthly rate going forward (~10%/mo),
+            # not at 1/6 of the cumulative move. Floored at MIN_THESIS_PCT so we
+            # never trade options on thin theses (where the OTM strike + theta
+            # math can't pay off regardless of conviction).
             try:
                 from options_analytics import options_trade_score
-                # crude monthly equivalent of the 6m momentum
-                thesis = max(0.0, (r["mom_6m"] / 6.0) * 100)
+                # Forward thesis: half-window momentum is the honest read
+                thesis = max(MIN_THESIS_PCT, (r["mom_6m"] / 3.0) * 100)
+                if thesis < MIN_THESIS_PCT:
+                    print(f"  [mopts] SKIP {tk}: thesis {thesis:.1f}% < "
+                          f"floor {MIN_THESIS_PCT:.0f}% — slow mover, options "
+                          f"won't pay off enough to justify capital lockup")
+                    continue
                 qs = options_trade_score(
                     self.conn, tk,
                     {**c, "iv": (c.get("iv") or 0)},  # iv already in decimal in select_call_contract

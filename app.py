@@ -4704,22 +4704,46 @@ with tab_options:
 
         if _bs_show:
             import pandas as _pdb
+            # Live-compute thesis math for display (cheap — just expected_move)
+            def _enrich(r):
+                try:
+                    from options_analytics import expected_move
+                    em = expected_move(r["ticker"], r["expiry"]) or {}
+                    em_pct = em.get("exp_move_pct") or 0
+                    thesis = r.get("thesis_pct") or 0
+                    edge_x = (thesis / em_pct) if em_pct > 0 else 0
+                    return em_pct, edge_x
+                except Exception:
+                    return 0, 0
+            _enriched = [(r, *_enrich(r)) for r in _bs_show]
+
             df = _pdb.DataFrame([{
-                "Score":   r["quality_score"],
-                "Grade":   r["quality_grade"],
-                "Ticker":  r["ticker"],
-                "Strike":  f"${r['strike']:.0f}",
-                "Type":    r["option_type"].upper(),
-                "Expiry":  r["expiry"],
-                "DTE":     r["dte"],
-                "Prem":    f"${r['premium']:.2f}",
+                "Score":     r["quality_score"],
+                "Grade":     r["quality_grade"],
+                "Ticker":    r["ticker"],
+                "Strike":    f"${r['strike']:.0f}",
+                "Type":      r["option_type"].upper(),
+                "Expiry":    r["expiry"],
+                "DTE":       r["dte"],
+                "Prem":      f"${r['premium']:.2f}",
                 "1 contract": f"${r['premium']*100:.0f}",
-                "IV":      f"{r['iv_pct']:.0f}%",
-                "Under":   f"${r['underlying_price']:.2f}",
-                "Sources": " · ".join(r["sources"]),
-                "Decision": r["decision"],
-            } for r in _bs_show])
+                "IV":        f"{r['iv_pct']:.0f}%",
+                "Thesis":    f"{r.get('thesis_pct',0):.1f}%",
+                "Implied":   f"{em_pct:.1f}%",
+                "Edge ×":    f"{edge_x:.1f}×" if edge_x else "—",
+                "Under":     f"${r['underlying_price']:.2f}",
+                "Sources":   " · ".join(r["sources"]),
+                "Decision":  r["decision"],
+            } for (r, em_pct, edge_x) in _enriched])
             st.dataframe(df, use_container_width=True, hide_index=True, height=420)
+            st.caption(
+                "**Thesis** = expected underlying move over the option's life "
+                "(3-mo-equiv of momentum, ≥ 8% floor).  **Implied** = what the "
+                "ATM straddle is pricing in.  **Edge ×** = thesis ÷ implied — "
+                "≥ 1.5× = real edge, < 1.0× = seller-favored.  Score now includes "
+                "a capital-efficiency component ($/100/day) so slow-grind trades "
+                "get filtered out."
+            )
 
             # Per-setup expanders with the contract symbol + alert status
             st.markdown("### 🔎 Per-Trade Detail")

@@ -1646,6 +1646,40 @@ def main():
         traceback.print_exc()
         send_telegram(f"⚠️ <b>Auto-Entry Options Error</b>\n{str(exc)[:300]}")
 
+    # ── Best Options Trades scanner — meta-scan + Telegram on NEW A+/A/B setups ─
+    # Pulls underlying candidates from ALL signal sources (momentum + PEAD +
+    # whale + VIP + movers), picks best contract per name, scores via the
+    # quality engine. Telegram fires only for NEW high-quality setups (deduped).
+    # Throttled to once/hour to bound API load (full scan ~60s).
+    try:
+        from options_scanner import OptionsScanner
+        _last = conn.execute(
+            "SELECT MAX(scanned_at) FROM best_options_trades").fetchone()
+        _last_iso = _last[0] if _last else None
+        _run_scan = True
+        if _last_iso:
+            try:
+                _last_dt = datetime.fromisoformat(str(_last_iso).replace("Z", "+00:00"))
+                if (datetime.now(_last_dt.tzinfo) - _last_dt).total_seconds() < 3600:
+                    _run_scan = False
+            except Exception:
+                pass
+        if _run_scan:
+            print(f"\n  {'─'*50}")
+            print(f"  BEST OPTIONS — meta-scan across all signal sources")
+            _osc = OptionsScanner(conn)
+            rep = _osc.scan_and_alert(telegram_sender=send_telegram,
+                                      min_quality=50, alert_threshold=70)
+            print(f"  Surfaced {rep['scanned']} setup(s), "
+                  f"sent {rep['alerts_sent']} new alert(s).")
+            for r in rep["results"][:5]:
+                print(f"    {r['quality_score']:3d} {r['quality_grade']:<2}  "
+                      f"{r['ticker']:6s} ${r['strike']:.0f}{r['option_type'][0].upper()} "
+                      f"exp {r['expiry']} prem=${r['premium']:.2f} "
+                      f"[{','.join(r['sources'])}]")
+    except Exception as _oe:
+        print(f"  WARN options scanner failed: {_oe}")
+
     # ── Momentum-aligned call buyer (cheap calls on validated mom leaders) ─────
     # Buys slightly-OTM calls (5-15%, 14-42 DTE, premium ≤ $5) ONLY on names that
     # pass the validated cross-sectional momentum rank. Auto-exits at +100% TP /

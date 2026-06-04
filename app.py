@@ -4525,7 +4525,8 @@ with tab_options:
                                         max_value=50, value=1, step=1,
                                         key="opt_contracts_input")
 
-    ot_lab, ot_chain, ot_unusual, ot_strategy, ot_paper, ot_smart = st.tabs([
+    ot_best, ot_lab, ot_chain, ot_unusual, ot_strategy, ot_paper, ot_smart = st.tabs([
+        "🎯  Best Trades NOW",
         "🧪  Options Lab",
         "⛓  Chain Viewer",
         "🔥  Unusual Activity",
@@ -4533,6 +4534,107 @@ with tab_options:
         "💰  Paper Trades",
         "🏛  Smart Money",
     ])
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SUB-TAB 0 — BEST OPTIONS TRADES NOW (the meta-scanner)
+    # ─────────────────────────────────────────────────────────────────────────
+    with ot_best:
+        st.markdown("### 🎯 Best Options Trades — Right Now")
+        st.caption(
+            "ONE ranked list that pulls underlying candidates from EVERY signal "
+            "source (momentum leaders · PEAD · whale picks · VIP-mentioned · "
+            "movers), picks the best contract per name, scores via the quality "
+            "engine (IVR · IV-RV · expected move · Greeks · UOA). Telegram "
+            "fires for new A-grade setups automatically."
+        )
+        _bc1, _bc2, _bc3 = st.columns([3, 1, 1])
+        with _bc2:
+            _bs_min = st.number_input("Min quality", 0, 100, 50, key="bs_min")
+        with _bc3:
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            _bs_run = st.button("🎯 Run Scan", key="bs_btn",
+                                type="primary", use_container_width=True)
+        with _bc1:
+            st.info(
+                "Scan takes ~60–90s (pulls option chains + scores 20–40 "
+                "candidates). The monitor also runs this hourly during market "
+                "hours — Telegram alerts fire for any NEW setup with quality ≥ 70.",
+                icon="📡",
+            )
+
+        if _bs_run:
+            try:
+                from options_scanner import OptionsScanner
+                _bp = st.progress(0.0, text="Gathering candidates from all sources…")
+                def _bs_cb(i, n, t):
+                    _bp.progress(min(i / max(n, 1), 1.0), text=f"Scoring {t} ({i}/{n})")
+                with st.spinner("Pulling chains + scoring across all signal sources…"):
+                    _bs_res = OptionsScanner(conn).scan(
+                        min_quality=int(_bs_min), progress=_bs_cb)
+                    OptionsScanner(conn).persist(_bs_res)
+                _bp.empty()
+                st.success(f"Scan complete: {len(_bs_res)} setup(s) "
+                           f"at quality ≥ {_bs_min}", icon="🎯")
+            except Exception as _bse:
+                st.error(f"Scan failed: {_bse}")
+
+        try:
+            from options_scanner import OptionsScanner as _OS
+            _bs_show = _OS(conn).get_latest()
+        except Exception:
+            _bs_show = []
+
+        if _bs_show:
+            import pandas as _pdb
+            df = _pdb.DataFrame([{
+                "Score":   r["quality_score"],
+                "Grade":   r["quality_grade"],
+                "Ticker":  r["ticker"],
+                "Strike":  f"${r['strike']:.0f}",
+                "Type":    r["option_type"].upper(),
+                "Expiry":  r["expiry"],
+                "DTE":     r["dte"],
+                "Prem":    f"${r['premium']:.2f}",
+                "1 contract": f"${r['premium']*100:.0f}",
+                "IV":      f"{r['iv_pct']:.0f}%",
+                "Under":   f"${r['underlying_price']:.2f}",
+                "Sources": " · ".join(r["sources"]),
+                "Decision": r["decision"],
+            } for r in _bs_show])
+            st.dataframe(df, use_container_width=True, hide_index=True, height=420)
+
+            # Per-setup expanders with the contract symbol + alert status
+            st.markdown("### 🔎 Per-Trade Detail")
+            for r in _bs_show[:15]:
+                _g_color = {"A+": "#3fb950", "A": "#3fb950", "B": "#58a6ff",
+                            "C": "#e3b341"}.get(r["quality_grade"], "#8b949e")
+                _alert_tag = "🔔 alerted" if r.get("alerted") else "·"
+                with st.expander(
+                        f"{r['quality_grade']}  **{r['ticker']}** ${r['strike']:.0f}"
+                        f"{r['option_type'][0].upper()} exp {r['expiry']}  "
+                        f"·  score {r['quality_score']}/100  ·  {_alert_tag}",
+                        expanded=False,
+                ):
+                    st.markdown(
+                        f"<div style='background:#161b22;border-left:4px solid {_g_color};"
+                        f"border-radius:6px;padding:10px 14px;margin-bottom:6px;color:#c9d1d9'>"
+                        f"<b style='color:{_g_color}'>{r['decision']}</b> · "
+                        f"contract <code>{r['contract_symbol']}</code><br>"
+                        f"<b>Sources:</b> {' · '.join(r['sources'])}<br>"
+                        f"<b>Premium:</b> ${r['premium']:.2f} per share "
+                        f"(= <b>${r['premium']*100:.0f} per contract</b>)<br>"
+                        f"<b>Underlying:</b> ${r['underlying_price']:.2f}  ·  "
+                        f"<b>IV:</b> {r['iv_pct']:.0f}%  ·  "
+                        f"<b>DTE:</b> {r['dte']}d  ·  "
+                        f"<b>Thesis:</b> {r['thesis_pct']:.1f}% move"
+                        f"</div>", unsafe_allow_html=True,
+                    )
+            st.caption("Grade scale: **A+** = exceptional · **A** = strong setup · "
+                       "**B** = solid · **C** = marginal · **D/F** = filtered out. "
+                       "Quality ≥ 70 = Telegram alert.")
+        else:
+            st.info("No scan results yet. Hit **Run Scan** above, or wait for "
+                    "the monitor's hourly auto-scan during market hours.", icon="📭")
 
     # ─────────────────────────────────────────────────────────────────────────
     # SUB-TAB 0 — OPTIONS LAB (the new analytics)

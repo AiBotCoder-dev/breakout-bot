@@ -337,33 +337,37 @@ st.markdown("""
   #MainMenu, footer { visibility: hidden; }
   [data-testid="stToolbar"] { display:none; }
 
-  /* ── Keep the sidebar REOPEN arrow always visible + high-contrast ──
-     On the dark theme the collapsed-sidebar control renders as a near-invisible
-     dark icon on a dark background, so it looks like the sidebar can't be
-     reopened. Force it visible and give it a clearly-clickable chip style.
-     Targets multiple testids to stay robust across Streamlit versions. */
+  /* ── Keep the sidebar REOPEN button always visible + high-contrast ──
+     On the dark theme the collapsed-sidebar reopen control renders as a
+     near-invisible dark icon, so it looks like the sidebar can't be reopened.
+     Streamlit 1.5x names this control "stExpandSidebarButton" (aria-label
+     "expandSidebar"); older versions used "collapsedControl". Target both, plus
+     the header that contains it, and style it as a clearly-clickable chip. */
+  [data-testid="stExpandSidebarButton"],
   [data-testid="stSidebarCollapsedControl"],
-  [data-testid="collapsedControl"] {
-    display: flex !important;
+  [data-testid="collapsedControl"],
+  [aria-label="expandSidebar"] {
+    display: inline-flex !important;
     visibility: visible !important;
     opacity: 1 !important;
-    z-index: 1000 !important;
-  }
-  [data-testid="stSidebarCollapsedControl"] button,
-  [data-testid="collapsedControl"] button,
-  [data-testid="stSidebarCollapseButton"] button,
-  [data-testid="stSidebarCollapsedControl"] svg,
-  [data-testid="collapsedControl"] svg,
-  [data-testid="stSidebarCollapseButton"] svg {
-    color: #e6edf3 !important;
-    fill: #e6edf3 !important;
-  }
-  [data-testid="stSidebarCollapsedControl"] button,
-  [data-testid="collapsedControl"] button {
+    z-index: 999999 !important;
     background: #1c2333 !important;
     border: 1px solid #30363d !important;
     border-radius: 6px !important;
+    color: #e6edf3 !important;
   }
+  [data-testid="stExpandSidebarButton"] svg,
+  [data-testid="stExpandSidebarButton"] *,
+  [data-testid="stSidebarCollapsedControl"] svg,
+  [data-testid="collapsedControl"] svg,
+  [aria-label="expandSidebar"] svg,
+  [aria-label="expandSidebar"] * {
+    color: #e6edf3 !important;
+    fill: #e6edf3 !important;
+  }
+  /* The collapsed reopen button lives in the header — make sure the header
+     stays rendered (we only hide the top-right toolbar, not the whole header). */
+  [data-testid="stHeader"] { background: transparent !important; }
 </style>
 """, unsafe_allow_html=True)
 

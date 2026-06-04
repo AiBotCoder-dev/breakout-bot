@@ -4525,13 +4525,111 @@ with tab_options:
                                         max_value=50, value=1, step=1,
                                         key="opt_contracts_input")
 
-    ot_chain, ot_unusual, ot_strategy, ot_paper, ot_smart = st.tabs([
+    ot_lab, ot_chain, ot_unusual, ot_strategy, ot_paper, ot_smart = st.tabs([
+        "🧪  Options Lab",
         "⛓  Chain Viewer",
         "🔥  Unusual Activity",
         "🎯  Strategy Builder",
         "💰  Paper Trades",
         "🏛  Smart Money",
     ])
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SUB-TAB 0 — OPTIONS LAB (the new analytics)
+    # ─────────────────────────────────────────────────────────────────────────
+    with ot_lab:
+        st.markdown("### 🧪 Options Lab — IV Rank · Expected Move · Greeks · Flow")
+        st.caption(
+            "The data the bot uses to filter options trades. IV Rank tells you "
+            "if vol is cheap or expensive. Expected Move shows what the market "
+            "is pricing in. IV-RV spread is the Goyal-Saretto cheap-options "
+            "edge. Greeks are real risk. UOA is smart-money flow."
+        )
+        _ol_t = (opt_ticker or "NVDA").strip().upper()
+        if st.button("🧪 Analyze", key="ol_btn", type="primary"):
+            try:
+                from options_analytics import full_report
+                with st.spinner(f"Pulling chain + computing analytics for {_ol_t}…"):
+                    _ol = full_report(conn, _ol_t)
+                st.session_state["_ol_last"] = _ol
+            except Exception as _ole:
+                st.error(f"Analysis failed: {_ole}")
+        _ol = st.session_state.get("_ol_last")
+
+        if _ol:
+            _ivr = _ol.get("iv_rank") or {}
+            _em  = _ol.get("exp_move") or {}
+            _rv  = _ol.get("iv_rv") or {}
+            _uoa = _ol.get("uoa") or []
+
+            # IV Rank
+            st.markdown(f"#### IV Analysis — {_ol['ticker']}")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("IV now", f"{_ivr.get('iv_now', 0):.1f}%")
+            c2.metric("IV Rank", f"{_ivr.get('iv_rank_pct', 0):.0f}%",
+                      delta=("low — buy zone"  if _ivr.get('iv_rank_pct', 100) <= 30 else
+                             "medium"          if _ivr.get('iv_rank_pct', 0) <= 70 else
+                             "HIGH — avoid buys"),
+                      delta_color=("normal" if _ivr.get('iv_rank_pct', 100) <= 50 else "inverse"))
+            c3.metric("Source",
+                      _ivr.get("source", "?"),
+                      delta=f"{_ivr.get('n', 0)} snapshots")
+            c4.metric("52-wk range",
+                      f"{_ivr.get('iv_min', 0):.0f}–{_ivr.get('iv_max', 0):.0f}%")
+
+            # Expected Move
+            if _em:
+                st.markdown(f"#### Expected Move ({_em.get('dte', 0)}d to "
+                            f"{_em.get('expiry', '')})")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Spot", f"${_em['spot']:.2f}")
+                c2.metric("ATM Straddle", f"${_em['straddle_price']:.2f}",
+                          delta=f"±{_em['exp_move_pct']:.1f}%")
+                c3.metric("Implied range",
+                          f"${_em['lower']:.2f} – ${_em['upper']:.2f}")
+                st.caption(f"Your thesis must move the stock MORE than "
+                           f"±{_em['exp_move_pct']:.1f}% over {_em['dte']}d to "
+                           f"beat the straddle. Less than that, sellers win.")
+
+            # IV-RV Spread
+            if _rv:
+                _sig_color = {"cheap": "#3fb950", "neutral": "#58a6ff",
+                              "expensive": "#e3b341", "rich": "#f85149"}.get(_rv.get("signal"), "#8b949e")
+                _sig_msg = {"cheap": "BUYER FAVORED — Goyal-Saretto edge",
+                            "neutral": "Fairly priced",
+                            "expensive": "Seller favored",
+                            "rich": "VOL TOO RICH — avoid long premium"}.get(_rv.get("signal"), "")
+                st.markdown(
+                    f"<div style='background:#161b22;border-left:5px solid {_sig_color};"
+                    f"border-radius:6px;padding:10px 14px;margin:6px 0'>"
+                    f"<b>IV-RV Spread:</b> IV {_rv['iv_pct']}% vs realized {_rv['rv30_pct']}% "
+                    f"= <b>{_rv['spread_pct']:+.1f}pt</b>  →  <b style='color:{_sig_color}'>"
+                    f"{_rv.get('signal','').upper()}</b>  ·  {_sig_msg}"
+                    f"</div>", unsafe_allow_html=True)
+
+            # UOA
+            st.markdown("#### Unusual Options Activity (smart-money flow)")
+            if _uoa:
+                import pandas as _pdol
+                df = _pdol.DataFrame([{
+                    "Type":      u["type"].upper(),
+                    "Strike":    f"${u['strike']:.2f}",
+                    "Expiry":    u["expiry"],
+                    "Vol":       u["volume"],
+                    "OI":        u["open_interest"],
+                    "Vol/OI":    f"{u['vol_oi_ratio']:.1f}×",
+                    "Premium":   f"${u['premium']:.2f}",
+                    "IV":        f"{u['iv_pct']:.0f}%",
+                } for u in _uoa])
+                st.dataframe(df, use_container_width=True, hide_index=True)
+                st.caption("Vol/OI > 3× = unusual. Concentrated calls = bullish positioning; "
+                           "concentrated puts = bearish or hedge.")
+            else:
+                st.info("No unusual flow detected on the nearest 4 expiries.", icon="📭")
+        else:
+            st.info(f"Enter a ticker above and hit **Analyze** to see IV Rank, "
+                    f"Expected Move, IV-RV spread, and Unusual Activity for any "
+                    f"name. Defaults to {_ol_t}.", icon="🧪")
 
     # ─────────────────────────────────────────────────────────────────────────
     # SUB-TAB 1 — CHAIN VIEWER

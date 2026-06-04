@@ -1208,6 +1208,23 @@ def main():
     except Exception as _be:
         print(f"  WARN benchmark snapshot failed: {_be}")
 
+    # ── Daily IV snapshot — builds historical IV record for true IV Rank ───────
+    # Cheap if we only do it once per calendar day. The bot's iv_snapshots table
+    # is what makes IV Rank progressively more accurate over time (vs the HV
+    # proxy used until ~30+ days of history exist).
+    try:
+        from options_analytics import snapshot_iv
+        row = conn.execute(
+            "SELECT MAX(snapshot_date) FROM iv_snapshots").fetchone()
+        last = row[0] if row else None
+        today_iso = datetime.now().strftime("%Y-%m-%d")
+        if (not last) or (str(last)[:10] != today_iso):
+            print(f"\n  IV SNAPSHOT — building historical IV record (one-per-day)")
+            n_iv = snapshot_iv(conn, OPTIONS_AUTO_WATCHLIST)
+            print(f"  IV snapshots recorded: {n_iv}")
+    except Exception as _ive:
+        print(f"  WARN IV snapshot failed: {_ive}")
+
     # ── Whale-watch outcomes — cheap forward P&L update (every cycle) ──────────
     # The expensive `build()` (4 APIs × ~125 tickers) is dashboard-button only;
     # here we just refresh live prices for already-detected picks so the

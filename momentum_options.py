@@ -231,20 +231,25 @@ class MomentumOptionsStrategy:
 
     # ── find setups (callable from monitor or dashboard) ───────────────────────
     def find_setups(self, top_n_underlyings: int = 8, ranked: list | None = None,
-                    progress=None) -> list:
-        """Return a list of clean lottery-call setups on momentum leaders."""
+                    progress=None, min_quality_score: int = 55) -> list:
+        """
+        Return a list of clean lottery-call setups on momentum leaders, now
+        FILTERED by the options_trade_score quality gate (IV rank + IV-RV +
+        expected move + Greeks + UOA). Rejects rich-IV / theta-cliff / against-
+        the-flow setups that the old simple gate let through.
+        """
         if ranked is None:
             from momentum_strategy import MomentumStrategy
-            ranked = MomentumStrategy(self.conn).rank(top_n=top_n_underlyings + 4,
+            ranked = MomentumStrategy(self.conn).rank(top_n=top_n_underlyings + 6,
                                                      min_mom_6m=0.10)
         setups = []
-        for i, r in enumerate(ranked[: top_n_underlyings + 4]):
+        for i, r in enumerate(ranked[: top_n_underlyings + 6]):
             if len(setups) >= top_n_underlyings:
                 break
             tk = r["ticker"]
             if progress:
                 try:
-                    progress(i + 1, top_n_underlyings + 4, tk)
+                    progress(i + 1, top_n_underlyings + 6, tk)
                 except Exception:
                     pass
             if "." in tk:                                # liquid US only
@@ -257,6 +262,35 @@ class MomentumOptionsStrategy:
             c["underlying_price"] = r["price"]
             c["mom_6m"] = r["mom_6m"]
             c["mom_3m"] = r["mom_3m"]
+            c["option_type"] = "call"
+
+            # ── Quality gate via options_analytics ─────────────────────────
+            # Thesis = momentum strength as a rough proxy for expected move
+            # over the option's life (e.g., 6m mom 60% → ~5% over a month).
+            try:
+                from options_analytics import options_trade_score
+                # crude monthly equivalent of the 6m momentum
+                thesis = max(0.0, (r["mom_6m"] / 6.0) * 100)
+                qs = options_trade_score(
+                    self.conn, tk,
+                    {**c, "iv": (c.get("iv") or 0)},  # iv already in decimal in select_call_contract
+                    thesis_move_pct=thesis,
+                )
+                c["quality_score"]   = qs["score"]
+                c["quality_grade"]   = qs["grade"]
+                c["quality_decision"] = qs["decision"]
+                c["quality_breakdown"] = qs["components"]
+                if qs["score"] < min_quality_score:
+                    print(f"  [mopts] SKIP {tk}: quality {qs['score']}/100 ({qs['grade']}) — "
+                          f"IVR/theta/flow not favorable")
+                    continue
+            except Exception as _qe:
+                # If analytics fails, keep the legacy behavior (don't block)
+                c["quality_score"] = None
+                c["quality_grade"] = "?"
+                c["quality_decision"] = "?"
+                print(f"  [mopts] quality scoring unavailable for {tk}: {_qe}")
+
             setups.append(c)
         return setups
 

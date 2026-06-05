@@ -49,6 +49,20 @@ IV_HARD_CEILING = 1.40                     # puts carry skew → allow a touch h
 TAKE_PROFIT_PCT, STOP_LOSS_PCT, TIME_STOP_DAYS = 100.0, -50.0, 10
 STRATEGY_LABEL = "bearish_put"
 
+# Per-stock backtest (4y) finding: individual high-beta names crash 10-30x more
+# often than SPY (COIN 31.6% of 5-day windows drop >5%, vs SPY's 1.2%). Puts have
+# a FAT LEFT TAIL on these and are dead money on low-vol names (KO 0.5%). So the
+# put engine PRIORITIZES high-crash-fuel names. This is the curated priority set
+# (sorted roughly by historical big-drop frequency); the ranking also weights by
+# live realized volatility so the list stays adaptive.
+PUT_PRIORITY_UNIVERSE = [
+    "COIN","SMCI","ARM","TSLA","PLTR","INTC","MU","NVDA","AMD","MARA","RIOT",
+    "MSTR","SHOP","NFLX","META","AMAT","QCOM","CRM","BA","NKE","DIS","PYPL",
+    "SNOW","DDOG","NET","CRWD","RBLX","HOOD","UBER","AVGO","ORCL","MRVL",
+]
+MIN_BIG_DROP_VOL = 35.0   # only put on names with annualized realized vol >= this%
+                          # (filters out the KO/PG/MCD types where puts are pointless)
+
 # Backtested stats for honest UI disclosure
 SETUP_STATS = {
     "OVERBOUGHT_DOWNTREND": {"label": "Overbought in downtrend (RSI>70, <200SMA)",
@@ -139,10 +153,21 @@ def bearish_signal(df: pd.DataFrame) -> dict | None:
             "in_downtrend": in_downtrend}
 
 
-def bearish_rank(conn=None, top_n: int = 10, progress=None) -> list:
-    """Weakest names in a confirmed downtrend — ranked most-bearish first."""
+def bearish_rank(conn=None, top_n: int = 10, progress=None,
+                 priority_only: bool = True) -> list:
+    """
+    Weakest names in a confirmed downtrend, PRIORITIZING high-crash-fuel names.
+
+    Per-stock backtest: puts only have real fat-tail potential on high-volatility
+    names. So we scan the priority universe first, require realized vol >=
+    MIN_BIG_DROP_VOL, and rank by (negative momentum × volatility) — i.e. weak
+    AND crash-prone floats to the top. Low-vol names (where puts are dead money)
+    are filtered out entirely.
+    """
     rows = []
-    uni = [t for t in LIQUID_UNIVERSE if "." not in t]
+    uni = list(PUT_PRIORITY_UNIVERSE)
+    if not priority_only:
+        uni += [t for t in LIQUID_UNIVERSE if "." not in t and t not in uni]
     for i, t in enumerate(uni):
         if progress:
             try: progress(i + 1, len(uni), t)
@@ -151,16 +176,20 @@ def bearish_rank(conn=None, top_n: int = 10, progress=None) -> list:
         sig = bearish_signal(df)
         if not sig or not sig["in_downtrend"]:
             continue
-        # ATR for stop sizing
+        # Realized vol (crash-fuel proxy) — filter out low-vol names
+        rv = float(df["Close"].pct_change().dropna().iloc[-60:].std() * (252 ** 0.5) * 100)
+        if rv < MIN_BIG_DROP_VOL:
+            continue
         high, low, cl = df["High"], df["Low"], df["Close"]
         tr = pd.concat([(high-low), (high-cl.shift()).abs(), (low-cl.shift()).abs()],
                        axis=1).max(axis=1)
         atr = float(tr.rolling(14).mean().iloc[-1] or sig["price"]*0.02)
         price = sig["price"]
         rows.append({
-            "ticker": t, "score": -sig["mom_6m"],   # most negative momentum = top
+            # rank = weakness × crash-fuel (more negative momentum AND higher vol = top)
+            "ticker": t, "score": (-sig["mom_6m"]) * (rv / 50.0),
             "mom_6m": sig["mom_6m"], "mom_3m": sig["mom_3m"], "rsi": sig["rsi"],
-            "price": price,
+            "realized_vol": round(rv, 0), "price": price,
             "stop": round(price + 2*atr, 2),          # stop ABOVE for a put
             "target": round(price * 0.85, 2),         # 15% down target
             "sma50": sig["sma50"], "sma200": sig["sma200"],

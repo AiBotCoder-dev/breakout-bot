@@ -4806,6 +4806,7 @@ with tab_options:
             df = _pdp.DataFrame([{
                 "Ticker": p["ticker"],
                 "6-mo %": f"{p['mom_6m']*100:+.0f}%",
+                "Vol%": f"{p.get('realized_vol', 0):.0f}",
                 "RSI": f"{p['rsi']:.0f}",
                 "Strike": f"${p['contract']['strike']:.0f}P",
                 "Expiry": p["contract"]["expiry"],

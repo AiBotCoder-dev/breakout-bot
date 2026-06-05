@@ -4713,8 +4713,10 @@ with tab_options:
                                         max_value=50, value=1, step=1,
                                         key="opt_contracts_input")
 
-    ot_best, ot_perf, ot_lab, ot_chain, ot_unusual, ot_strategy, ot_paper, ot_smart = st.tabs([
+    (ot_best, ot_short, ot_perf, ot_lab, ot_chain, ot_unusual,
+     ot_strategy, ot_paper, ot_smart) = st.tabs([
         "🎯  Best Trades NOW",
+        "⚡  Short-Term",
         "📊  Performance",
         "🧪  Options Lab",
         "⛓  Chain Viewer",
@@ -4723,6 +4725,83 @@ with tab_options:
         "💰  Paper Trades",
         "🏛  Smart Money",
     ])
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SUB-TAB — SHORT-TERM REVERSAL OPTIONS (backtested fat-tail setups)
+    # ─────────────────────────────────────────────────────────────────────────
+    with ot_short:
+        st.markdown("### ⚡ Short-Term Reversal Calls — Backtested Setups")
+        st.caption(
+            "Short-DTE (1–7 day) calls on the ONLY short-horizon setups that "
+            "survived a 3-year backtest with a real fat right tail: market "
+            "capitulation + single-name reversals. Uses ATM/slightly-ITM "
+            "contracts (high delta) because a 2–3 day hold has no time for a "
+            "far-OTM lottery to come good."
+        )
+        st.markdown(
+            "<div style='background:#3d2a0e;border-left:5px solid #e3b341;"
+            "border-radius:6px;padding:10px 14px;margin:6px 0;color:#c9d1d9;font-size:0.88em'>"
+            "<b>⚠️ Honest expectancy:</b> this is a defined-risk LOTTERY, not a "
+            "money printer. The underlying edge is ~1–1.3% over baseline; the "
+            "'crazy returns' live only in the right tail (p90 +12% underlying → "
+            "+200–400% on the call) and only on rare high-conviction days. Expect "
+            "most tickets to lose. Setups that FAILED the backtest (momentum-thrust "
+            "chasing, inside-day breaks, oversold bounces) are deliberately excluded."
+            "</div>", unsafe_allow_html=True)
+
+        # Backtested edge reference table
+        with st.expander("📊 The backtested edge behind each setup", expanded=False):
+            st.markdown(
+                "| Setup | Horizon | Win% | Forward edge | Right tail |\n"
+                "|---|---|---|---|---|\n"
+                "| Market capitulation (SPY −5% day) | 1–2d | **83%** | +3.4%/day | calls +200–400% |\n"
+                "| Extreme fear (VIX ≥ 40) | 5–20d | **90%** | +8% (20d) | strongest signal |\n"
+                "| Gap-down reversal (gap<−2%, RSI<40) | 2–3d | 54% | +1.3% vs base | p90 +12% |\n"
+                "| Post-panic bounce (prior −4%, today green) | 2–3d | 51% | +1.0% vs base | p90 +12% |\n"
+            )
+
+        if st.button("⚡ Scan Short-Term Setups", key="st_scan_btn",
+                     type="primary"):
+            try:
+                from short_term_options import ShortTermOptionsStrategy
+                _sp = st.progress(0.0, text="Scanning for reversal setups…")
+                def _st_cb(i, n, t):
+                    _sp.progress(min(i / max(n, 1), 1.0), text=f"{t} ({i}/{n})")
+                with st.spinner("Checking market panic + single-name reversals…"):
+                    _st_plays = ShortTermOptionsStrategy(conn).scan(progress=_st_cb)
+                _sp.empty()
+                st.session_state["_st_plays"] = _st_plays
+            except Exception as _se:
+                st.error(f"Scan failed: {_se}")
+
+        _st_plays = st.session_state.get("_st_plays")
+        if _st_plays is None:
+            st.info("Hit **Scan Short-Term Setups**. Most days this finds nothing — "
+                    "the edge only exists on capitulation/reversal days, and the "
+                    "discipline is waiting for them.", icon="⏳")
+        elif not _st_plays:
+            st.success("No short-term reversal setups firing right now — that's the "
+                       "correct answer on a calm day. Don't force a trade.", icon="✅")
+        else:
+            st.success(f"{len(_st_plays)} short-term setup(s) firing", icon="⚡")
+            for p in _st_plays:
+                c = p["contract"]; stt = p["stats"]
+                with st.expander(
+                        f"⚡ **{p['ticker']}** — {stt['label']}  ·  "
+                        f"${c['strike']:.0f}C exp {c['expiry']} ({c['dte']}d)  "
+                        f"${c['premium']:.2f}", expanded=True):
+                    st.markdown(
+                        f"- **Setup:** {stt['label']}  ·  hist win **{stt['win']}%**  ·  "
+                        f"forward {stt['fwd']}\n"
+                        f"- **Contract:** {c['strike']:.0f}C exp {c['expiry']} "
+                        f"({c['dte']}d, {c['moneyness']:+.1f}% moneyness)  ·  "
+                        f"IV {c['iv']*100:.0f}%  ·  vol {c['volume']} / OI {c['open_interest']}\n"
+                        f"- **Cost:** ${c['premium']:.2f}/sh = **${c['premium']*100:.0f} per contract**\n"
+                        f"- **Exit rules:** +75% take profit · −40% stop · hard time-stop 3 days\n"
+                        f"- **Tail:** {stt['tail']}")
+        st.caption("Exit discipline is everything here: +75% TP / −40% stop / "
+                   "force-close after 3 trading days. The edge is measured over "
+                   "1–3 days; holding longer just feeds theta.")
 
     # ─────────────────────────────────────────────────────────────────────────
     # SUB-TAB 1 — OPTIONS PERFORMANCE TRACKER + EMPIRICAL PROBABILITY

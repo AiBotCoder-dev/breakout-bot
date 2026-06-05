@@ -1696,6 +1696,29 @@ def main():
     except Exception as _pde:
         print(f"  WARN panic detector failed: {_pde}")
 
+    # ── SHORT-TERM REVERSAL OPTIONS — alert on backtested capitulation setups ──
+    # Cheap market-wide check (2 downloads). Fires only on the strongest, rarest
+    # short-horizon edges (SPY -5% day = 83% win +3.4%/d; VIX>=40 = 90% win).
+    # Single-name reversal scan stays dashboard-button only (too slow per cycle).
+    try:
+        from short_term_options import market_panic_signals, select_short_dte_call
+        _st_sigs = market_panic_signals()
+        for _sig in _st_sigs:
+            _c = select_short_dte_call("SPY", _sig.get("price") or 0)
+            _stt = _sig["stats"]
+            _line = (f"\nSuggested: SPY ${_c['strike']:.0f}C exp {_c['expiry']} "
+                     f"({_c['dte']}d) @ ${_c['premium']:.2f}" if _c else "")
+            send_telegram(
+                f"⚡ <b>SHORT-TERM SETUP: {_stt['label']}</b>\n"
+                f"Historical win rate: <b>{_stt['win']}%</b>  ·  forward {_stt['fwd']}\n"
+                f"This is the strongest short-horizon edge we have. Consider a "
+                f"1–7 DTE ATM/ITM call on SPY/QQQ. Exit +75% / -40% / 3-day stop."
+                f"{_line}"
+            )
+            print(f"  ⚡ SHORT-TERM SETUP fired: {_sig['setup']}")
+    except Exception as _ste:
+        print(f"  WARN short-term options check failed: {_ste}")
+
     # ── EVENT-DRIVEN OPTIONS EXITS — close on external risk BEFORE new entries ─
     # External factors that should close an open options position regardless of
     # P&L: bearish VIP post about the underlying, high-impact negative news,

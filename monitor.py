@@ -1696,6 +1696,38 @@ def main():
     except Exception as _pde:
         print(f"  WARN panic detector failed: {_pde}")
 
+    # ── PUT ENGINE REGIME GATE — alert when puts become active (bearish flip) ──
+    # Puts lose in bull markets (backtested), so they're gated to bear/neutral
+    # regime. Alert once when the gate OPENS (SPY drops to/below 200-SMA) — that's
+    # the state change worth knowing; detailed put scanning stays dashboard-only.
+    try:
+        from put_engine import market_allows_puts
+        _pg = market_allows_puts()
+        _pg_state = "active" if _pg.get("allowed") else "holstered"
+        _prev = None
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS put_regime_state "
+                         "(id INTEGER PRIMARY KEY, state TEXT, updated TEXT)")
+            _r = conn.execute("SELECT state FROM put_regime_state WHERE id=1").fetchone()
+            _prev = (_r[0] if not hasattr(_r, "get") else _r.get("state")) if _r else None
+        except Exception:
+            pass
+        if _prev != _pg_state:
+            conn.execute("INSERT INTO put_regime_state (id, state, updated) "
+                         "VALUES (1,?,?) ON CONFLICT(id) DO UPDATE SET "
+                         "state=excluded.state, updated=excluded.updated",
+                         (_pg_state, datetime.now().isoformat()))
+            if _pg_state == "active" and _prev is not None:
+                send_telegram(
+                    f"🔻 <b>PUT ENGINE ACTIVE</b>\n"
+                    f"Regime flipped to <b>{_pg.get('regime')}</b> — {_pg.get('reason')}\n"
+                    f"Puts are now in-play. Check the 🔻 Puts tab for bearish setups. "
+                    f"(Reminder: even in a bear regime, individual puts are a fat-tail "
+                    f"coin-flip, not a sure thing.)")
+                print(f"  🔻 PUT ENGINE now ACTIVE (regime {_pg.get('regime')})")
+    except Exception as _pge:
+        print(f"  WARN put regime check failed: {_pge}")
+
     # ── SHORT-TERM REVERSAL OPTIONS — alert on backtested capitulation setups ──
     # Cheap market-wide check (2 downloads). Fires only on the strongest, rarest
     # short-horizon edges (SPY -5% day = 83% win +3.4%/d; VIX>=40 = 90% win).

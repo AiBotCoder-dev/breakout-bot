@@ -4713,10 +4713,11 @@ with tab_options:
                                         max_value=50, value=1, step=1,
                                         key="opt_contracts_input")
 
-    (ot_best, ot_short, ot_perf, ot_lab, ot_chain, ot_unusual,
+    (ot_best, ot_short, ot_puts, ot_perf, ot_lab, ot_chain, ot_unusual,
      ot_strategy, ot_paper, ot_smart) = st.tabs([
         "🎯  Best Trades NOW",
         "⚡  Short-Term",
+        "🔻  Puts",
         "📊  Performance",
         "🧪  Options Lab",
         "⛓  Chain Viewer",
@@ -4725,6 +4726,99 @@ with tab_options:
         "💰  Paper Trades",
         "🏛  Smart Money",
     ])
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SUB-TAB — PUT ENGINE (bearish, regime-gated)
+    # ─────────────────────────────────────────────────────────────────────────
+    with ot_puts:
+        st.markdown("### 🔻 Put Engine — Bearish (Regime-Gated)")
+        st.caption(
+            "The bearish counterpart to the call engines. Backtesting was blunt: "
+            "most bearish setups LOSE because markets drift up and weakness bounces. "
+            "So puts are GATED to where they actually work — bear/neutral regime, "
+            "real catalysts, and the 2 setups that survived testing."
+        )
+        st.markdown(
+            "<div style='background:#3d1414;border-left:5px solid #f85149;"
+            "border-radius:6px;padding:10px 14px;margin:6px 0;color:#c9d1d9;font-size:0.88em'>"
+            "<b>⚠️ Honest truth from the backtest:</b> shorting breakdowns (+0.84%/3d), "
+            "weakness (+0.70%/3d), and death crosses (+1.45%/5d) all <b>made money for "
+            "the other side</b> — they bounce. Puts are NOT a standalone trend strategy. "
+            "This engine holsters itself in confirmed bull markets and only activates "
+            "on bearish regime + catalysts + the 2 validated setups (overbought-in-"
+            "downtrend, failed gap-up)."
+            "</div>", unsafe_allow_html=True)
+
+        try:
+            from put_engine import market_allows_puts, PutEngine
+            _gate = market_allows_puts()
+        except Exception as _pe:
+            _gate = {"allowed": False, "regime": "?", "reason": str(_pe)}
+
+        _gc = "#3fb950" if not _gate.get("allowed") else "#f85149"
+        st.markdown(
+            f"<div style='background:#161b22;border-left:5px solid {_gc};"
+            f"border-radius:6px;padding:10px 14px;margin:6px 0;color:#c9d1d9'>"
+            f"<b>Regime gate:</b> {_gate.get('regime','?')}  ·  "
+            f"puts <b>{'ACTIVE' if _gate.get('allowed') else 'HOLSTERED'}</b><br>"
+            f"<span style='color:#8b949e;font-size:0.88em'>{_gate.get('reason','')}</span>"
+            f"</div>", unsafe_allow_html=True)
+
+        _pc1, _pc2 = st.columns([2, 1])
+        with _pc1:
+            _force = st.checkbox(
+                "Force scan (override gate — only for a specific bearish catalyst "
+                "you're acting on, e.g. bad CPI print, Fed shock, tariff news)",
+                value=False, key="put_force")
+        with _pc2:
+            _put_btn = st.button("🔻 Scan Puts", key="put_scan_btn",
+                                 type="primary", use_container_width=True)
+
+        if _put_btn:
+            try:
+                _pp = st.progress(0.0, text="Scanning downtrend names…")
+                def _p_cb(i, n, t):
+                    _pp.progress(min(i/max(n,1), 1.0), text=f"{t} ({i}/{n})")
+                with st.spinner("Ranking bearish candidates + selecting puts…"):
+                    _put_res = PutEngine(conn).scan(top_n=8, progress=_p_cb,
+                                                    force=_force)
+                _pp.empty()
+                st.session_state["_put_res"] = _put_res
+            except Exception as _pse:
+                st.error(f"Put scan failed: {_pse}")
+
+        _put_res = st.session_state.get("_put_res")
+        if _put_res is None:
+            st.info("Hit **Scan Puts**. In a bull market this stays empty by design — "
+                    "the discipline is NOT shorting strength.", icon="⏳")
+        elif not _put_res.get("plays"):
+            if not _put_res.get("allowed"):
+                st.success("Puts holstered by the regime gate — correct in a bull "
+                           "market. Tick **Force scan** only if you have a specific "
+                           "bearish catalyst.", icon="✅")
+            else:
+                st.info("Regime allows puts but no downtrend candidates with clean "
+                        "contracts right now.", icon="📭")
+        else:
+            st.warning(f"{len(_put_res['plays'])} put play(s) — regime "
+                       f"{_put_res.get('regime')}", icon="🔻")
+            import pandas as _pdp
+            df = _pdp.DataFrame([{
+                "Ticker": p["ticker"],
+                "6-mo %": f"{p['mom_6m']*100:+.0f}%",
+                "RSI": f"{p['rsi']:.0f}",
+                "Strike": f"${p['contract']['strike']:.0f}P",
+                "Expiry": p["contract"]["expiry"],
+                "DTE": p["contract"]["dte"],
+                "Prem": f"${p['contract']['premium']:.2f}",
+                "1 ctr": f"${p['contract']['premium']*100:.0f}",
+                "IV": f"{p['contract']['iv']*100:.0f}%",
+                "Quality": f"{p['contract'].get('quality_score','?')}",
+            } for p in _put_res["plays"]])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.caption("Put exits mirror calls: +100% TP / −50% stop. Remember the "
+                       "backtest — even in a bear regime, individual-name puts are a "
+                       "coin-flip with a fat tail, not a sure thing.")
 
     # ─────────────────────────────────────────────────────────────────────────
     # SUB-TAB — SHORT-TERM REVERSAL OPTIONS (backtested fat-tail setups)

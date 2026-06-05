@@ -1015,10 +1015,17 @@ with st.sidebar:
                     _ai_ctx["vix"] = ts.get_vix_level()
                 except Exception:
                     pass
-                # SPY regime from cached ctx if available
+                # SPY market regime (computed fresh; previously referenced an
+                # undefined `_ctx` so this silently never populated)
                 try:
-                    if "_ctx" in dir() and isinstance(_ctx, dict):
-                        _ai_ctx["regime"] = _ctx.get("regime")
+                    import yfinance as _yf_reg
+                    _spy = _yf_reg.download("SPY", period="1y", interval="1d",
+                                            progress=False, auto_adjust=True)
+                    if _spy is not None and not _spy.empty:
+                        if isinstance(_spy.columns, pd.MultiIndex):
+                            _spy.columns = _spy.columns.get_level_values(0)
+                        _reg = ts.MarketRegimeDetector.detect(_spy)
+                        _ai_ctx["regime"] = _reg.get("regime") or _reg.get("label")
                 except Exception:
                     pass
                 # Recent scan picks
@@ -2637,7 +2644,7 @@ with tab_mgmt:
                                   len(_passing) > 0,
                                   f"{len(_passing)} of {len(_plays)}"))
                     # Gate 5: watchlist available
-                    from monitor import OPTIONS_AUTO_WATCHLIST
+                    from monitor import OPTIONS_AUTO_WATCHLIST, OPTIONS_MIN_CASH
                     _rep.append((f"Watchlist ({len(OPTIONS_AUTO_WATCHLIST)} tickers)",
                                   True,
                                   f"Always evaluated: {', '.join(OPTIONS_AUTO_WATCHLIST[:6])}…"))

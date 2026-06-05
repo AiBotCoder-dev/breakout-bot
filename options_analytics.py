@@ -513,6 +513,18 @@ def options_trade_score(conn, ticker: str, contract: dict,
         pts["expected_move"] = {"pts": 8, "max": 25, "label": "expected move n/a"}
     total += pts["expected_move"]["pts"]
 
+    # Greeks computed up-front so BOTH the capital-efficiency gate below and the
+    # greeks component further down can use it. (Previously `g` was referenced in
+    # the capital-efficiency block before it was defined, so that block always
+    # raised NameError, got swallowed, and silently scored 0/"n/a".)
+    g = black_scholes_greeks(
+        contract.get("underlying_price", 0) or 0,
+        contract.get("strike", 0) or 0,
+        int(contract.get("dte", 0) or 0),
+        float(contract.get("iv", 0) or 0),
+        contract.get("option_type", "call"),
+    )
+
     # ── Capital efficiency: expected $ return per day of locked capital ──────
     # The whole point of options vs stocks is leveraged $/day. If a $400
     # contract is expected to return $30 over 28 days, that's $1/day per $100
@@ -553,13 +565,7 @@ def options_trade_score(conn, ticker: str, contract: dict,
     total += cap_pts
 
     # ── Greeks sanity (theta/premium ratio) — up to 15 pts ────────────────────
-    g = black_scholes_greeks(
-        contract.get("underlying_price", 0) or 0,
-        contract.get("strike", 0) or 0,
-        int(contract.get("dte", 0) or 0),
-        float(contract.get("iv", 0) or 0),
-        contract.get("option_type", "call"),
-    )
+    # `g` was computed up-front (above) so the capital-efficiency gate could use it.
     if g and contract.get("premium"):
         # daily theta as % of premium per day — lower = better
         theta_burn_pct = abs(g["theta_per_day"]) / max(contract["premium"], 0.01) * 100

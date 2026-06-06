@@ -40,4 +40,7 @@ jobs:
           OPENROUTER_API_KEY:    ${{ secrets.OPENROUTER_API_KEY }}
           ALPACA_API_KEY:        ${{ secrets.ALPACA_API_KEY }}
           ALPACA_API_SECRET:     ${{ secrets.ALPACA_API_SECRET }}
+          BROKER_MODE:           ${{ secrets.BROKER_MODE }}
+          ALPACA_PAPER_KEY:      ${{ secrets.ALPACA_PAPER_KEY }}
+          ALPACA_PAPER_SECRET:   ${{ secrets.ALPACA_PAPER_SECRET }}
         run: python daily_briefing.py

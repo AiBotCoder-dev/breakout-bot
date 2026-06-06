@@ -47,4 +47,10 @@ jobs:
           # Sign up free: https://alpaca.markets/
           ALPACA_API_KEY:        ${{ secrets.ALPACA_API_KEY }}
           ALPACA_API_SECRET:     ${{ secrets.ALPACA_API_SECRET }}
+          # Broker (paper) auto-trading. BROKER_MODE=alpaca_paper routes
+          # auto-entries to a real Alpaca PAPER account. Paper keys fall back to
+          # ALPACA_API_KEY/SECRET if dedicated paper keys aren't set.
+          BROKER_MODE:           ${{ secrets.BROKER_MODE }}
+          ALPACA_PAPER_KEY:      ${{ secrets.ALPACA_PAPER_KEY }}
+          ALPACA_PAPER_SECRET:   ${{ secrets.ALPACA_PAPER_SECRET }}
         run: python monitor.py

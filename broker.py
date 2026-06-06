@@ -324,6 +324,67 @@ class AlpacaPaperBroker:
     def held_option_underlyings(self) -> set:
         return {p["underlying"] for p in self.get_option_positions()}
 
+    # ── OPTIONS EXIT MANAGER — autonomous position management ──────────────────
+    @staticmethod
+    def parse_occ_symbol(symbol: str) -> dict | None:
+        """
+        Parse an OCC option symbol like 'NVDA260612C00212000' into
+        {underlying, expiry (date), type, strike}. Format from the end:
+        [8-digit strike (price*1000)][1 char C/P][6-digit YYMMDD][underlying].
+        """
+        from datetime import datetime as _dt
+        try:
+            s = symbol.strip().upper()
+            strike = int(s[-8:]) / 1000.0
+            opt_type = "call" if s[-9] == "C" else "put"
+            ymd = s[-15:-9]
+            expiry = _dt.strptime(ymd, "%y%m%d").date()
+            underlying = s[:-15]
+            return {"underlying": underlying, "expiry": expiry,
+                    "type": opt_type, "strike": strike}
+        except Exception:
+            return None
+
+    def manage_option_exits(self, tp_pct: float = 100.0, sl_pct: float = -50.0,
+                            dte_floor: int = 1) -> list:
+        """
+        Autonomous exit rules for every open option position:
+          • close at >= tp_pct unrealized   (take profit, default +100%)
+          • close at <= sl_pct unrealized   (stop loss, default -50%)
+          • close at <= dte_floor days left  (theta-cliff time stop)
+        Returns a list of {symbol, underlying, reason, pct, pnl} for each close.
+        """
+        from datetime import date as _date
+        closed = []
+        for p in self.get_option_positions():
+            sym = p["symbol"]
+            pct = p["unrealized_pct"]
+            pnl = p["unrealized_pnl"]
+            parsed = self.parse_occ_symbol(sym)
+            dte = None
+            if parsed:
+                try:
+                    dte = (parsed["expiry"] - _date.today()).days
+                except Exception:
+                    dte = None
+
+            reason = None
+            if pct >= tp_pct:
+                reason = "TAKE_PROFIT"
+            elif pct <= sl_pct:
+                reason = "STOP_LOSS"
+            elif dte is not None and dte <= dte_floor:
+                reason = "TIME_STOP"
+
+            if reason:
+                res = self.close_option(sym)
+                if res.get("ok"):
+                    closed.append({"symbol": sym,
+                                   "underlying": p.get("underlying", ""),
+                                   "reason": reason, "pct": pct, "pnl": pnl,
+                                   "dte": dte})
+        return closed
+
 
 if __name__ == "__main__":
     b = AlpacaPaperBroker()

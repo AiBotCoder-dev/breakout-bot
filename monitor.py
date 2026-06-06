@@ -1932,6 +1932,26 @@ def main():
             if not _ob.available() or not _ost["can_buy_longs"]:
                 print(f"  ⚠️ Broker options unavailable: {_ost.get('msg')} — skipping.")
             else:
+                # ── AUTONOMOUS EXIT MANAGER — runs every cycle, closes on rules ─
+                # +100% take profit / -50% stop / DTE<=1 time-stop. This is what
+                # makes the bot safe to leave running for days unattended.
+                try:
+                    _exits = _ob.manage_option_exits(tp_pct=100, sl_pct=-50, dte_floor=1)
+                    for _x in _exits:
+                        emoji = {"TAKE_PROFIT": "🎯", "STOP_LOSS": "🛑",
+                                 "TIME_STOP": "⏱"}.get(_x["reason"], "📕")
+                        print(f"    {emoji} EXIT {_x['symbol']} {_x['reason']} "
+                              f"{_x['pct']:+.0f}% (${_x['pnl']:+.0f})")
+                        send_telegram(
+                            f"{emoji} <b>OPTION EXIT: {_x['underlying']}</b>\n"
+                            f"{_x['symbol']}\n"
+                            f"Reason: {_x['reason']}  ·  {_x['pct']:+.0f}% "
+                            f"(${_x['pnl']:+.0f})")
+                    if _exits:
+                        print(f"  Exit manager closed {len(_exits)} option position(s).")
+                except Exception as _xe:
+                    print(f"  WARN exit manager failed: {_xe}")
+
                 acct = _ob.get_account()
                 real_equity = acct.get("equity", 0)
                 # Size to the OVERRIDE if set (e.g. trade $100k paper as $1k)
@@ -1943,10 +1963,13 @@ def main():
                       f"(real ${real_equity:,.0f}) · ~${budget:.0f}/ticket · "
                       f"cap ${ticket_cap:.0f}")
                 held_u = _ob.held_option_underlyings()
-                setups = _mopt.find_setups(top_n_underlyings=6, min_quality_score=55)
+                # Higher frequency for a bigger profitability sample: scan more
+                # underlyings + open more per cycle. Quality gate stays at 55 so
+                # the sample is the REAL strategy, not watered-down trades.
+                setups = _mopt.find_setups(top_n_underlyings=12, min_quality_score=55)
                 opened = 0
                 for s in setups:
-                    if opened >= 2:
+                    if opened >= 4:
                         break
                     if s["ticker"] in held_u:
                         continue
@@ -1979,6 +2002,38 @@ def main():
                         print(f"    ✗ {s['ticker']:6s} — Alpaca opt order failed: "
                               f"{res.get('error')}")
                 print(f"  Momentum options (Alpaca paper): opened {opened}")
+
+                # ── Once-per-day broker scorecard (track profitability over days)
+                try:
+                    conn.execute("CREATE TABLE IF NOT EXISTS broker_equity_log "
+                                 "(snapshot_date TEXT PRIMARY KEY, equity REAL, "
+                                 "open_options INTEGER, logged_at TEXT)")
+                    _today = datetime.now().strftime("%Y-%m-%d")
+                    _row = conn.execute("SELECT equity FROM broker_equity_log "
+                                        "WHERE snapshot_date=?", (_today,)).fetchone()
+                    if _row is None:
+                        _nopt = len(_ob.get_option_positions())
+                        conn.execute("INSERT INTO broker_equity_log "
+                                     "(snapshot_date, equity, open_options, logged_at) "
+                                     "VALUES (?,?,?,?)",
+                                     (_today, real_equity, _nopt,
+                                      datetime.now().isoformat()))
+                        # first-seen equity = baseline for the curve
+                        _base = conn.execute("SELECT equity FROM broker_equity_log "
+                                             "ORDER BY snapshot_date ASC LIMIT 1").fetchone()
+                        _b0 = float(_base[0] if not hasattr(_base,'get') else _base.get('equity')) if _base else real_equity
+                        _chg = (real_equity / _b0 - 1) * 100 if _b0 else 0
+                        send_telegram(
+                            f"🏦 <b>BROKER DAILY SCORECARD</b>\n"
+                            f"Real equity: ${real_equity:,.2f}\n"
+                            f"Since start: {_chg:+.2f}%  (baseline ${_b0:,.0f})\n"
+                            f"Open option positions: {_nopt}\n"
+                            f"Day P&L: ${acct.get('day_pnl',0):+,.2f}\n"
+                            f"<i>Autonomous paper run — gathering profitability data.</i>")
+                        print(f"  Broker scorecard logged: ${real_equity:,.2f} "
+                              f"({_chg:+.2f}% since start)")
+                except Exception as _sce:
+                    print(f"  WARN broker scorecard failed: {_sce}")
         else:
             # Internal simulation path (default)
             _opt_engine = ts.OptionsPaperEngine(conn)

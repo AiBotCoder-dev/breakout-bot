@@ -22,7 +22,11 @@ def _hoist_ai_secrets():
     try:
         import streamlit as _st_for_secrets
         _wanted = {"GROQ_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY",
-                   "ALPACA_API_KEY", "ALPACA_API_SECRET"}
+                   "ALPACA_API_KEY", "ALPACA_API_SECRET",
+                   # Broker (paper trading) secrets — needed so the Live Broker
+                   # dashboard can read them (broker.py reads os.environ).
+                   "ALPACA_PAPER_KEY", "ALPACA_PAPER_SECRET", "BROKER_MODE",
+                   "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}
 
         def _walk(obj, depth=0):
             if depth > 3:

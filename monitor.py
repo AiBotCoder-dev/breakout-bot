@@ -61,6 +61,16 @@ def _ai_rationale(label: str, payload: dict, max_tokens: int = 160) -> str:
 # Defaults to internal so NOTHING trades a broker account until you opt in.
 BROKER_MODE = os.environ.get("BROKER_MODE", "internal").strip().lower()
 
+# Trade the broker account as if it had THIS much equity, regardless of the real
+# balance. Lets you keep Alpaca's $100k paper default but size every trade to your
+# real plan (e.g. 1000). 0 = use the real account equity. Set as a secret.
+try:
+    ACCOUNT_EQUITY_OVERRIDE = float(os.environ.get("ACCOUNT_EQUITY_OVERRIDE", "0") or 0)
+except Exception:
+    ACCOUNT_EQUITY_OVERRIDE = 0.0
+# A single option ticket may not exceed this fraction of (effective) equity.
+MAX_TICKET_FRACTION = 0.20
+
 # ── Auto-entry configuration ──────────────────────────────────────────────────
 # Raise these thresholds to be more selective; lower them to trade more often.
 STOCK_MIN_SCORE          = 60    # explosive_score threshold for stock auto-entry
@@ -758,9 +768,13 @@ def auto_enter_momentum(conn, paper, session, quality,
                 _acct = _b.get_account()
                 if "error" not in _acct:
                     _broker = _b
-                    _broker_equity = _acct.get("equity", 0)
-                    print(f"  🏦 BROKER MODE: Alpaca paper — equity "
-                          f"${_broker_equity:,.2f}, {len(_b.get_positions())} positions")
+                    _real_eq = _acct.get("equity", 0)
+                    _broker_equity = (ACCOUNT_EQUITY_OVERRIDE
+                                      if ACCOUNT_EQUITY_OVERRIDE > 0 else _real_eq)
+                    _ov = (f" (sizing as ${_broker_equity:,.0f} override)"
+                           if ACCOUNT_EQUITY_OVERRIDE > 0 else "")
+                    print(f"  🏦 BROKER MODE: Alpaca paper — real equity "
+                          f"${_real_eq:,.2f}{_ov}, {len(_b.get_positions())} positions")
                 else:
                     print(f"  ⚠️ Alpaca paper account error: {_acct['error']} — "
                           f"falling back to internal sim.")
@@ -1919,8 +1933,15 @@ def main():
                 print(f"  ⚠️ Broker options unavailable: {_ost.get('msg')} — skipping.")
             else:
                 acct = _ob.get_account()
-                equity = acct.get("equity", 0)
+                real_equity = acct.get("equity", 0)
+                # Size to the OVERRIDE if set (e.g. trade $100k paper as $1k)
+                equity = (ACCOUNT_EQUITY_OVERRIDE if ACCOUNT_EQUITY_OVERRIDE > 0
+                          else real_equity)
                 budget = max(50.0, equity * 0.05)        # ~5% lottery sizing per ticket
+                ticket_cap = equity * MAX_TICKET_FRACTION  # one ticket ≤ this $
+                print(f"  Sizing on ${equity:,.0f} effective equity "
+                      f"(real ${real_equity:,.0f}) · ~${budget:.0f}/ticket · "
+                      f"cap ${ticket_cap:.0f}")
                 held_u = _ob.held_option_underlyings()
                 setups = _mopt.find_setups(top_n_underlyings=6, min_quality_score=55)
                 opened = 0
@@ -1935,7 +1956,13 @@ def main():
                         print(f"    {s['ticker']:6s} — no tradable Alpaca contract, skip")
                         continue
                     prem = s.get("premium") or contract.get("close_price") or 0
-                    qty = max(1, int(budget // (prem * 100))) if prem > 0 else 1
+                    one_ct_cost = prem * 100 if prem > 0 else 0
+                    # Per-ticket cap: skip contracts too expensive for the account
+                    if one_ct_cost > ticket_cap:
+                        print(f"    {s['ticker']:6s} — 1 contract ${one_ct_cost:.0f} "
+                              f"> cap ${ticket_cap:.0f}, too big for account, skip")
+                        continue
+                    qty = max(1, int(budget // one_ct_cost)) if one_ct_cost > 0 else 1
                     res = _ob.submit_option_buy(contract["symbol"], qty)
                     if res.get("ok"):
                         opened += 1

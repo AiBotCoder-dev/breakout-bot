@@ -53,4 +53,7 @@ jobs:
           BROKER_MODE:           ${{ secrets.BROKER_MODE }}
           ALPACA_PAPER_KEY:      ${{ secrets.ALPACA_PAPER_KEY }}
           ALPACA_PAPER_SECRET:   ${{ secrets.ALPACA_PAPER_SECRET }}
+          # Trade the account as if it had this much equity (e.g. 1000) regardless
+          # of the real paper balance. 0/unset = use the real balance.
+          ACCOUNT_EQUITY_OVERRIDE: ${{ secrets.ACCOUNT_EQUITY_OVERRIDE }}
         run: python monitor.py

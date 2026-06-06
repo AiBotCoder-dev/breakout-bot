@@ -43,4 +43,5 @@ jobs:
           BROKER_MODE:           ${{ secrets.BROKER_MODE }}
           ALPACA_PAPER_KEY:      ${{ secrets.ALPACA_PAPER_KEY }}
           ALPACA_PAPER_SECRET:   ${{ secrets.ALPACA_PAPER_SECRET }}
+          ACCOUNT_EQUITY_OVERRIDE: ${{ secrets.ACCOUNT_EQUITY_OVERRIDE }}
         run: python daily_briefing.py

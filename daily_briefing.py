@@ -86,11 +86,98 @@ def build_briefing_context(conn) -> dict:
     return ctx
 
 
+def send_command_center_brief():
+    """
+    Send the one-glance 'what to buy today' command-center brief to Telegram.
+    Runs FIRST and independently of the AI prose briefing — it only needs the DB
+    + live market data, so it sends even when no AI key is configured.
+    """
+    print("  Building Command Center morning brief…")
+    try:
+        cc_conn = get_connection()
+    except Exception as exc:
+        print(f"  CC DB connection failed: {exc}")
+        return
+    try:
+        from command_center import run_morning_scan
+        try:
+            from monitor import OPTIONS_AUTO_WATCHLIST as _WL
+        except Exception:
+            _WL = None
+        cc = run_morning_scan(cc_conn, progress=lambda m: print(f"    …{m}"),
+                              watchlist=_WL)
+
+        m = cc.get("market", {})
+        stocks = cc.get("top_stocks", [])
+        opts = [o for o in cc.get("options", []) if str(o.get("decision")) == "BUY"]
+        whale = cc.get("whale", [])
+        goal = cc.get("goal", {})
+
+        # Buy list (skip extended names)
+        buy_lines = []
+        for s in stocks[:5]:
+            flag = " ⚠️ext" if s.get("extended") else ""
+            buy_lines.append(f"  • <b>{s['ticker']}</b> ${s['price']:.2f} "
+                             f"(6mo {s['mom_6m']*100:+.0f}%, stop ${s['stop']:.2f}){flag}")
+        buy_block = "\n".join(buy_lines) if buy_lines else "  (none ranked)"
+
+        opt_block = ""
+        if opts:
+            opt_block = "\n<b>🎰 Options (BUY-grade):</b>\n" + "\n".join(
+                f"  • {o['ticker']} ${float(o['strike'] or 0):.0f}"
+                f"{str(o['type'])[0].upper()} exp {o['expiry']} "
+                f"${float(o['premium'] or 0):.2f} ({o['grade']})" for o in opts[:3])
+
+        whale_block = ""
+        if whale:
+            whale_block = "\n<b>🐋 Smart money:</b> " + ", ".join(
+                f"{w['ticker']}({w['score']})" for w in whale[:3])
+
+        panic_block = ""
+        if cc.get("panic"):
+            panic_block = ("\n🚨 <b>PANIC SIGNAL FIRING</b> — highest-conviction buy. "
+                           "Scale into SPY/momentum/calls.")
+
+        goal_block = ""
+        if goal:
+            goal_block = (f"\n<b>🎯 Goal:</b> ${goal.get('real_value_now',0):,.0f} / "
+                          f"${goal.get('goal_capital',0):,.0f} ({goal.get('status','?')})")
+
+        msg = (
+            f"🌅 <b>MORNING BRIEF — what to do today</b>\n"
+            f"{datetime.utcnow().strftime('%a %d %b %Y')}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>{cc.get('verdict','?')}</b>\n"
+            f"{cc.get('action','')}\n"
+            f"{panic_block}\n"
+            f"\n<b>Market:</b> {m.get('bias','?')} bias · {m.get('regime','?')} · "
+            f"{m.get('risk','?')} risk · VIX {m.get('vix',0):.1f}\n"
+            f"\n<b>📈 Stocks to buy:</b>\n{buy_block}\n"
+            f"{opt_block}"
+            f"{whale_block}"
+            f"{goal_block}"
+        )
+        if len(msg) > 4000:
+            msg = msg[:3990] + "…"
+        sent = send_telegram(msg)
+        print(f"  Command Center brief → Telegram: {'✓ sent' if sent else '✗ failed'}")
+    except Exception as exc:
+        print(f"  WARN command center brief failed: {exc}")
+        traceback.print_exc()
+    finally:
+        try: cc_conn.close()
+        except Exception: pass
+
+
 def main():
     now_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     print(f"{'='*60}")
     print(f"  Daily AI Briefing  —  {now_utc}")
     print(f"{'='*60}")
+
+    # ── FIRST: the actionable 'what to buy today' command-center brief ────────
+    # Sent regardless of AI config (it needs only DB + market data).
+    send_command_center_brief()
 
     if _AI is None or not _AI.available:
         print("  AI not configured (no GROQ_API_KEY / GEMINI_API_KEY / "

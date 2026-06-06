@@ -3153,6 +3153,64 @@ with tab_analyst:
         st.caption(f"Generated {_brief['as_of'][:19]} UTC · symbol {_brief['symbol']} · "
                    f"This is probabilistic analysis, not a directional guarantee.")
 
+    # ── REVERSAL FINDER — downtrend -> base -> uptrend watchlist ──────────────
+    st.divider()
+    st.markdown("### 🔄 Reversal Finder — Downtrend → Base → Uptrend")
+    st.caption(
+        "Finds stocks turning the corner: fell hard, based tightly without new "
+        "lows, then reclaimed a flattening/rising 50-SMA. Backtest (88 names, 5y): "
+        "the 50-SMA-reclaim version wins 62.6% over 60 days (median +5.1%) — but "
+        "the naive base-BREAKOUT version was REJECTED (it underperforms). "
+        "Watchlist / idea generator, not an auto-trader — the edge is modest."
+    )
+    if st.button("🔄 Scan Reversals", key="rev_btn", type="primary"):
+        try:
+            from reversal_finder import ReversalFinder
+            _rp = st.progress(0.0, text="Scanning for reversals…")
+            def _rev_cb(i, n, t):
+                _rp.progress(min(i/max(n,1), 1.0), text=f"{t} ({i}/{n})")
+            with st.spinner("Scanning liquid universe for downtrend→base→uptrend…"):
+                _rev_res = ReversalFinder(conn).scan(progress=_rev_cb)
+            _rp.empty()
+            st.session_state["_rev_res"] = _rev_res
+        except Exception as _re:
+            st.error(f"Reversal scan failed: {_re}")
+
+    _rev_res = st.session_state.get("_rev_res")
+    if _rev_res is None:
+        st.info("Hit **Scan Reversals** to find stocks turning from downtrend to "
+                "uptrend. Staged: TRIGGERED (entry), BASING (watch), EXTENDED (chase risk).",
+                icon="🔄")
+    elif not _rev_res:
+        st.info("No reversal setups in the universe right now.", icon="📭")
+    else:
+        _stage_meta = {"TRIGGERED": ("#3fb950", "🎯", "Just reclaimed 50-SMA — the validated entry"),
+                       "BASING":    ("#58a6ff", "👀", "Based, downtrend arrested, not yet turned — watch"),
+                       "EXTENDED":  ("#e3b341", "⚠️", "Already ran post-trigger — chase risk")}
+        for _stage in ["TRIGGERED", "BASING", "EXTENDED"]:
+            _rows = [r for r in _rev_res if r["stage"] == _stage]
+            if not _rows:
+                continue
+            _col, _ic, _desc = _stage_meta[_stage]
+            st.markdown(f"<div style='color:{_col};font-weight:700;margin-top:8px'>"
+                        f"{_ic} {_stage} ({len(_rows)}) — <span style='font-weight:400;"
+                        f"color:#8b949e'>{_desc}</span></div>", unsafe_allow_html=True)
+            import pandas as _pdr
+            df = _pdr.DataFrame([{
+                "Ticker": r["ticker"],
+                "Price": f"${r['price']:.2f}",
+                "Drawdown": f"{r['drawdown_pct']:.0f}%",
+                "Base range": f"{r['base_range_pct']:.0f}%",
+                "200-slope": f"{r['slope200_20d']:+.1f}%",
+                "Improving": "✓" if r["slope_improving"] else "",
+                "Entry": f"${r['entry']:.2f}",
+                "Stop": f"${r['stop']:.2f}",
+                "Target": f"${r['target']:.2f}",
+            } for r in _rows])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        st.caption("Discipline: act on TRIGGERED (50-SMA reclaim), watch BASING for "
+                   "the trigger, avoid chasing EXTENDED. Stop below the base.")
+
 
 with tab_whale:
     conn, _ww_mode = get_db()

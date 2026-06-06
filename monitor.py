@@ -1208,6 +1208,44 @@ def main():
     except Exception as _be:
         print(f"  WARN benchmark snapshot failed: {_be}")
 
+    # ── INSTITUTIONAL MORNING BRIEFING — once per day, Telegram ───────────────
+    # Professional desk-analyst read: multi-timeframe structure + internals +
+    # regime + bull/bear/neutral probabilities + risk + recommended strategy.
+    try:
+        from market_analyst import MarketAnalyst
+        conn.execute("CREATE TABLE IF NOT EXISTS briefing_state "
+                     "(id INTEGER PRIMARY KEY, last_date TEXT)")
+        _br_row = conn.execute("SELECT last_date FROM briefing_state WHERE id=1").fetchone()
+        _br_last = (_br_row[0] if not hasattr(_br_row, "get") else _br_row.get("last_date")) if _br_row else None
+        _today = datetime.now().strftime("%Y-%m-%d")
+        if _br_last != _today:
+            print(f"\n  {'─'*50}")
+            print(f"  MARKET ANALYST — generating institutional morning briefing")
+            _brief = MarketAnalyst(conn).generate_briefing()
+            conn.execute("INSERT INTO briefing_state (id, last_date) VALUES (1,?) "
+                         "ON CONFLICT(id) DO UPDATE SET last_date=excluded.last_date",
+                         (_today,))
+            _bias = _brief["bias"]; _emoji = {"Bullish":"🟢","Bearish":"🔴","Neutral":"⚪"}.get(_bias,"⚪")
+            _struct = _brief["structure"]
+            _msg = (
+                f"🏛 <b>MORNING BRIEFING</b>  {_emoji}\n"
+                f"<b>Bias: {_bias}</b>  (conf {_brief['confidence']:.0f}%)\n"
+                f"Bull {_brief['prob_bull']:.0f}% · Bear {_brief['prob_bear']:.0f}% · "
+                f"Neutral {_brief['prob_neutral']:.0f}%\n"
+                f"Regime: <b>{_brief['market_regime']['primary']}</b> · "
+                f"Risk: <b>{_brief['risk']['level']}</b>\n"
+                f"\n<b>Structure:</b> W:{_struct['weekly']['trend']} · "
+                f"D:{_struct['daily']['trend']} · I:{_struct['intraday']['trend']}\n"
+                f"Breadth: {_brief['internals']['breadth'].get('pct_above_200','?')}% >200SMA · "
+                f"VIX {_brief['internals'].get('vix',0):.1f}\n"
+                f"\n<b>Strategy:</b> {_brief['recommended_strategy']['summary'][:240]}\n"
+                f"\n<i>Invalidation:</i> {(_brief['invalidation'][0] if _brief['invalidation'] else '—')}"
+            )
+            send_telegram(_msg)
+            print(f"  Briefing sent: {_bias} bias, {_brief['market_regime']['primary']} regime")
+    except Exception as _mbe:
+        print(f"  WARN morning briefing failed: {_mbe}")
+
     # ── Daily IV snapshot — builds historical IV record for true IV Rank ───────
     # Cheap if we only do it once per calendar day. The bot's iv_snapshots table
     # is what makes IV Rank progressively more accurate over time (vs the HV

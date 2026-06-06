@@ -1286,9 +1286,10 @@ if run_btn:
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
-(tab_mgmt, tab_whale, tab_dash, tab_results, tab_chart, tab_analytics,
+(tab_mgmt, tab_analyst, tab_whale, tab_dash, tab_results, tab_chart, tab_analytics,
  tab_paper, tab_fees, tab_options) = st.tabs([
     "🎛  Management",
+    "🏛  Market Analyst",
     "🐋  Whale Watch",
     "📊  Dashboard",
     "🔍  Scan Results",
@@ -3035,6 +3036,124 @@ with tab_mgmt:
 #   watchlist with concrete entry/stop/target. Forward scorecard measures
 #   whether the picks actually beat SPY.
 # ──────────────────────────────────────────────────────────────────────────────
+with tab_analyst:
+    conn, _ma_mode = get_db()
+    st.markdown("## 🏛 Market Analyst — Institutional Briefing")
+    st.caption(
+        "Thinks like a desk analyst, not an indicator chaser: multi-timeframe "
+        "structure (weekly/daily/intraday), market internals + breadth, regime "
+        "classification, and a weighted bull/bear/neutral PROBABILITY view — "
+        "never a binary 'buy'. Capital preservation and probabilities over "
+        "trade frequency."
+    )
+
+    if st.button("🏛 Generate Briefing", key="ma_btn", type="primary"):
+        try:
+            from market_analyst import MarketAnalyst
+            with st.spinner("Analyzing structure, internals, breadth, regime… (~60s)"):
+                _brief = MarketAnalyst(conn).generate_briefing()
+            st.session_state["_market_brief"] = _brief
+        except Exception as _mae:
+            st.error(f"Briefing failed: {_mae}")
+
+    _brief = st.session_state.get("_market_brief")
+    if not _brief:
+        st.info("Hit **Generate Briefing** for the full professional market read. "
+                "Also delivered to Telegram each morning before the open.", icon="🏛")
+    else:
+        # ── Headline: probabilities + bias + confidence ──────────────────────
+        _bias = _brief["bias"]
+        _bias_color = {"Bullish": "#3fb950", "Bearish": "#f85149",
+                       "Neutral": "#e3b341"}.get(_bias, "#8b949e")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("🟢 Bullish", f"{_brief['prob_bull']:.0f}%")
+        c2.metric("🔴 Bearish", f"{_brief['prob_bear']:.0f}%")
+        c3.metric("⚪ Neutral", f"{_brief['prob_neutral']:.0f}%")
+        c4.metric("Confidence", f"{_brief['confidence']:.0f}%")
+        st.markdown(
+            f"<div style='background:#161b22;border-left:6px solid {_bias_color};"
+            f"border-radius:8px;padding:12px 16px;margin:8px 0;color:#c9d1d9'>"
+            f"<span style='font-size:1.2em'><b>Market Bias: "
+            f"<span style='color:{_bias_color}'>{_bias.upper()}</span></b></span>  ·  "
+            f"Regime: <b>{_brief['market_regime']['primary']}</b>  ·  "
+            f"Risk: <b>{_brief['risk']['level']}</b><br>"
+            f"<span style='color:#8b949e;font-size:0.9em'>"
+            f"Regime tags: {' · '.join(_brief['market_regime']['tags'])}</span>"
+            f"</div>", unsafe_allow_html=True)
+
+        # ── Multi-timeframe structure ────────────────────────────────────────
+        st.markdown("### 📐 Multi-Timeframe Structure")
+        _sc = st.columns(3)
+        for _i, _tf in enumerate(["weekly", "daily", "intraday"]):
+            s = _brief["structure"][_tf]
+            _tc = ("#3fb950" if "Bull" in s["trend"] else
+                   "#f85149" if "Bear" in s["trend"] else "#e3b341")
+            with _sc[_i]:
+                st.markdown(
+                    f"<div style='background:#161b22;border:1px solid #30363d;"
+                    f"border-radius:8px;padding:10px 12px'>"
+                    f"<b>{s['timeframe']}</b><br>"
+                    f"<span style='color:{_tc};font-weight:700'>{s['trend']}</span><br>"
+                    f"<span style='font-size:0.8em;color:#8b949e'>"
+                    f"RSI {s.get('rsi',0):.0f} · close {s.get('close_in_range_pct',0):.0f}% "
+                    f"of range · vol {s.get('volume_trend','?')}<br>"
+                    f"{'HH ' if s.get('hh') else ''}{'HL ' if s.get('hl') else ''}"
+                    f"{'LH ' if s.get('lh') else ''}{'LL' if s.get('ll') else ''}</span>"
+                    f"</div>", unsafe_allow_html=True)
+
+        # ── Internals + key levels ───────────────────────────────────────────
+        _ic1, _ic2 = st.columns(2)
+        with _ic1:
+            st.markdown("### 🔬 Market Internals")
+            _intr = _brief["internals"]; _br = _intr["breadth"]
+            _vix_chg = _intr.get("vix_20d_chg")
+            _vix_chg_txt = f" ({_vix_chg:+.0f}% 20d)" if _vix_chg is not None else ""
+            st.markdown(
+                f"- **Breadth:** {_br.get('pct_above_50','?')}% above 50-SMA · "
+                f"{_br.get('pct_above_200','?')}% above 200-SMA\n"
+                f"- **VIX:** {_intr.get('vix',0):.1f}{_vix_chg_txt}\n"
+                f"- **Breadth health (RSP/SPY):** {_intr.get('equal_vs_cap_20d','?')}% (20d)\n"
+                f"- **Risk appetite (XLY/XLP):** {_intr.get('risk_appetite_20d','?')}% (20d)\n"
+                f"- **Credit (HYG/TLT):** {_intr.get('credit_20d','?')}% (20d)")
+        with _ic2:
+            st.markdown("### 🎯 Key Levels")
+            _lv = _brief["key_levels"]
+            st.markdown(
+                f"- **Prev week:** H ${_lv.get('prev_week_high','?')} · "
+                f"L ${_lv.get('prev_week_low','?')}\n"
+                f"- **Prev day:** H ${_lv.get('prev_day_high','?')} · "
+                f"L ${_lv.get('prev_day_low','?')}\n"
+                f"- **Resistance:** ${_lv.get('near_resistance','?')} (near) · "
+                f"${_lv.get('resistance','?')} (60d)\n"
+                f"- **Support:** ${_lv.get('near_support','?')} (near) · "
+                f"${_lv.get('support','?')} (60d)\n"
+                f"- **Last:** ${_lv.get('last','?')}")
+
+        # ── Recommended strategy + opportunities ─────────────────────────────
+        st.markdown("### ♟ Recommended Strategy")
+        st.info(_brief["recommended_strategy"]["summary"], icon="♟")
+        st.caption("Active engines for this regime: " +
+                   " · ".join(_brief["recommended_strategy"]["engines"]))
+        if _brief["opportunities"]:
+            st.markdown("**Trade opportunities:**")
+            for o in _brief["opportunities"]:
+                st.markdown(f"- {o}")
+
+        # ── Reasons + invalidation ───────────────────────────────────────────
+        _rc1, _rc2 = st.columns(2)
+        with _rc1:
+            st.markdown("### ✅ Reasons Supporting")
+            for r in _brief["reasons"]:
+                st.markdown(f"- {r}")
+        with _rc2:
+            st.markdown("### ⚠️ Would Invalidate This View")
+            for r in _brief["invalidation"]:
+                st.markdown(f"- {r}")
+
+        st.caption(f"Generated {_brief['as_of'][:19]} UTC · symbol {_brief['symbol']} · "
+                   f"This is probabilistic analysis, not a directional guarantee.")
+
+
 with tab_whale:
     conn, _ww_mode = get_db()
 

@@ -1231,6 +1231,29 @@ def main():
         )
         print(f"  [Telegram] {'✓ message sent!' if sent else '✗ FAILED — check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID secrets'}")
 
+    # ── BROKER SELF-TEST — runs even when market is closed ────────────────────
+    # Lets a manual workflow run verify the full chain (keys -> Alpaca -> options
+    # level -> BROKER_MODE) any day. Telegrams the result ONLY on a manual
+    # dispatch so the every-5-min runs don't spam.
+    print(f"\n  EXECUTION MODE: {BROKER_MODE}")
+    if BROKER_MODE == "alpaca_paper":
+        try:
+            from broker import AlpacaPaperBroker
+            _selftest_b = AlpacaPaperBroker()
+            _t = _selftest_b.test_connection()
+            if _t.get("ok"):
+                _ost = _selftest_b.options_status()
+                _line = (f"✅ Alpaca paper connected · equity ${_t.get('equity',0):,.0f} · "
+                         f"{_ost.get('msg')}")
+            else:
+                _line = f"❌ Alpaca paper NOT connected: {_t.get('error')}"
+            print(f"  BROKER SELF-TEST: {_line}")
+            if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+                send_telegram(f"🏦 <b>Broker self-test</b>\n{_line}\n"
+                              f"(BROKER_MODE={BROKER_MODE})")
+        except Exception as _ste:
+            print(f"  BROKER SELF-TEST failed: {_ste}")
+
     # ── Market window check ───────────────────────────────────────────────────
     session = ts.MarketClock.get_session()
     quality = session.get("quality", "CLOSED")

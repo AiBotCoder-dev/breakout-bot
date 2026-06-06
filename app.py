@@ -1966,12 +1966,16 @@ with tab_mgmt:
         _ser = _bsc.get("series") or []
         if len(_ser) >= 2:
             import pandas as _pdb
-            _df = _pdb.DataFrame({
+            # NOTE: must NOT use the name `_df` here — it would shadow the
+            # module-level _df() query helper (Streamlit tab blocks share module
+            # scope), breaking every later _df(...) call with "DataFrame is not
+            # callable". Use a distinct local name.
+            _bench_df = _pdb.DataFrame({
                 "date": [s["date"] for s in _ser],
                 "Bot (momentum)": [round(s["bot_ret_pct"], 2) for s in _ser],
                 "SPY": [round(s["spy_ret_pct"], 2) for s in _ser],
             }).set_index("date")
-            st.line_chart(_df)
+            st.line_chart(_bench_df)
         else:
             st.caption("📈 Equity curve appears once 2+ daily snapshots exist.")
     else:

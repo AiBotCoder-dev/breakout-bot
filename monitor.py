@@ -54,6 +54,13 @@ def _ai_rationale(label: str, payload: dict, max_tokens: int = 160) -> str:
         return ""
 
 
+# ── Execution mode ────────────────────────────────────────────────────────────
+# "internal"     = the bot's built-in paper simulation (default; nothing external)
+# "alpaca_paper" = route auto-entries to a real Alpaca PAPER account for an honest,
+#                  broker-grade track record. Requires ALPACA_PAPER_KEY/SECRET.
+# Defaults to internal so NOTHING trades a broker account until you opt in.
+BROKER_MODE = os.environ.get("BROKER_MODE", "internal").strip().lower()
+
 # ── Auto-entry configuration ──────────────────────────────────────────────────
 # Raise these thresholds to be more selective; lower them to trade more often.
 STOCK_MIN_SCORE          = 60    # explosive_score threshold for stock auto-entry
@@ -740,7 +747,33 @@ def auto_enter_momentum(conn, paper, session, quality,
         return
     print(f"  {len(ranked)} liquid uptrend leaders ranked.")
 
-    held_tickers = {p["ticker"] for p in paper.open_positions}
+    # ── Broker mode: route entries to a real Alpaca PAPER account ─────────────
+    _broker = None
+    _broker_equity = None
+    if BROKER_MODE == "alpaca_paper":
+        try:
+            from broker import AlpacaPaperBroker
+            _b = AlpacaPaperBroker()
+            if _b.available():
+                _acct = _b.get_account()
+                if "error" not in _acct:
+                    _broker = _b
+                    _broker_equity = _acct.get("equity", 0)
+                    print(f"  🏦 BROKER MODE: Alpaca paper — equity "
+                          f"${_broker_equity:,.2f}, {len(_b.get_positions())} positions")
+                else:
+                    print(f"  ⚠️ Alpaca paper account error: {_acct['error']} — "
+                          f"falling back to internal sim.")
+            else:
+                print("  ⚠️ BROKER_MODE=alpaca_paper but no paper keys set — "
+                      "falling back to internal sim.")
+        except Exception as _bx:
+            print(f"  ⚠️ Broker init failed: {_bx} — internal sim fallback.")
+
+    if _broker:
+        held_tickers = _broker.held_tickers()
+    else:
+        held_tickers = {p["ticker"] for p in paper.open_positions}
     held_sectors = {}
     for p in paper.open_positions:
         s = str(p.get("sector", "") or "Unknown")
@@ -780,6 +813,33 @@ def auto_enter_momentum(conn, paper, session, quality,
         if held_sectors.get(sect_key, 0) >= 4:
             print(f"    {ticker:8s} — sector '{sect_key}' already at cap, skip")
             continue
+
+        # ── BROKER PATH: submit a real Alpaca paper bracket order ─────────────
+        if _broker:
+            # size ~ position % of real account equity (10% per name, risk-mult applied)
+            pos_dollars = max(0.0, (_broker_equity or 0) * 0.10 * float(risk_mult or 1.0))
+            if pos_dollars < (live or 0):
+                print(f"    {ticker:8s} — ${pos_dollars:.0f} < 1 share (${live:.2f}), skip")
+                continue
+            br = _broker.submit_bracket_order(ticker, pos_dollars, r["stop"],
+                                              r["target"], price=live)
+            if br.get("ok"):
+                new_entries += 1
+                held_tickers.add(ticker)
+                held_sectors[sect_key] = held_sectors.get(sect_key, 0) + 1
+                print(f"    ✅ ALPACA BUY {ticker:8s}  {br['qty']}sh @ ~${br['entry_est']:.2f}  "
+                      f"TP ${br['tp']:.2f} / SL ${br['sl']:.2f}  cost~${br['cost_est']:.0f}")
+                send_telegram(
+                    f"🏦 <b>ALPACA PAPER BUY: {ticker}</b>\n"
+                    f"Momentum 6mo {r['mom_6m']*100:+.0f}% · RSI {r['rsi']:.0f}\n"
+                    f"Qty    : {br['qty']} shares @ ~${br['entry_est']:.2f}\n"
+                    f"Bracket: TP ${br['tp']:.2f} / SL ${br['sl']:.2f}\n"
+                    f"Cost   : ~${br['cost_est']:.0f}  |  Acct equity ${_broker_equity:,.0f}\n"
+                    f"Real broker fills — this is your honest track record."
+                )
+            else:
+                print(f"    ✗ {ticker:8s} — Alpaca order failed: {br.get('error')}")
+            continue   # broker path done for this ticker
 
         signal = {
             "price":         live,

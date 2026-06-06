@@ -1421,6 +1421,67 @@ with tab_today:
         st.caption(f"Scan completed {_cc['as_of'][:19]} UTC · "
                    f"Market read: {_m.get('strategy','')[:120]}")
 
+    # ── LIVE BROKER (Alpaca paper) — real account track record ───────────────
+    st.divider()
+    st.markdown("### 🏦 Live Broker — Alpaca Paper Account")
+    try:
+        from broker import AlpacaPaperBroker
+        _bk = AlpacaPaperBroker()
+        _bk_test = _bk.test_connection()
+    except Exception as _bke:
+        _bk = None
+        _bk_test = {"ok": False, "error": str(_bke)}
+
+    if not _bk_test.get("ok"):
+        st.info(
+            "**Not connected yet.** To trade a real broker paper account "
+            "(honest fills + a clean track record to judge profitability):\n"
+            "1. Create a free account at **alpaca.markets** → Paper Trading\n"
+            "2. In the Alpaca dashboard, set your paper starting equity (e.g. $200)\n"
+            "3. Generate **paper** API keys\n"
+            "4. Add them as secrets: `ALPACA_PAPER_KEY`, `ALPACA_PAPER_SECRET` "
+            "(Streamlit secrets + GitHub repo secrets)\n"
+            "5. Set `BROKER_MODE=alpaca_paper` (GitHub secret/env) to let the bot "
+            "auto-trade it.\n\n"
+            f"_Status: {_bk_test.get('error','not configured')}_", icon="🏦")
+    else:
+        _acct = _bk.get_account()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Equity", f"${_acct.get('equity',0):,.2f}",
+                  delta=f"{_acct.get('day_pnl_pct',0):+.2f}% today")
+        c2.metric("Cash", f"${_acct.get('cash',0):,.2f}")
+        c3.metric("Buying power", f"${_acct.get('buying_power',0):,.2f}")
+        c4.metric("Day P&L", f"${_acct.get('day_pnl',0):+,.2f}")
+        st.caption(f"Account {_bk_test.get('account_number','?')} · status "
+                   f"{_acct.get('status','?')} · this is a REAL broker paper "
+                   f"account (simulated money, real fills).")
+
+        _pos = _bk.get_positions()
+        st.markdown("**Open positions (live from Alpaca):**")
+        if _pos:
+            import pandas as _pdbk
+            df = _pdbk.DataFrame([{
+                "Ticker": p["ticker"], "Qty": f"{p['qty']:.0f}",
+                "Entry": f"${p['avg_entry']:.2f}", "Now": f"${p['current']:.2f}",
+                "Value": f"${p['market_value']:,.0f}",
+                "P&L": f"${p['unrealized_pnl']:+,.0f}",
+                "P&L %": f"{p['unrealized_pct']:+.1f}%",
+            } for p in _pos])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No open positions in the Alpaca paper account.")
+
+        _ords = _bk.get_orders(limit=10)
+        if _ords:
+            with st.expander("Recent orders", expanded=False):
+                import pandas as _pdo2
+                st.dataframe(_pdo2.DataFrame([{
+                    "Ticker": o["ticker"], "Side": o["side"], "Qty": o["qty"],
+                    "Type": o["type"], "Class": o["order_class"],
+                    "Status": o["status"], "Filled@": o["filled_avg_price"],
+                    "When": o["submitted_at"],
+                } for o in _ords]), use_container_width=True, hide_index=True)
+
     # ── MORNING ROUTINE checklist ────────────────────────────────────────────
     st.divider()
     st.markdown("### ✅ Morning Routine (in order)")

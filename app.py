@@ -1286,8 +1286,9 @@ if run_btn:
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
-(tab_mgmt, tab_analyst, tab_whale, tab_dash, tab_results, tab_chart, tab_analytics,
- tab_paper, tab_fees, tab_options) = st.tabs([
+(tab_today, tab_mgmt, tab_analyst, tab_whale, tab_dash, tab_results, tab_chart,
+ tab_analytics, tab_paper, tab_fees, tab_options) = st.tabs([
+    "🌅  Today",
     "🎛  Management",
     "🏛  Market Analyst",
     "🐋  Whale Watch",
@@ -1299,6 +1300,148 @@ if run_btn:
     "💰  Fees Tracker",
     "⚡  Options",
 ])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB — TODAY (one-click command center: what to buy today)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_today:
+    conn, _td_mode = get_db()
+    st.markdown("## 🌅 Today — Your Daily Command Center")
+    st.caption("One click. The whole bot distilled into: should I trade, what to "
+               "buy, and am I on track. Run this each morning before the open.")
+
+    if st.button("🌅 Run Morning Scan", key="cc_btn", type="primary",
+                 use_container_width=True):
+        try:
+            from command_center import run_morning_scan
+            from monitor import OPTIONS_AUTO_WATCHLIST as _CC_WL
+            _ccp = st.empty()
+            def _cc_cb(msg):
+                _ccp.caption(f"⏳ {msg}")
+            with st.spinner("Running the full morning scan (~2 min)…"):
+                _cc = run_morning_scan(conn, progress=_cc_cb, watchlist=_CC_WL)
+            _ccp.empty()
+            st.session_state["_cc"] = _cc
+        except Exception as _cce:
+            st.error(f"Morning scan failed: {_cce}")
+
+    _cc = st.session_state.get("_cc")
+    if not _cc:
+        st.info("Hit **Run Morning Scan** for today's complete picture in one view.",
+                icon="🌅")
+    else:
+        # ── VERDICT banner ───────────────────────────────────────────────────
+        _vcolor = ("#3fb950" if "GO" in _cc["verdict"] or "BUY" in _cc["verdict"]
+                   else "#f85149" if "STAND DOWN" in _cc["verdict"]
+                   else "#e3b341")
+        st.markdown(
+            f"<div style='background:#161b22;border-left:8px solid {_vcolor};"
+            f"border-radius:10px;padding:16px 20px;margin:8px 0'>"
+            f"<div style='font-size:1.5em;font-weight:800;color:{_vcolor}'>{_cc['verdict']}</div>"
+            f"<div style='color:#c9d1d9;margin-top:6px'>{_cc['action']}</div>"
+            f"</div>", unsafe_allow_html=True)
+
+        _m = _cc["market"]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Bias", _m.get("bias", "?"))
+        c2.metric("Regime", _m.get("regime", "?"))
+        c3.metric("Risk", _m.get("risk", "?"))
+        c4.metric("VIX", f"{_m.get('vix', 0):.1f}" if _m.get("vix") else "?")
+
+        # ── Panic (if firing) ────────────────────────────────────────────────
+        if _cc.get("panic"):
+            st.markdown("### 🚨 PANIC SIGNAL — highest-conviction buy")
+            for p in _cc["panic"]:
+                st.success(f"**{p['label']}** — {p['win_rate_60d']:.0f}% win rate / "
+                           f"+{p['mean_return_60d']:.1f}% mean over 60 days. "
+                           f"Scale into SPY/momentum/calls.", icon="🚨")
+
+        # ── Buy list ─────────────────────────────────────────────────────────
+        _cb1, _cb2 = st.columns(2)
+        with _cb1:
+            st.markdown("### 📈 Stocks to Buy (momentum leaders)")
+            if _cc.get("top_stocks"):
+                import pandas as _pdt
+                df = _pdt.DataFrame([{
+                    "Ticker": s["ticker"], "Price": f"${s['price']:.2f}",
+                    "6mo": f"{s['mom_6m']*100:+.0f}%", "RSI": f"{s['rsi']:.0f}",
+                    "Stop": f"${s['stop']:.2f}",
+                    "": "⚠️ext" if s.get("extended") else "",
+                } for s in _cc["top_stocks"]])
+                st.dataframe(df, use_container_width=True, hide_index=True)
+            else:
+                st.caption("No momentum leaders ranked.")
+        with _cb2:
+            st.markdown("### 🎰 Options Play (best validated setup)")
+            if _cc.get("options"):
+                import pandas as _pdo
+                df = _pdo.DataFrame([{
+                    "Ticker": o["ticker"],
+                    "Contract": f"${float(o['strike'] or 0):.0f}{str(o['type'])[0].upper()}",
+                    "Exp": o["expiry"], "Prem": f"${float(o['premium'] or 0):.2f}",
+                    "Grade": o["grade"], "Decision": o["decision"],
+                } for o in _cc["options"]])
+                st.dataframe(df, use_container_width=True, hide_index=True)
+                st.caption("Only act on BUY-grade. WATCH = not yet.")
+            else:
+                st.caption("No options setups passed quality gate (correct on a "
+                           "low-conviction day).")
+
+        # ── Catalysts + Goal ─────────────────────────────────────────────────
+        _cc1, _cc2 = st.columns(2)
+        with _cc1:
+            st.markdown("### 🐋 Smart-Money & Catalysts")
+            if _cc.get("whale"):
+                for w in _cc["whale"]:
+                    st.markdown(f"- **{w['ticker']}** ({w['score']}/100) — "
+                                f"{str(w['signal'])[:50]} · entry ${w['entry']}")
+            if _cc.get("catalysts"):
+                for c in _cc["catalysts"]:
+                    _se = {"bullish":"🟢","bearish":"🔴"}.get(c["sentiment"], "⚪")
+                    st.markdown(f"- {_se} **{c['who']}** [{c['tickers']}]: "
+                                f"{c['text'][:70]}")
+            if not _cc.get("whale") and not _cc.get("catalysts"):
+                st.caption("No fresh catalysts. Refresh Whale Watch / VIP tabs for detail.")
+        with _cc2:
+            st.markdown("### 🎯 Goal Progress")
+            _g = _cc.get("goal") or {}
+            if _g:
+                st.metric(f"${_g.get('start_capital',500):.0f} → "
+                          f"${_g.get('goal_capital',1500):.0f}",
+                          f"${_g.get('real_value_now',0):,.0f}",
+                          delta=f"{_g.get('status','?')} · "
+                                f"{_g.get('pct_of_goal',0):.0f}% there")
+                st.caption(f"Pace {_g.get('actual_monthly_pct',0):+.1f}%/mo · "
+                           f"need {_g.get('required_monthly_pct',0):+.1f}%/mo · "
+                           f"day {_g.get('days_elapsed',0)} of "
+                           f"{_g.get('days_elapsed',0)+_g.get('days_remaining',0)}")
+            else:
+                st.caption("Set your goal in the Management tab.")
+
+        st.caption(f"Scan completed {_cc['as_of'][:19]} UTC · "
+                   f"Market read: {_m.get('strategy','')[:120]}")
+
+    # ── MORNING ROUTINE checklist ────────────────────────────────────────────
+    st.divider()
+    st.markdown("### ✅ Morning Routine (in order)")
+    st.markdown(
+        "1. **Run Morning Scan** above ☝️ — read the verdict first.\n"
+        "2. **Check the verdict:** GO = trade normally · CAUTION = high-conviction "
+        "only · STAND DOWN = no new longs · PANIC = aggressive buy.\n"
+        "3. **If 🚨 PANIC is firing** — that's the strongest signal. Scale into "
+        "SPY/momentum/calls and stop here.\n"
+        "4. **Buy from the momentum list** (top 2-3 not flagged ⚠️extended), on "
+        "pullbacks toward their rising average. Set stops as shown.\n"
+        "5. **Options:** only take BUY-grade plays. Skip WATCH. Lottery sizing (~5%).\n"
+        "6. **Scan catalysts:** check 🐋 Whale Watch + 📣 VIP Feed for fresh "
+        "Trump/Fed/insider moves on your names.\n"
+        "7. **Glance at 🔄 Reversal Finder** (Market Analyst tab) for TRIGGERED "
+        "turnarounds.\n"
+        "8. **Check goal pace** — if behind, do NOT force trades to catch up. "
+        "Discipline over FOMO.\n"
+        "9. **Set alerts & walk away.** Telegram pings you on panic, VIP posts, "
+        "and new A-grade options. Let the setups come to you."
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

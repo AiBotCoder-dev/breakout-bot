@@ -1405,6 +1405,18 @@ def main():
                 f"Affects  : {tickers_str}\n"
                 f"Source   : {item.get('source', '')}"
             )
+            # ── Attach the exact affordable WEEKLY option for each named ticker ──
+            try:
+                from catalyst_options import catalyst_to_weekly_alert
+                _sent = str(cls.get("sentiment", "")).lower()
+                _dir = "bearish" if _sent in ("negative", "bearish") else "bullish"
+                for _tk in (cls.get("affected_tickers", []) or [])[:2]:
+                    _opt_msg = catalyst_to_weekly_alert(
+                        _tk, _dir, item.get("headline", "")[:160])
+                    if _opt_msg:
+                        send_telegram(_opt_msg)
+            except Exception as _coe:
+                print(f"  WARN catalyst option alert failed: {_coe}")
 
         # Market pulse for the run log
         try:

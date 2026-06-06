@@ -254,6 +254,20 @@ class VipNewsMonitor:
                                 self._mark_alerted(feed["handle"], pid)
                         except Exception:
                             pass
+                        # ── Attach the exact affordable WEEKLY option to trade ──
+                        # For each named ticker, find a weekly contract that fits
+                        # the account ($200 default) and send a precise ENTER-NOW
+                        # alert. This is the "news -> exact option" path.
+                        for _tk in tickers[:2]:
+                            try:
+                                from catalyst_options import catalyst_to_weekly_alert
+                                _cat = (title or body)[:160]
+                                _opt_msg = catalyst_to_weekly_alert(
+                                    _tk, sentiment, f"{feed['name']}: {_cat}")
+                                if _opt_msg:
+                                    telegram_sender(_opt_msg)
+                            except Exception:
+                                pass
             except Exception as ex:
                 print(f"  [vip] {handle} feed failed: {ex}")
             report[handle] = stats

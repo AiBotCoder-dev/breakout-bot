@@ -1456,8 +1456,34 @@ with tab_today:
                    f"{_acct.get('status','?')} · this is a REAL broker paper "
                    f"account (simulated money, real fills).")
 
+        # Options-enabled status (you trade options, so this is the key check)
+        try:
+            _ost = _bk.options_status()
+            if _ost.get("can_buy_longs"):
+                st.success(f"✅ Options ready — {_ost['msg']}", icon="🎰")
+            else:
+                st.warning(f"⚠️ {_ost['msg']}", icon="🎰")
+        except Exception:
+            pass
+
+        # Option positions (your focus)
+        _opos = _bk.get_option_positions()
+        st.markdown("**Open OPTION positions (live from Alpaca):**")
+        if _opos:
+            import pandas as _pdop
+            df = _pdop.DataFrame([{
+                "Contract": p["symbol"], "Underlying": p["underlying"],
+                "Qty": f"{p['qty']:.0f}", "Entry": f"${p['avg_entry']:.2f}",
+                "Now": f"${p['current']:.2f}", "Value": f"${p['market_value']:,.0f}",
+                "P&L": f"${p['unrealized_pnl']:+,.0f}",
+                "P&L %": f"{p['unrealized_pct']:+.1f}%",
+            } for p in _opos])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No open option positions in the Alpaca paper account.")
+
         _pos = _bk.get_positions()
-        st.markdown("**Open positions (live from Alpaca):**")
+        st.markdown("**Open STOCK positions (live from Alpaca):**")
         if _pos:
             import pandas as _pdbk
             df = _pdbk.DataFrame([{

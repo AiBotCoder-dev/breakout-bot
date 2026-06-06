@@ -202,6 +202,128 @@ class AlpacaPaperBroker:
     def held_tickers(self) -> set:
         return {p["ticker"] for p in self.get_positions()}
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # OPTIONS (paper) — requires options enabled on the account (Level 2 to buy)
+    # ══════════════════════════════════════════════════════════════════════════
+    def options_status(self) -> dict:
+        """
+        Detect whether options trading is enabled + the approved level.
+        Returns {enabled, level, buying_power, msg}.
+        """
+        try:
+            a = self._get("/v2/account")
+            lvl = a.get("options_trading_level")
+            lvl = int(lvl) if lvl is not None else 0
+            obp = float(a.get("options_buying_power", 0) or 0)
+            enabled = lvl >= 1
+            can_buy = lvl >= 2          # long calls/puts need Level 2
+            if not enabled:
+                msg = ("Options NOT enabled on this paper account. In the Alpaca "
+                       "dashboard → account config → enable Options (Level 2) to "
+                       "buy calls/puts. Instant on paper.")
+            elif not can_buy:
+                msg = (f"Options enabled at Level {lvl}, but buying calls/puts needs "
+                       f"Level 2. Raise the options level in the Alpaca dashboard.")
+            else:
+                msg = f"Options enabled — Level {lvl}, buying power ${obp:,.0f}."
+            return {"enabled": enabled, "can_buy_longs": can_buy,
+                    "level": lvl, "buying_power": obp, "msg": msg}
+        except Exception as e:
+            return {"enabled": False, "can_buy_longs": False, "level": 0,
+                    "buying_power": 0, "msg": f"error: {str(e)[:160]}"}
+
+    def find_option_contract(self, underlying: str, expiry: str,
+                             opt_type: str, target_strike: float) -> dict | None:
+        """
+        Look up the canonical Alpaca OCC symbol for the contract closest to
+        target_strike on the given expiry. Returns {symbol, strike, tradable,
+        close_price} or None. Uses Alpaca's contracts endpoint so symbols always
+        match what the broker will accept.
+        """
+        try:
+            params = {
+                "underlying_symbols": underlying.upper(),
+                "expiration_date": expiry,
+                "type": "call" if opt_type.lower().startswith("c") else "put",
+                "status": "active", "limit": 200,
+            }
+            data = self._get("/v2/options/contracts", params)
+            contracts = data.get("option_contracts", []) or []
+            if not contracts:
+                return None
+            best, bd = None, 1e18
+            for c in contracts:
+                try:
+                    sk = float(c.get("strike_price", 0))
+                except Exception:
+                    continue
+                d = abs(sk - target_strike)
+                if d < bd and c.get("tradable", True):
+                    bd, best = d, c
+            if not best:
+                return None
+            return {
+                "symbol": best.get("symbol"),
+                "strike": float(best.get("strike_price", 0)),
+                "tradable": bool(best.get("tradable", True)),
+                "expiry": best.get("expiration_date"),
+                "close_price": float(best.get("close_price") or 0) or None,
+            }
+        except Exception:
+            return None
+
+    def submit_option_buy(self, occ_symbol: str, qty: int = 1) -> dict:
+        """Market buy-to-open `qty` contracts of an option (paper)."""
+        if not self.available():
+            return {"ok": False, "error": "broker not configured"}
+        st = self.options_status()
+        if not st["can_buy_longs"]:
+            return {"ok": False, "error": st["msg"]}
+        body = {"symbol": occ_symbol, "qty": str(int(qty)), "side": "buy",
+                "type": "market", "time_in_force": "day"}
+        try:
+            o = self._post("/v2/orders", body)
+            return {"ok": True, "order_id": o.get("id"), "qty": int(qty),
+                    "symbol": occ_symbol, "status": o.get("status")}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
+
+    def close_option(self, occ_symbol: str) -> dict:
+        try:
+            self._delete(f"/v2/positions/{occ_symbol}")
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
+
+    def get_option_positions(self) -> list:
+        """Open OPTION positions (asset_class == us_option), with live P&L."""
+        try:
+            rows = self._get("/v2/positions")
+        except Exception:
+            return []
+        out = []
+        for p in rows:
+            if p.get("asset_class") != "us_option":
+                continue
+            try:
+                out.append({
+                    "symbol": p.get("symbol"),
+                    "underlying": p.get("symbol", "")[:6].rstrip("0123456789"),
+                    "qty": float(p.get("qty", 0)),
+                    "avg_entry": float(p.get("avg_entry_price", 0)),
+                    "current": float(p.get("current_price", 0) or 0),
+                    "market_value": float(p.get("market_value", 0) or 0),
+                    "cost_basis": float(p.get("cost_basis", 0) or 0),
+                    "unrealized_pnl": float(p.get("unrealized_pl", 0) or 0),
+                    "unrealized_pct": round(float(p.get("unrealized_plpc", 0) or 0) * 100, 2),
+                })
+            except Exception:
+                continue
+        return out
+
+    def held_option_underlyings(self) -> set:
+        return {p["underlying"] for p in self.get_option_positions()}
+
 
 if __name__ == "__main__":
     b = AlpacaPaperBroker()

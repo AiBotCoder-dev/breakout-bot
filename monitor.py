@@ -1885,11 +1885,57 @@ def main():
     try:
         from momentum_options import MomentumOptionsStrategy
         _mopt = MomentumOptionsStrategy(conn)
-        _opt_engine = ts.OptionsPaperEngine(conn)
-        _opt_engine.expire_check()              # housekeeping: close expired worthless
-        n_closed = _mopt.auto_exit(_opt_engine)
-        n_opened = _mopt.auto_enter(_opt_engine, market_regime=market_regime)
-        print(f"  Momentum calls: closed {n_closed}, opened {n_opened}")
+
+        # ── BROKER PATH: place real Alpaca PAPER option orders ────────────────
+        if BROKER_MODE == "alpaca_paper":
+            from broker import AlpacaPaperBroker
+            _ob = AlpacaPaperBroker()
+            _ost = _ob.options_status() if _ob.available() else {"can_buy_longs": False,
+                   "msg": "no paper keys"}
+            if not _ob.available() or not _ost["can_buy_longs"]:
+                print(f"  ⚠️ Broker options unavailable: {_ost.get('msg')} — skipping.")
+            else:
+                acct = _ob.get_account()
+                equity = acct.get("equity", 0)
+                budget = max(50.0, equity * 0.05)        # ~5% lottery sizing per ticket
+                held_u = _ob.held_option_underlyings()
+                setups = _mopt.find_setups(top_n_underlyings=6, min_quality_score=55)
+                opened = 0
+                for s in setups:
+                    if opened >= 2:
+                        break
+                    if s["ticker"] in held_u:
+                        continue
+                    contract = _ob.find_option_contract(
+                        s["ticker"], s["expiry"], "call", s["strike"])
+                    if not contract or not contract.get("tradable"):
+                        print(f"    {s['ticker']:6s} — no tradable Alpaca contract, skip")
+                        continue
+                    prem = s.get("premium") or contract.get("close_price") or 0
+                    qty = max(1, int(budget // (prem * 100))) if prem > 0 else 1
+                    res = _ob.submit_option_buy(contract["symbol"], qty)
+                    if res.get("ok"):
+                        opened += 1
+                        print(f"    ✅ ALPACA OPT BUY {contract['symbol']} x{qty} "
+                              f"(~${prem:.2f}/ct, ${prem*100*qty:.0f})")
+                        send_telegram(
+                            f"🏦 <b>ALPACA PAPER OPTION BUY</b>\n"
+                            f"{s['ticker']} ${contract['strike']:.0f}C exp {s['expiry']}\n"
+                            f"Qty: {qty} contract(s) @ ~${prem:.2f} "
+                            f"(~${prem*100*qty:.0f})\n"
+                            f"Quality {s.get('quality_score','?')}/100 · real broker fills\n"
+                            f"Acct equity ${equity:,.0f}")
+                    else:
+                        print(f"    ✗ {s['ticker']:6s} — Alpaca opt order failed: "
+                              f"{res.get('error')}")
+                print(f"  Momentum options (Alpaca paper): opened {opened}")
+        else:
+            # Internal simulation path (default)
+            _opt_engine = ts.OptionsPaperEngine(conn)
+            _opt_engine.expire_check()          # housekeeping: close expired worthless
+            n_closed = _mopt.auto_exit(_opt_engine)
+            n_opened = _mopt.auto_enter(_opt_engine, market_regime=market_regime)
+            print(f"  Momentum calls: closed {n_closed}, opened {n_opened}")
     except Exception as exc:
         print(f"  ERROR in momentum options: {exc}")
         traceback.print_exc()

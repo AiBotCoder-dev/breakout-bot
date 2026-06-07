@@ -1352,6 +1352,22 @@ with tab_today:
         c3.metric("Risk", _m.get("risk", "?"))
         c4.metric("VIX", f"{_m.get('vix', 0):.1f}" if _m.get("vix") else "?")
 
+        # ── Macro event risk (jobs/CPI/PCE/FOMC) ─────────────────────────────
+        _macro = _cc.get("macro") or {}
+        if _macro:
+            _ml = _macro.get("level", "LOW")
+            _mc = {"HIGH": "#f85149", "ELEVATED": "#e3b341"}.get(_ml, "#3fb950")
+            st.markdown(
+                f"<div style='background:#161b22;border-left:5px solid {_mc};"
+                f"border-radius:6px;padding:8px 14px;margin:6px 0;color:#c9d1d9'>"
+                f"<b>🌐 Macro event risk: {_ml}</b> — {_macro.get('advice','')}"
+                f"</div>", unsafe_allow_html=True)
+            _up = _macro.get("upcoming") or []
+            if _up:
+                st.caption("Upcoming: " + " · ".join(
+                    f"{e['name']} ({e['days_away']}d{'≈' if e.get('approx_date') else ''})"
+                    for e in _up))
+
         # ── Panic (if firing) ────────────────────────────────────────────────
         if _cc.get("panic"):
             st.markdown("### 🚨 PANIC SIGNAL — highest-conviction buy")
@@ -3440,6 +3456,95 @@ with tab_analyst:
 
         st.caption(f"Generated {_brief['as_of'][:19]} UTC · symbol {_brief['symbol']} · "
                    f"This is probabilistic analysis, not a directional guarantee.")
+
+    # ── MACRO ENGINE — economic calendar + event risk + interpretation ───────
+    st.divider()
+    st.markdown("### 🌐 Macro Engine — What Moves the Market")
+    st.caption("The 'human logic' layer: macro data (jobs/CPI/PCE/FOMC) drives the "
+               "market more than charts. Knows what's coming, flags event risk so "
+               "you don't get blindsided, and explains the likely driver of recent moves.")
+    try:
+        from macro_engine import upcoming_events as _ue, event_risk as _erk, explain_recent as _exr
+        _er = _erk()
+        _erc = {"HIGH": "#f85149", "ELEVATED": "#e3b341"}.get(_er["level"], "#3fb950")
+        st.markdown(
+            f"<div style='background:#161b22;border-left:5px solid {_erc};"
+            f"border-radius:6px;padding:10px 14px;margin:6px 0;color:#c9d1d9'>"
+            f"<b>Event risk: {_er['level']}</b> · next: {_er.get('next_event','—')} "
+            f"in {_er.get('days_away','?')}d<br>"
+            f"<span style='color:#8b949e;font-size:0.9em'>{_er['advice']}</span></div>",
+            unsafe_allow_html=True)
+        # Why did the market move recently
+        try:
+            _vix_now = None; _spy5 = None
+            import yfinance as _yfm
+            _spydf = _yfm.download("SPY", period="10d", progress=False, auto_adjust=True)
+            if _spydf is not None and not _spydf.empty:
+                if hasattr(_spydf.columns, "get_level_values"):
+                    _spydf.columns = _spydf.columns.get_level_values(0)
+                _cl = _spydf["Close"].dropna()
+                if len(_cl) >= 6:
+                    _spy5 = float(_cl.iloc[-1]/_cl.iloc[-6]-1)*100
+            try:
+                _vix_now = float(_yfm.Ticker("^VIX").fast_info["last_price"])
+            except Exception:
+                pass
+            st.info("🔍 " + _exr(vix=_vix_now, spy_5d_pct=_spy5), icon="🧭")
+        except Exception:
+            pass
+        # Calendar
+        _evs = _ue(days_ahead=21)
+        if _evs:
+            import pandas as _pdm
+            st.dataframe(_pdm.DataFrame([{
+                "Date": e["date"], "In": f"{e['days_away']}d",
+                "Event": e["name"] + (" ≈" if e.get("approx_date") else ""),
+                "Impact": "🔴"*e["impact"] if e["impact"]>=5 else "🟠"*e["impact"],
+                "Time": e["time"],
+            } for e in _evs]), use_container_width=True, hide_index=True)
+            st.caption("≈ = approximate date (agencies set exact day; verify). "
+                       "Impact 🔴🔴🔴🔴🔴 = can move the whole market.")
+    except Exception as _me:
+        st.caption(f"(macro engine unavailable: {_me})")
+
+    # ── HIDDEN GEMS — strong fundamentals, weak technicals (the SOFI profile) ─
+    st.divider()
+    st.markdown("### 💎 Hidden Gems — Strong Fundamentals, Weak Technicals")
+    st.caption("The SOFI profile: great business, broken chart. NOT buys yet — "
+               "prime reversal-watch candidates. ✅ 'reversal-ready' = reclaimed "
+               "the 50-SMA (the validated turn trigger fired).")
+    if st.button("💎 Scan Hidden Gems", key="gems_btn", type="primary"):
+        try:
+            from sector_analysis import find_hidden_gems
+            _gp = st.progress(0.0, text="Scanning fundamentals + technicals…")
+            def _g_cb(i, n, t):
+                _gp.progress(min(i/max(n,1), 1.0), text=f"{t} ({i}/{n})")
+            with st.spinner("Finding strong-fundamentals / weak-technicals names…"):
+                _gems = find_hidden_gems(progress=_g_cb)
+            _gp.empty()
+            st.session_state["_gems"] = _gems
+        except Exception as _ge:
+            st.error(f"Scan failed: {_ge}")
+    _gems = st.session_state.get("_gems")
+    if _gems is None:
+        st.info("Hit **Scan Hidden Gems** to find SOFI-type names — strong "
+                "fundamentals trading at weak technicals.", icon="💎")
+    elif not _gems:
+        st.info("No clean hidden-gem candidates right now.", icon="📭")
+    else:
+        import pandas as _pdg
+        st.success(f"{len(_gems)} hidden gem(s)", icon="💎")
+        st.dataframe(_pdg.DataFrame([{
+            "Ticker": g["ticker"], "Sector": (g["sector"] or "")[:18],
+            "Price": f"${g['price']:.2f}", "Drawdown": f"{g['drawdown_pct']:.0f}%",
+            "Fwd P/E": f"{g['pe_fwd']:.0f}" if g.get("pe_fwd") else "—",
+            "EPS g": f"{(g['eps_growth_qoq'] or 0)*100:+.0f}%",
+            "Rev g": f"{(g['rev_growth'] or 0)*100:+.0f}%",
+            "50SMA": f"${g['sma50']:.2f}", "200SMA": f"${g['sma200']:.2f}",
+            "Status": "✅ reversal-ready" if g["reversal_ready"] else "👀 basing/down",
+        } for g in _gems]), use_container_width=True, hide_index=True)
+        st.caption("Watch the 👀 names for the 50-SMA reclaim → they flip to "
+                   "✅ reversal-ready, which is the validated entry trigger.")
 
     # ── REVERSAL FINDER — downtrend -> base -> uptrend watchlist ──────────────
     st.divider()

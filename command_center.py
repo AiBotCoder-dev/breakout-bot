@@ -135,6 +135,16 @@ def run_morning_scan(conn, progress=None, watchlist=None) -> dict:
         pass
     out["goal"] = goal
 
+    # 7) Macro event risk (jobs/CPI/PCE/FOMC) ─────────────────────────────────
+    macro = {}
+    try:
+        from macro_engine import event_risk, upcoming_events
+        macro = event_risk()
+        macro["upcoming"] = upcoming_events(days_ahead=14)[:4]
+    except Exception:
+        pass
+    out["macro"] = macro
+
     # ── Synthesise verdict ────────────────────────────────────────────────────
     out["verdict"], out["action"] = _verdict(out)
     out["as_of"] = datetime.utcnow().isoformat()
@@ -144,6 +154,12 @@ def run_morning_scan(conn, progress=None, watchlist=None) -> dict:
 def _verdict(out) -> tuple:
     m = out.get("market", {})
     bias = m.get("bias", "?"); risk = m.get("risk", "?")
+    macro = out.get("macro", {})
+    # Imminent binary macro event overrides everything except an active panic-buy
+    if not out.get("panic") and macro.get("level") == "HIGH":
+        return ("⏸ WAIT — MAJOR DATA IMMINENT",
+                f"{macro.get('advice','Major macro release imminent.')} "
+                f"Hold dry powder — the data can override every technical setup.")
     if out.get("panic"):
         return ("🚨 AGGRESSIVE BUY",
                 "Panic signal firing — historically the strongest buy. Scale into "

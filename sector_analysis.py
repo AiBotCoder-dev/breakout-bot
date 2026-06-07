@@ -393,6 +393,67 @@ def _divergence_score(s: dict) -> int:
     return max(0, min(100, pts))
 
 
+def find_hidden_gems(universe: list | None = None, top_n: int = 15,
+                     progress=None) -> list:
+    """
+    The SOFI profile: STRONG fundamentals + WEAK technicals (below 200-SMA).
+    These are 'great business, broken chart' names — not buys YET, but prime
+    reversal-watch candidates. Flags reversal_ready when price reclaims the
+    50-SMA (the validated turn trigger).
+    """
+    if universe is None:
+        try:
+            from momentum_strategy import LIQUID_UNIVERSE
+            universe = LIQUID_UNIVERSE
+        except Exception:
+            universe = []
+    results = []
+    uni = [t for t in universe if "." not in t]
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs = {ex.submit(_fundamental_snapshot, t): t for t in uni}
+        for i, fut in enumerate(as_completed(futs), 1):
+            if progress:
+                try: progress(i, len(futs), futs[fut])
+                except Exception: pass
+            s = fut.result()
+            if not s:
+                continue
+            # Strong fundamentals filter
+            pe = s.get("pe_fwd"); peg = s.get("peg"); eps_g = s.get("eps_growth_qoq")
+            op = s.get("op_m"); rev_g = s.get("rev_growth")
+            strong = 0
+            if pe and pe < 30: strong += 1
+            if peg and 0 < peg < 1.8: strong += 1
+            if eps_g and eps_g > 0.10: strong += 1
+            if rev_g and rev_g > 0.10: strong += 1
+            if op and op > 0.10: strong += 1
+            if strong < 3:                  # need genuinely strong fundamentals
+                continue
+            # Weak technicals: pull price vs 200/50 SMA
+            df = _hist(s["ticker"], "1y")
+            if df is None or len(df) < 210:
+                continue
+            c = df["Close"]; price = float(c.iloc[-1])
+            sma50 = float(c.iloc[-50:].mean()); sma200 = float(c.iloc[-200:].mean())
+            below_200 = price < sma200
+            if not below_200:               # must be technically weak (the divergence)
+                continue
+            drawdown = (price / float(c.iloc[-252:].max()) - 1) * 100 if len(c) >= 252 else 0
+            reversal_ready = price > sma50   # reclaimed the 50 = turn may be starting
+            results.append({
+                "ticker": s["ticker"], "sector": s.get("sector", ""),
+                "price": round(price, 2), "pe_fwd": pe, "peg": peg,
+                "eps_growth_qoq": eps_g, "rev_growth": rev_g, "op_m": op,
+                "drawdown_pct": round(drawdown, 1),
+                "below_200": below_200, "reversal_ready": reversal_ready,
+                "sma50": round(sma50, 2), "sma200": round(sma200, 2),
+                "fundamental_strength": strong,
+            })
+    # reversal-ready first, then deepest discount
+    results.sort(key=lambda r: (not r["reversal_ready"], r["drawdown_pct"]))
+    return results[:top_n]
+
+
 def find_fundamental_divergence(universe: list | None = None,
                                 top_n: int = 15, min_score: int = 50,
                                 progress=None) -> list:

@@ -1360,6 +1360,35 @@ def main():
     except Exception as _ive:
         print(f"  WARN IV snapshot failed: {_ive}")
 
+    # ── MACRO EVENT-RISK ALERT — once/day when a major release is imminent ────
+    try:
+        from macro_engine import event_risk as _erk, upcoming_events as _ue
+        _er = _erk()
+        if _er.get("level") in ("HIGH", "ELEVATED"):
+            conn.execute("CREATE TABLE IF NOT EXISTS macro_alert_state "
+                         "(id INTEGER PRIMARY KEY, last_date TEXT, last_event TEXT)")
+            _mrow = conn.execute("SELECT last_date, last_event FROM macro_alert_state "
+                                 "WHERE id=1").fetchone()
+            _mlast = (_mrow[0] if not hasattr(_mrow,'get') else _mrow.get('last_date')) if _mrow else None
+            _today = datetime.now().strftime("%Y-%m-%d")
+            _ev_key = f"{_er.get('next_event')}|{_er.get('next_date')}"
+            _mlast_ev = (_mrow[1] if not hasattr(_mrow,'get') else _mrow.get('last_event')) if _mrow else None
+            if _mlast != _today or _mlast_ev != _ev_key:
+                conn.execute("INSERT INTO macro_alert_state (id, last_date, last_event) "
+                             "VALUES (1,?,?) ON CONFLICT(id) DO UPDATE SET "
+                             "last_date=excluded.last_date, last_event=excluded.last_event",
+                             (_today, _ev_key))
+                _emoji = "🛑" if _er["level"] == "HIGH" else "⚠️"
+                send_telegram(
+                    f"{_emoji} <b>MACRO EVENT RISK: {_er['level']}</b>\n"
+                    f"{_er['advice']}\n"
+                    f"<i>Strong data keeps the Fed hawkish → growth/tech sells off "
+                    f"(the 'good news is bad news' mechanism). Trade smaller / wait.</i>")
+                print(f"  🌐 Macro event-risk alert sent: {_er['level']} "
+                      f"({_er.get('next_event')})")
+    except Exception as _mae:
+        print(f"  WARN macro event-risk check failed: {_mae}")
+
     # ── Whale-watch outcomes — cheap forward P&L update (every cycle) ──────────
     # The expensive `build()` (4 APIs × ~125 tickers) is dashboard-button only;
     # here we just refresh live prices for already-detected picks so the

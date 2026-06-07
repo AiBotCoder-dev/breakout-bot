@@ -1942,6 +1942,11 @@ def main():
                                  "TIME_STOP": "⏱"}.get(_x["reason"], "📕")
                         print(f"    {emoji} EXIT {_x['symbol']} {_x['reason']} "
                               f"{_x['pct']:+.0f}% (${_x['pnl']:+.0f})")
+                        try:
+                            from trade_journal import log_exit as _jlx
+                            _jlx(conn, _x["symbol"], _x["reason"], _x["pct"], _x["pnl"])
+                        except Exception:
+                            pass
                         send_telegram(
                             f"{emoji} <b>OPTION EXIT: {_x['underlying']}</b>\n"
                             f"{_x['symbol']}\n"
@@ -1991,6 +1996,25 @@ def main():
                         opened += 1
                         print(f"    ✅ ALPACA OPT BUY {contract['symbol']} x{qty} "
                               f"(~${prem:.2f}/ct, ${prem*100*qty:.0f})")
+                        # ── Journal: full attribution for later optimization ──
+                        try:
+                            from trade_journal import log_entry as _jle
+                            _jsec = ""
+                            try:
+                                import yfinance as _yfj
+                                _jsec = str((_yfj.Ticker(s["ticker"]).info or {}
+                                            ).get("sector", "") or "")
+                            except Exception:
+                                pass
+                            _jle(conn, contract_symbol=contract["symbol"],
+                                 underlying=s["ticker"], setup="momentum_call",
+                                 quality_score=s.get("quality_score"), sector=_jsec,
+                                 dte=s.get("dte"), iv=s.get("iv"),
+                                 otm_pct=s.get("otm_pct"), mom_6m=s.get("mom_6m"),
+                                 mom_3m=s.get("mom_3m"), entry_premium=prem,
+                                 qty=qty, cost=prem * 100 * qty)
+                        except Exception as _je:
+                            print(f"    (journal log_entry skipped: {_je})")
                         send_telegram(
                             f"🏦 <b>ALPACA PAPER OPTION BUY</b>\n"
                             f"{s['ticker']} ${contract['strike']:.0f}C exp {s['expiry']}\n"

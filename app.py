@@ -1512,6 +1512,56 @@ with tab_today:
                     "When": o["submitted_at"],
                 } for o in _ords]), use_container_width=True, hide_index=True)
 
+    # ── TRADE JOURNAL — attribution analytics (drives optimization) ───────────
+    st.markdown("### 📓 Trade Journal — What's Actually Working")
+    st.caption("Every broker option trade tagged by quality band, DTE, sector, "
+               "and momentum. After ~2-4 weeks this tells you WHICH trades make "
+               "money — so optimization is driven by evidence, not guesses.")
+    try:
+        from trade_journal import analyze as _tj_analyze, recent as _tj_recent
+        _ja = _tj_analyze(conn)
+    except Exception as _tje:
+        _ja = None
+        st.caption(f"(journal not available: {_tje})")
+    if _ja:
+        _ov = _ja.get("overall", {})
+        if _ov.get("n", 0) == 0:
+            st.info(f"No closed broker trades yet ({_ja.get('n_open',0)} open). "
+                    "Breakdowns populate as trades close — check back after a few "
+                    "days of the autonomous run.", icon="📓")
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Closed trades", _ov["n"])
+            c2.metric("Win rate", f"{_ov['win_rate']:.0f}%")
+            c3.metric("Expectancy", f"{_ov['expectancy']:+.0f}%/trade")
+            c4.metric("Total P&L", f"${_ov['total_pnl']:+,.0f}")
+            st.caption(f"Avg win {_ov['avg_win']:+.0f}% · avg loss "
+                       f"{_ov['avg_loss']:+.0f}% · {_ja.get('n_open',0)} still open")
+
+            import pandas as _pdj
+            def _bd_table(title, d):
+                if not d:
+                    return
+                st.markdown(f"**{title}**")
+                rows = [{"Bucket": k, "N": v.get("n",0),
+                         "Win%": f"{v.get('win_rate',0):.0f}%",
+                         "Expectancy": f"{v.get('expectancy',0):+.0f}%",
+                         "Total P&L": f"${v.get('total_pnl',0):+,.0f}"}
+                        for k, v in sorted(d.items(),
+                                           key=lambda x: -(x[1].get('expectancy') or 0))]
+                st.dataframe(_pdj.DataFrame(rows), use_container_width=True, hide_index=True)
+            _jc1, _jc2 = st.columns(2)
+            with _jc1:
+                _bd_table("By quality band", _ja.get("by_quality"))
+                _bd_table("By DTE", _ja.get("by_dte"))
+                _bd_table("By exit reason", _ja.get("by_exit"))
+            with _jc2:
+                _bd_table("By sector", _ja.get("by_sector"))
+                _bd_table("By momentum", _ja.get("by_momentum"))
+            st.caption("Read it like this: if a bucket has negative expectancy "
+                       "across a decent N, stop taking those trades. That's the "
+                       "evidence-based optimization.")
+
     # ── MORNING ROUTINE checklist ────────────────────────────────────────────
     st.divider()
     st.markdown("### ✅ Morning Routine (in order)")

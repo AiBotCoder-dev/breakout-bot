@@ -5301,6 +5301,46 @@ with tab_options:
     # SUB-TAB — PUT ENGINE (bearish, regime-gated)
     # ─────────────────────────────────────────────────────────────────────────
     with ot_puts:
+        # ── NEWS-REVERSAL PUTS (the validated put edge) ──────────────────────
+        st.markdown("### 📰 News-Reversal Puts — The Validated Put Edge")
+        st.caption(
+            "Backtest verdict: shorting OVEREXTENDED stocks LOSES — parabolic "
+            "(+4.8%/5d) and stretched (+4.3%/5d) names keep RISING ('overbought "
+            "gets more overbought'). The real put edge is EVENT-DRIVEN: a stock "
+            "gaps down on bad news regardless of the chart. This fires only on a "
+            "negative catalyst CONFIRMED by price breaking down."
+        )
+        if st.button("📰 Scan News-Reversal Puts", key="nrp_btn", type="primary"):
+            try:
+                from news_reversal_puts import NewsReversalPuts
+                with st.spinner("Scanning negative catalysts + RSI2 extremes…"):
+                    _nrp = NewsReversalPuts(conn).scan()
+                st.session_state["_nrp"] = _nrp
+            except Exception as _ne:
+                st.error(f"Scan failed: {_ne}")
+        _nrp = st.session_state.get("_nrp")
+        if _nrp is None:
+            st.info("Hit **Scan News-Reversal Puts**. Most days this is empty — it "
+                    "only fires on a real negative catalyst that price is confirming.",
+                    icon="📰")
+        elif not _nrp:
+            st.success("No news-reversal put setups firing — correct on a calm day. "
+                       "Don't short strength just because it looks 'too high'.", icon="✅")
+        else:
+            st.warning(f"{len(_nrp)} put setup(s)", icon="🔻")
+            for r in _nrp:
+                _stt = r["stats"]
+                with st.expander(f"🔻 **{r['ticker']}** @ ${r['price']:.2f} — "
+                                 f"{_stt['label']}", expanded=True):
+                    st.markdown(f"- **Setup:** {_stt['label']} ({_stt['edge']})\n"
+                                f"- **Catalyst:** {r['catalyst']}\n"
+                                f"- **Horizon:** {_stt['horizon']}")
+                    st.caption("News puts are high-variance — you're fighting upward "
+                               "drift. The edge is the catalyst + confirmation, not the "
+                               "chart looking high. Affordable weekly put suggestion is "
+                               "sent to Telegram automatically by the monitor.")
+        st.divider()
+
         st.markdown("### 🔻 Put Engine — Bearish (Regime-Gated)")
         st.caption(
             "The bearish counterpart to the call engines. Backtesting was blunt: "

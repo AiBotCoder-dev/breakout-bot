@@ -1872,6 +1872,39 @@ def main():
     except Exception as _pde:
         print(f"  WARN panic detector failed: {_pde}")
 
+    # ── NEWS-REVERSAL PUTS — alert on negative catalyst + price confirming ────
+    # The validated put edge (shorting overextension was backtest-rejected).
+    # Fires when a fresh bearish catalyst hits a liquid name AND price is breaking
+    # down. Sends the affordable weekly PUT. Deduped by ticker+day.
+    try:
+        from news_reversal_puts import NewsReversalPuts
+        _nrp_acct = ACCOUNT_EQUITY_OVERRIDE if ACCOUNT_EQUITY_OVERRIDE > 0 else 200.0
+        _nrps = NewsReversalPuts(conn, account=_nrp_acct).find_news_reversals()
+        if _nrps:
+            conn.execute("CREATE TABLE IF NOT EXISTS nrp_alert_state "
+                         "(ticker TEXT, alert_date TEXT, PRIMARY KEY(ticker, alert_date))")
+            _today = datetime.now().strftime("%Y-%m-%d")
+            for _r in _nrps[:3]:
+                _seen = conn.execute("SELECT 1 FROM nrp_alert_state WHERE ticker=? "
+                                     "AND alert_date=?", (_r["ticker"], _today)).fetchone()
+                if _seen:
+                    continue
+                conn.execute("INSERT INTO nrp_alert_state (ticker, alert_date) "
+                             "VALUES (?,?) ON CONFLICT DO NOTHING",
+                             (_r["ticker"], _today))
+                _eng = NewsReversalPuts(conn, account=_nrp_acct)
+                _putmsg = _eng.put_play(_r["ticker"], _r["catalyst"])
+                send_telegram(
+                    f"🔻 <b>NEWS-REVERSAL PUT: {_r['ticker']}</b>\n"
+                    f"Catalyst: {_r['catalyst'][:160]}\n"
+                    f"Price breaking down (below 20-EMA / red). "
+                    f"Validated put edge = negative catalyst + confirmation.")
+                if _putmsg:
+                    send_telegram(_putmsg)
+                print(f"  🔻 News-reversal put alert: {_r['ticker']}")
+    except Exception as _nre:
+        print(f"  WARN news-reversal puts failed: {_nre}")
+
     # ── PUT ENGINE REGIME GATE — alert when puts become active (bearish flip) ──
     # Puts lose in bull markets (backtested), so they're gated to bear/neutral
     # regime. Alert once when the gate OPENS (SPY drops to/below 200-SMA) — that's

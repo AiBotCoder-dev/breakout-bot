@@ -336,10 +336,14 @@ CREATE INDEX IF NOT EXISTS idx_callouts_user   ON paper_options_callouts(usernam
             return []
 
         collected = []
+        # Expanded subreddit set (free, same credentials). More callout volume.
+        _SUBS = ("options", "wallstreetbets", "thetagang", "smallstreetbets",
+                 "Optionswheel", "StockMarket", "Daytrading", "swingtrading",
+                 "options_trading", "Vitards")
         try:
             reddit = praw.Reddit(client_id=cid, client_secret=csec, user_agent=ua,
                                    check_for_async=False)
-            for sub_name in ("options", "wallstreetbets", "thetagang", "smallstreetbets"):
+            for sub_name in _SUBS:
                 try:
                     sub = reddit.subreddit(sub_name)
                     for post in sub.new(limit=max_per_sub):
@@ -358,9 +362,59 @@ CREATE INDEX IF NOT EXISTS idx_callouts_user   ON paper_options_callouts(usernam
                             collected.append(callout)
                 except Exception:
                     continue
+
+            # WSB DAILY-THREAD COMMENTS — where most live callouts actually are.
+            # The pinned daily discussion thread holds the real-time option calls
+            # that never become standalone posts.
+            try:
+                wsb = reddit.subreddit("wallstreetbets")
+                for sticky_i in (1, 2):
+                    try:
+                        thread = wsb.sticky(number=sticky_i)
+                    except Exception:
+                        continue
+                    if not thread or "discussion" not in (thread.title or "").lower():
+                        continue
+                    thread.comments.replace_more(limit=0)
+                    for cmt in thread.comments[:max_per_sub * 3]:
+                        ctext = getattr(cmt, "body", "") or ""
+                        callout = parse_callout(ctext)
+                        if callout:
+                            callout.update({
+                                "source":     "reddit/wsb_daily",
+                                "username":   str(cmt.author) if cmt.author else "[deleted]",
+                                "created_at": datetime.utcfromtimestamp(
+                                                  getattr(cmt, "created_utc", 0)).isoformat(),
+                                "raw_text":   ctext[:300],
+                            })
+                            collected.append(callout)
+            except Exception:
+                pass
         except Exception:
             return []
         return collected
+
+    def fetch_stocktwits_trending(self, max_symbols: int = 15,
+                                  max_per_ticker: int = 10) -> list:
+        """
+        Pull StockTwits TRENDING symbols (what's hot right now), then scan their
+        streams for callouts. Catches hyped names before they hit a per-ticker
+        scan. Free, no auth.
+        """
+        if requests is None:
+            return []
+        try:
+            r = requests.get("https://api.stocktwits.com/api/2/trending/symbols.json",
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            if r.status_code != 200:
+                return []
+            syms = [s.get("symbol") for s in (r.json().get("symbols") or [])]
+            syms = [s for s in syms if s][:max_symbols]
+        except Exception:
+            return []
+        if not syms:
+            return []
+        return self.fetch_stocktwits(tickers=syms, max_per_ticker=max_per_ticker)
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -445,6 +499,12 @@ CREATE INDEX IF NOT EXISTS idx_callouts_user   ON paper_options_callouts(usernam
         st_raw = self.fetch_stocktwits(tickers=tickers)
         for c in st_raw:
             new_callouts.append(c)
+        # StockTwits trending (hot names right now)
+        try:
+            for c in self.fetch_stocktwits_trending():
+                new_callouts.append(c)
+        except Exception:
+            pass
         if include_reddit:
             rd_raw = self.fetch_reddit()
             for c in rd_raw:
@@ -625,6 +685,50 @@ CREATE INDEX IF NOT EXISTS idx_callouts_user   ON paper_options_callouts(usernam
             return out
         except Exception:
             return []
+
+    # ── WIN-RATE GATE ─────────────────────────────────────────────────────────
+    # Backtest of the callout proxy (chasing hype) was ~zero-to-negative edge, so
+    # callouts are NOT trusted by default. A source only becomes ACTIONABLE once
+    # its CLOSED callouts prove a real win rate over a minimum sample.
+    GATE_MIN_CLOSED = 20      # need at least this many resolved callouts
+    GATE_MIN_WINRATE = 55.0   # and at least this win rate to be actionable
+
+    def get_source_winrates(self) -> list:
+        """Per-source win rate + sample + actionable flag (forward-measured)."""
+        try:
+            rows = self.conn.execute(
+                "SELECT source, COUNT(*) n_closed, "
+                "SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END) n_wins, "
+                "AVG(pnl_pct) avg_pnl FROM paper_options_callouts "
+                "WHERE status='CLOSED' GROUP BY source ORDER BY n_closed DESC"
+            ).fetchall()
+        except Exception:
+            return []
+        out = []
+        for r in rows or []:
+            d = dict(r)
+            n = int(d.get("n_closed") or 0); w = int(d.get("n_wins") or 0)
+            wr = round(w / n * 100, 1) if n else 0.0
+            actionable = (n >= self.GATE_MIN_CLOSED and wr >= self.GATE_MIN_WINRATE)
+            out.append({
+                "source": d.get("source"), "n_closed": n, "win_rate": wr,
+                "avg_pnl": round(float(d.get("avg_pnl") or 0), 1),
+                "actionable": actionable,
+                "status": ("✅ ACTIONABLE" if actionable else
+                           f"👀 observing ({n}/{self.GATE_MIN_CLOSED})"),
+            })
+        return out
+
+    def actionable_sources(self) -> set:
+        return {s["source"] for s in self.get_source_winrates() if s["actionable"]}
+
+    def get_actionable_callouts(self, limit: int = 30) -> list:
+        """Active callouts ONLY from sources that have proven a win rate."""
+        good = self.actionable_sources()
+        if not good:
+            return []
+        active = self.get_active_callouts(limit=200)
+        return [c for c in active if c.get("source") in good][:limit]
 
     def get_stats(self) -> dict:
         try:

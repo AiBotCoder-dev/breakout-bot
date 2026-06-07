@@ -3091,15 +3091,39 @@ with tab_mgmt:
     # ── SECTION 3.5 — OPTIONS CALLOUTS (SOCIAL AGGREGATOR) ───────────────────
     st.markdown("### 📢 Options Callouts — Social Watchlist")
     st.caption(
-        "Aggregates call/put ideas from StockTwits (+ Reddit if configured), "
-        "snapshots the option's premium when called, then tracks forward P&L. "
-        "**Research only — not auto-traded.** Builds a leaderboard of which "
-        "callers are actually profitable."
+        "Aggregates call/put ideas from StockTwits (incl. trending) + Reddit "
+        "(10 subs + the WSB daily-thread comments), snapshots the premium when "
+        "called, then tracks forward P&L. **Research only.** Backtest of chasing "
+        "social hype was ~zero/negative edge — so a source must EARN trust: it's "
+        "only 'actionable' after ≥55% win over ≥20 closed callouts."
     )
     try:
         from options_callouts import OptionsCalloutTracker
         _oct = OptionsCalloutTracker(conn)
         _oc_stats = _oct.get_stats()
+
+        # ── Win-rate gate: per-source proof before trust ────────────────────
+        _wr = _oct.get_source_winrates()
+        st.markdown("**🚦 Source win-rate gate** "
+                    "(forward-measured — callouts aren't trusted until proven):")
+        if _wr:
+            import pandas as _pdwr
+            st.dataframe(_pdwr.DataFrame([{
+                "Source": s["source"], "Closed": s["n_closed"],
+                "Win%": f"{s['win_rate']:.0f}%", "Avg P&L": f"{s['avg_pnl']:+.0f}%",
+                "Status": s["status"],
+            } for s in _wr]), use_container_width=True, hide_index=True)
+            _act = _oct.get_actionable_callouts(limit=20)
+            if _act:
+                st.success(f"✅ {len(_act)} ACTIONABLE callout(s) from proven sources",
+                           icon="✅")
+            else:
+                st.info("No source has cleared the win-rate gate yet — all callouts "
+                        "are in observation mode (tracked, not actionable). This is "
+                        "correct until the data proves a source.", icon="👀")
+        else:
+            st.caption("No closed callouts yet — sources start in observation. "
+                       "The gate populates as callouts resolve.")
 
         _ocm = st.columns(5)
         _ocm[0].metric("Total Tracked", _oc_stats.get("n_total", 0))

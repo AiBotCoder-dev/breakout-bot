@@ -346,21 +346,26 @@ class AlpacaPaperBroker:
             return None
 
     def manage_option_exits(self, tp_pct: float = 100.0, sl_pct: float = -50.0,
-                            dte_floor: int = 1) -> list:
+                            dte_floor: int = 1, put_tp_pct: float = 50.0,
+                            put_sl_pct: float = -45.0, put_max_hold: int = 3) -> list:
         """
-        Autonomous exit rules for every open option position:
-          • close at >= tp_pct unrealized   (take profit, default +100%)
-          • close at <= sl_pct unrealized   (stop loss, default -50%)
-          • close at <= dte_floor days left  (theta-cliff time stop)
+        Autonomous exit rules for every open option position.
+
+        CALLS (ride): +tp_pct take profit / sl_pct stop / DTE<=dte_floor time-stop.
+        PUTS (short-term quick profit): tighter — +put_tp_pct (default +50%) take
+        profit FAST, put_sl_pct stop, and a hard MAX-HOLD of put_max_hold days
+        (the bearish move reverts fast, so don't hold puts). Direction parsed from
+        the OCC symbol.
         Returns a list of {symbol, underlying, reason, pct, pnl} for each close.
         """
-        from datetime import date as _date
+        from datetime import date as _date, datetime as _dtm
         closed = []
         for p in self.get_option_positions():
             sym = p["symbol"]
             pct = p["unrealized_pct"]
             pnl = p["unrealized_pnl"]
             parsed = self.parse_occ_symbol(sym)
+            is_put = bool(parsed and parsed.get("type") == "put")
             dte = None
             if parsed:
                 try:
@@ -368,12 +373,19 @@ class AlpacaPaperBroker:
                 except Exception:
                     dte = None
 
+            # Per-direction thresholds. Puts = short-term quick profit: tighter
+            # TP/SL and a quicker time-stop (DTE<=2 vs <=1 for calls) so the
+            # autonomous loop banks the fast move instead of holding.
+            _tp = put_tp_pct if is_put else tp_pct
+            _sl = put_sl_pct if is_put else sl_pct
+            _dte_floor = 2 if is_put else dte_floor
+
             reason = None
-            if pct >= tp_pct:
+            if pct >= _tp:
                 reason = "TAKE_PROFIT"
-            elif pct <= sl_pct:
+            elif pct <= _sl:
                 reason = "STOP_LOSS"
-            elif dte is not None and dte <= dte_floor:
+            elif dte is not None and dte <= _dte_floor:
                 reason = "TIME_STOP"
 
             if reason:

@@ -41,12 +41,15 @@ from momentum_strategy import LIQUID_UNIVERSE
 
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
-OTM_PCT_MIN, OTM_PCT_MAX = 0.03, 0.12     # puts: 3-12% below spot
-DTE_MIN, DTE_MAX, DTE_IDEAL = 7, 35, 18
+# Puts are SHORT-TERM quick-profit trades, not long-term holds — the bearish move
+# reverts fast and theta + upward drift both work against holding. So short DTE +
+# quick take-profit.
+OTM_PCT_MIN, OTM_PCT_MAX = 0.03, 0.10     # puts: 3-10% below spot
+DTE_MIN, DTE_MAX, DTE_IDEAL = 2, 10, 5    # short-dated (was 7-35) — quick in/out
 COST_CAP_PER_CONTRACT = 6.00
 MIN_VOL, MIN_OI = 50, 100
 IV_HARD_CEILING = 1.40                     # puts carry skew → allow a touch higher
-TAKE_PROFIT_PCT, STOP_LOSS_PCT, TIME_STOP_DAYS = 100.0, -50.0, 10
+TAKE_PROFIT_PCT, STOP_LOSS_PCT, TIME_STOP_DAYS = 50.0, -45.0, 3   # quick profit, fast stop
 STRATEGY_LABEL = "bearish_put"
 
 # Per-stock backtest (4y) finding: individual high-beta names crash 10-30x more

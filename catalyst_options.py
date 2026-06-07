@@ -138,9 +138,21 @@ def format_alert(ticker: str, direction: str, catalyst: str,
                 f"\n⚠️ No weekly contract fits your ${account:.0f} account "
                 f"(all affordable strikes too illiquid or too pricey). "
                 f"Skip — don't force it.")
-    tp = round(contract["premium"] * 2.0, 2)      # +100%
-    sl = round(contract["premium"] * 0.5, 2)      # -50%
+    is_put = contract["direction"] == "put"
     n = max(1, contract["contracts_affordable"])
+    # PUTS are short-term quick-profit trades — the down-move reverts fast, so
+    # take profit quickly (+50%) and exit within 2-3 days. CALLS can ride (+100%).
+    if is_put:
+        tp = round(contract["premium"] * 1.5, 2)      # +50% quick
+        sl = round(contract["premium"] * 0.55, 2)     # -45%
+        plan = (f"\n<b>Plan (SHORT-TERM PUT):</b> take profit FAST +50% "
+                f"(≈${tp:.2f}) · stop -45% (≈${sl:.2f}) · "
+                f"<b>exit within 2-3 days</b> — the down-move reverts; don't hold.\n")
+    else:
+        tp = round(contract["premium"] * 2.0, 2)      # +100% ride
+        sl = round(contract["premium"] * 0.5, 2)      # -50%
+        plan = (f"\n<b>Plan:</b> exit +100% (≈${tp:.2f}) · stop -50% (≈${sl:.2f}) · "
+                f"don't hold into expiry day.\n")
     return (
         head +
         f"\n<b>ENTER:</b> {contract['ticker']} ${contract['strike']:.0f}"
@@ -151,8 +163,7 @@ def format_alert(ticker: str, direction: str, catalyst: str,
         f"({n}x fits your ${account:.0f})\n"
         f"Underlying ${contract['spot']:.2f} · IV {contract['iv']*100:.0f}% · "
         f"vol {contract['volume']} / OI {contract['open_interest']}\n"
-        f"\n<b>Plan:</b> exit +100% (≈${tp:.2f}) · stop -50% (≈${sl:.2f}) · "
-        f"don't hold into expiry day.\n"
+        + plan +
         f"<i>⚠️ Weekly news options are high-variance (fast theta + IV crush). "
         f"One ticket only. Verify price is still near ${contract['premium']:.2f} "
         f"before entering — alert may be up to ~5 min old.</i>"

@@ -1998,22 +1998,28 @@ def main():
                 # +100% take profit / -50% stop / DTE<=1 time-stop. This is what
                 # makes the bot safe to leave running for days unattended.
                 try:
-                    _exits = _ob.manage_option_exits(tp_pct=70, sl_pct=-50, dte_floor=2)
+                    # Trailing-stop exit manager (lets winners run; no profit cap)
+                    _exits = _ob.manage_option_exits(conn=conn)
                     for _x in _exits:
-                        emoji = {"TAKE_PROFIT": "🎯", "STOP_LOSS": "🛑",
+                        emoji = {"TRAILING_STOP": "🎯", "STOP_LOSS": "🛑",
                                  "TIME_STOP": "⏱"}.get(_x["reason"], "📕")
+                        _peak = _x.get("peak_pct")
+                        _peaktxt = f" (peak +{_peak:.0f}%)" if _peak is not None else ""
                         print(f"    {emoji} EXIT {_x['symbol']} {_x['reason']} "
-                              f"{_x['pct']:+.0f}% (${_x['pnl']:+.0f})")
+                              f"{_x['pct']:+.0f}%{_peaktxt} (${_x['pnl']:+.0f})")
                         try:
                             from trade_journal import log_exit as _jlx
                             _jlx(conn, _x["symbol"], _x["reason"], _x["pct"], _x["pnl"])
                         except Exception:
                             pass
+                        _pk = _x.get("peak_pct")
+                        _pktxt = (f"\nPeak reached: +{_pk:.0f}% (trailing stop "
+                                  f"banked the run)") if _pk is not None and _pk > 0 else ""
                         send_telegram(
                             f"{emoji} <b>OPTION EXIT: {_x['underlying']}</b>\n"
                             f"{_x['symbol']}\n"
-                            f"Reason: {_x['reason']}  ·  {_x['pct']:+.0f}% "
-                            f"(${_x['pnl']:+.0f})")
+                            f"Reason: {_x['reason']}  ·  closed {_x['pct']:+.0f}% "
+                            f"(${_x['pnl']:+.0f}){_pktxt}")
                     if _exits:
                         print(f"  Exit manager closed {len(_exits)} option position(s).")
                 except Exception as _xe:

@@ -143,16 +143,16 @@ def format_alert(ticker: str, direction: str, catalyst: str,
     # PUTS are short-term quick-profit trades — the down-move reverts fast, so
     # take profit quickly (+50%) and exit within 2-3 days. CALLS can ride (+100%).
     if is_put:
-        tp = round(contract["premium"] * 1.5, 2)      # +50% quick
         sl = round(contract["premium"] * 0.55, 2)     # -45%
-        plan = (f"\n<b>Plan (SHORT-TERM PUT):</b> take profit FAST +50% "
-                f"(≈${tp:.2f}) · stop -45% (≈${sl:.2f}) · "
-                f"<b>exit within 2-3 days</b> — the down-move reverts; don't hold.\n")
+        plan = (f"\n<b>Plan (SHORT-TERM PUT):</b> hard stop -45% (≈${sl:.2f}). "
+                f"Once up +40%, <b>trail a 25% stop below the peak</b> — let it run "
+                f"but bank the reversion. Exit within 2-3 days; the down-move reverts.\n")
     else:
-        tp = round(contract["premium"] * 2.0, 2)      # +100% ride
         sl = round(contract["premium"] * 0.5, 2)      # -50%
-        plan = (f"\n<b>Plan:</b> exit +100% (≈${tp:.2f}) · stop -50% (≈${sl:.2f}) · "
-                f"don't hold into expiry day.\n")
+        plan = (f"\n<b>Plan (LET IT RUN):</b> hard stop -50% (≈${sl:.2f}). "
+                f"Once up +50%, <b>trail a 30% stop below the peak</b> — NO profit "
+                f"cap, so a +200-300% runner keeps running; you only exit on a 30% "
+                f"pullback from the high. This is how you catch the home runs.\n")
     return (
         head +
         f"\n<b>ENTER:</b> {contract['ticker']} ${contract['strike']:.0f}"

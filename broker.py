@@ -345,25 +345,80 @@ class AlpacaPaperBroker:
         except Exception:
             return None
 
-    def manage_option_exits(self, tp_pct: float = 70.0, sl_pct: float = -50.0,
-                            dte_floor: int = 2, put_tp_pct: float = 50.0,
-                            put_sl_pct: float = -45.0, put_max_hold: int = 3) -> list:
+    def manage_option_exits(self, conn=None,
+                            activation_pct: float = 50.0, trail_frac: float = 0.30,
+                            hard_stop_pct: float = -50.0, dte_floor: int = 2,
+                            put_activation: float = 40.0, put_trail_frac: float = 0.25,
+                            put_hard_stop: float = -45.0) -> list:
         """
-        Autonomous exit rules for every open option position.
+        TRAILING-STOP exit manager — lets winners RUN (no take-profit cap) while
+        protecting gains. This is the answer to 'don't sell a +300% runner at +70%.'
 
-        CALLS (ride): +tp_pct take profit / sl_pct stop / DTE<=dte_floor time-stop.
-        PUTS (short-term quick profit): tighter — +put_tp_pct (default +50%) take
-        profit FAST, put_sl_pct stop, and a hard MAX-HOLD of put_max_hold days
-        (the bearish move reverts fast, so don't hold puts). Direction parsed from
-        the OCC symbol.
-        Returns a list of {symbol, underlying, reason, pct, pnl} for each close.
+        Logic per open option (direction parsed from the OCC symbol):
+          • Track the PEAK premium reached (persisted in broker_option_peaks).
+          • Before the trade reaches `activation_pct` (+50% calls / +40% puts):
+            hard stop only (-50% / -45%). Losers cut fast, no early profit-taking.
+          • Once activated: switch to a TRAILING stop at `trail_frac` below the
+            peak premium (30% calls / 25% puts). The stop RISES as the option
+            makes new highs, so it stays in the whole run and only exits on a
+            real pullback from the top — capturing the full move, capped by
+            nothing on the upside.
+          • Always: DTE<=floor time-stop (theta cliff).
+
+        conn (optional) persists the peak per contract across the 5-min cycles.
+        Returns a list of {symbol, underlying, reason, pct, pnl, peak_pct}.
         """
-        from datetime import date as _date, datetime as _dtm
+        from datetime import date as _date
+        if conn is not None:
+            try:
+                conn.execute("CREATE TABLE IF NOT EXISTS broker_option_peaks "
+                             "(contract_symbol TEXT PRIMARY KEY, peak_premium REAL, "
+                             "peak_pct REAL, activated INTEGER DEFAULT 0)")
+            except Exception:
+                conn = None
+
+        def _peak_read(sym):
+            if conn is None:
+                return None
+            try:
+                r = conn.execute("SELECT peak_premium, peak_pct, activated FROM "
+                                 "broker_option_peaks WHERE contract_symbol=?",
+                                 (sym,)).fetchone()
+                if not r:
+                    return None
+                g = (lambda k, i: r.get(k) if hasattr(r, "get") else r[i])
+                return (float(g("peak_premium", 0) or 0), float(g("peak_pct", 0) or 0),
+                        int(g("activated", 0) or 0))
+            except Exception:
+                return None
+
+        def _peak_write(sym, prem, pct, activated):
+            if conn is None:
+                return
+            try:
+                conn.execute("INSERT INTO broker_option_peaks "
+                             "(contract_symbol, peak_premium, peak_pct, activated) "
+                             "VALUES (?,?,?,?) ON CONFLICT(contract_symbol) DO UPDATE SET "
+                             "peak_premium=excluded.peak_premium, peak_pct=excluded.peak_pct, "
+                             "activated=excluded.activated",
+                             (sym, prem, pct, int(activated)))
+            except Exception:
+                pass
+
+        def _peak_clear(sym):
+            if conn is None:
+                return
+            try:
+                conn.execute("DELETE FROM broker_option_peaks WHERE contract_symbol=?", (sym,))
+            except Exception:
+                pass
+
         closed = []
         for p in self.get_option_positions():
             sym = p["symbol"]
             pct = p["unrealized_pct"]
             pnl = p["unrealized_pnl"]
+            cur_prem = p.get("current", 0) or 0
             parsed = self.parse_occ_symbol(sym)
             is_put = bool(parsed and parsed.get("type") == "put")
             dte = None
@@ -373,28 +428,38 @@ class AlpacaPaperBroker:
                 except Exception:
                     dte = None
 
-            # Per-direction thresholds. Puts = short-term quick profit: tighter
-            # TP/SL and a quicker time-stop (DTE<=2 vs <=1 for calls) so the
-            # autonomous loop banks the fast move instead of holding.
-            _tp = put_tp_pct if is_put else tp_pct
-            _sl = put_sl_pct if is_put else sl_pct
+            _act = put_activation if is_put else activation_pct
+            _trail = put_trail_frac if is_put else trail_frac
+            _hard = put_hard_stop if is_put else hard_stop_pct
             _dte_floor = 2 if is_put else dte_floor
 
+            # update peak
+            prev = _peak_read(sym)
+            peak_prem = max(prev[0] if prev else 0, cur_prem)
+            peak_pct = max(prev[1] if prev else -999, pct)
+            activated = bool((prev[2] if prev else 0)) or (peak_pct >= _act)
+            _peak_write(sym, peak_prem, peak_pct, activated)
+
             reason = None
-            if pct >= _tp:
-                reason = "TAKE_PROFIT"
-            elif pct <= _sl:
-                reason = "STOP_LOSS"
-            elif dte is not None and dte <= _dte_floor:
+            if dte is not None and dte <= _dte_floor:
                 reason = "TIME_STOP"
+            elif not activated:
+                if pct <= _hard:
+                    reason = "STOP_LOSS"
+            else:
+                # trailing: stop = peak premium minus trail fraction
+                trail_stop = peak_prem * (1 - _trail)
+                if cur_prem <= trail_stop and peak_prem > 0:
+                    reason = "TRAILING_STOP"
 
             if reason:
                 res = self.close_option(sym)
                 if res.get("ok"):
+                    _peak_clear(sym)
                     closed.append({"symbol": sym,
                                    "underlying": p.get("underlying", ""),
                                    "reason": reason, "pct": pct, "pnl": pnl,
-                                   "dte": dte})
+                                   "peak_pct": round(peak_pct, 0), "dte": dte})
         return closed
 
 

@@ -419,6 +419,11 @@ class AlpacaPaperBroker:
             pct = p["unrealized_pct"]
             pnl = p["unrealized_pnl"]
             cur_prem = p.get("current", 0) or 0
+            # GUARD: if Alpaca reports no/zero price (illiquid contract, thin
+            # quotes, before-open), do NOT make an exit decision — a 0 price would
+            # look like -100% and falsely trigger a stop. Skip until a real quote.
+            if cur_prem <= 0:
+                continue
             parsed = self.parse_occ_symbol(sym)
             is_put = bool(parsed and parsed.get("type") == "put")
             dte = None

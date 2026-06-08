@@ -2035,11 +2035,26 @@ def main():
                 print(f"  Sizing on ${equity:,.0f} effective equity "
                       f"(real ${real_equity:,.0f}) · ~${budget:.0f}/ticket · "
                       f"cap ${ticket_cap:.0f}")
+                # ── MACRO EVENT GATE — don't buy into a binary data print ──────
+                # Conservative: only SKIPS new entries when a major release
+                # (CPI/FOMC/Jobs) is imminent. Never causes a trade; exits above
+                # still run. Protects against e.g. buying calls the morning of CPI.
+                _macro_block = False
+                try:
+                    from macro_engine import event_risk as _erk
+                    if _erk().get("level") == "HIGH":
+                        _macro_block = True
+                        print("  ⏸ Macro event imminent (HIGH risk) — skipping new "
+                              "option buys this cycle (exits still active).")
+                except Exception:
+                    pass
+
                 held_u = _ob.held_option_underlyings()
                 # Higher frequency for a bigger profitability sample: scan more
                 # underlyings + open more per cycle. Quality gate stays at 55 so
                 # the sample is the REAL strategy, not watered-down trades.
-                setups = _mopt.find_setups(top_n_underlyings=12, min_quality_score=55)
+                setups = [] if _macro_block else _mopt.find_setups(
+                    top_n_underlyings=12, min_quality_score=55)
                 opened = 0
                 for s in setups:
                     if opened >= 4:

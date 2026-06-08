@@ -345,8 +345,8 @@ class AlpacaPaperBroker:
         except Exception:
             return None
 
-    def manage_option_exits(self, tp_pct: float = 100.0, sl_pct: float = -50.0,
-                            dte_floor: int = 1, put_tp_pct: float = 50.0,
+    def manage_option_exits(self, tp_pct: float = 70.0, sl_pct: float = -50.0,
+                            dte_floor: int = 2, put_tp_pct: float = 50.0,
                             put_sl_pct: float = -45.0, put_max_hold: int = 3) -> list:
         """
         Autonomous exit rules for every open option position.

@@ -45,9 +45,9 @@ COST_CAP_PER_CONTRACT   = 5.00     # max premium per share ($500 / contract).
                                    # (semis $100-500) had no qualifying contracts.
                                    # $5 keeps the "cheap" character while letting
                                    # 5-15% OTM 2-4wk calls on mid-priced names fit.
-TARGET_DTE_MIN          = 7        # shorter so capital isn't tied up on slow theses
-TARGET_DTE_MAX          = 28       # tightened from 42 — long-dated grind kills $/day ROI
-TARGET_DTE_IDEAL        = 14       # ~2 weeks: catalyst-friendly + bounded theta drag
+TARGET_DTE_MIN          = 5        # SHORT-TERM only — no long holds (user directive)
+TARGET_DTE_MAX          = 14       # ~2 weeks max (was 28) — quick in/out
+TARGET_DTE_IDEAL        = 9        # ~1.5 weeks — short hold, cheaper contract for $1k acct
 MIN_THESIS_PCT          = 8.0      # don't trade options if the expected move is < 8%
                                    # (the OTM strike + theta math doesn't pay otherwise)
 OTM_PCT_MIN             = 0.05     # 5% OTM minimum
@@ -56,9 +56,9 @@ LOTTERY_SIZE_PCT        = 0.05     # 5% of options cash per ticket (lottery)
 MAX_CONCURRENT_POSITIONS = 8
 MAX_NEW_PER_CYCLE       = 2
 
-TAKE_PROFIT_PCT         = 100.0    # +100% → take profit
+TAKE_PROFIT_PCT         = 70.0     # +70% → take profit (was 100 — bank it faster on short DTE)
 STOP_LOSS_PCT           = -50.0    # -50%  → cut
-EXIT_DTE_FLOOR          = 2        # ≤ 2 DTE → force exit (theta cliff)
+EXIT_DTE_FLOOR          = 3        # ≤ 3 DTE → force exit (theta cliff sooner on short calls)
 
 EARNINGS_AVOID_DAYS     = 7        # skip if earnings within N days
 IV_HARD_CEILING         = 1.20     # skip if call IV > 120% (vol way too rich)

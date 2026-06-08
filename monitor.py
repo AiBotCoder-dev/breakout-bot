@@ -1998,7 +1998,7 @@ def main():
                 # +100% take profit / -50% stop / DTE<=1 time-stop. This is what
                 # makes the bot safe to leave running for days unattended.
                 try:
-                    _exits = _ob.manage_option_exits(tp_pct=100, sl_pct=-50, dte_floor=1)
+                    _exits = _ob.manage_option_exits(tp_pct=70, sl_pct=-50, dte_floor=2)
                     for _x in _exits:
                         emoji = {"TAKE_PROFIT": "🎯", "STOP_LOSS": "🛑",
                                  "TIME_STOP": "⏱"}.get(_x["reason"], "📕")

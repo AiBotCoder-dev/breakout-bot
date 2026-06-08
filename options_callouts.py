@@ -493,7 +493,8 @@ CREATE INDEX IF NOT EXISTS idx_callouts_user   ON paper_options_callouts(usernam
     # ── Ingestion (idempotent) ───────────────────────────────────────────────
 
     def ingest_callouts(self, tickers: list = None,
-                         include_reddit: bool = True) -> dict:
+                         include_reddit: bool = True,
+                         include_youtube: bool = False) -> dict:
         """Pull from all sources, parse, snapshot premium, store new callouts."""
         new_callouts = []
         st_raw = self.fetch_stocktwits(tickers=tickers)
@@ -509,6 +510,14 @@ CREATE INDEX IF NOT EXISTS idx_callouts_user   ON paper_options_callouts(usernam
             rd_raw = self.fetch_reddit()
             for c in rd_raw:
                 new_callouts.append(c)
+        # YouTube finance-video transcripts (slow + cloud-flaky -> opt-in).
+        if include_youtube:
+            try:
+                from youtube_callouts import fetch_youtube_callouts
+                for c in fetch_youtube_callouts():
+                    new_callouts.append(c)
+            except Exception:
+                pass
 
         stored = 0
         skipped_existing = 0

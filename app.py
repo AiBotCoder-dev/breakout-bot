@@ -3136,10 +3136,13 @@ with tab_mgmt:
         with _oc_btns[0]:
             if st.button("📥 Pull Latest Callouts", key="mgmt_oc_pull",
                           use_container_width=True):
-                with st.spinner("Fetching social callouts + snapshotting premiums..."):
+                _inc_yt = st.session_state.get("oc_include_yt", False)
+                with st.spinner("Fetching social callouts + snapshotting premiums"
+                                + (" + YouTube transcripts (slow)" if _inc_yt else "") + "…"):
                     try:
                         _trk = _oct.track_outcomes(max_per_cycle=40)
-                        _ing = _oct.ingest_callouts(include_reddit=True)
+                        _ing = _oct.ingest_callouts(include_reddit=True,
+                                                    include_youtube=_inc_yt)
                         st.success(
                             f"Ingested {_ing.get('new_stored',0)} new "
                             f"(fetched {_ing.get('fetched',0)}, "
@@ -3162,6 +3165,10 @@ with tab_mgmt:
                         st.rerun()
                     except Exception as _te:
                         st.error(f"Refresh failed: {_te}")
+
+        st.checkbox("Include YouTube finance-video transcripts when pulling "
+                    "(spoken callouts; slower; may be IP-blocked on cloud)",
+                    value=False, key="oc_include_yt")
 
         # ── Active callouts (live P&L) ───────────────────────────────────────
         _active = _oct.get_active_callouts(limit=40)

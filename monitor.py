@@ -2035,6 +2035,38 @@ def main():
                 print(f"  Sizing on ${equity:,.0f} effective equity "
                       f"(real ${real_equity:,.0f}) · ~${budget:.0f}/ticket · "
                       f"cap ${ticket_cap:.0f}")
+
+                # ── VIRTUAL $1k PORTFOLIO + auto-reset on blow-up ──────────────
+                # Track the $1k bankroll carved from the real $100k. If the bot
+                # loses it, don't stop — bank the result, bump a lifetime counter,
+                # and start a fresh $1k off current real equity (~100 lives @ $100k).
+                # Pure accounting: does NOT change trade sizing above.
+                if ACCOUNT_EQUITY_OVERRIDE > 0 and real_equity > 0:
+                    try:
+                        import virtual_portfolio as _vp
+                        _vfloor = float(os.environ.get("VIRTUAL_BLOW_FLOOR", "0") or 0)
+                        _vs = _vp.step(conn, real_equity,
+                                       start=ACCOUNT_EQUITY_OVERRIDE, floor=_vfloor)
+                        if _vs.get("reset"):
+                            print(f"  💥 VIRTUAL $1k BLOWN — run #{_vs['blown_id']} "
+                                  f"wiped at ${_vs['blown_value']:,.0f}. Started "
+                                  f"#{_vs['new_id']} (lifetime blow-ups: "
+                                  f"{_vs['blow_count']}).")
+                            send_telegram(
+                                f"💥 <b>VIRTUAL $1k PORTFOLIO BLOWN</b>\n"
+                                f"Run #{_vs['blown_id']} wiped out "
+                                f"(ended ${_vs['blown_value']:,.0f}).\n"
+                                f"Auto-started fresh run "
+                                f"#{_vs['new_id']} @ ${ACCOUNT_EQUITY_OVERRIDE:,.0f}.\n"
+                                f"Lifetime $1k accounts blown: <b>{_vs['blow_count']}</b>\n"
+                                f"Real paper balance ${real_equity:,.0f} "
+                                f"(~{int(real_equity/ACCOUNT_EQUITY_OVERRIDE)} lives left).")
+                        else:
+                            print(f"  💼 Virtual $1k run #{_vs['active_id']} value "
+                                  f"${_vs['value']:,.0f} · lifetime blow-ups "
+                                  f"{_vs['blow_count']}")
+                    except Exception as _vpe:
+                        print(f"  WARN virtual portfolio step failed: {_vpe}")
                 # ── MACRO EVENT GATE — don't buy into a binary data print ──────
                 # Conservative: only SKIPS new entries when a major release
                 # (CPI/FOMC/Jobs) is imminent. Never causes a trade; exits above

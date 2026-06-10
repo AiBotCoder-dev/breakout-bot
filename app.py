@@ -1500,6 +1500,48 @@ with tab_today:
                 "real balance. Set `ACCOUNT_EQUITY_OVERRIDE=1000` (Streamlit + GitHub "
                 "secrets) to trade it as a $1k account.", icon="⚠️")
 
+        # ── VIRTUAL $1k PORTFOLIO + blow-up counter ───────────────────────────
+        # The $1k bankroll carved from the real $100k. When the bot loses it, it
+        # auto-resets to a fresh $1k and bumps a lifetime counter — a brutally
+        # honest survival stat ("the strategy blew N x $1k accounts").
+        if _ovr > 0:
+            try:
+                import virtual_portfolio as _vpmod
+                _vsum = _vpmod.summary(conn, _acct.get("equity", 0), start=_ovr)
+                vk1, vk2, vk3, vk4 = st.columns(4)
+                _cv = _vsum.get("current_value")
+                _vp = _vsum.get("pnl")
+                vk1.metric(f"Virtual run #{_vsum.get('active_id','—')}",
+                           f"${_cv:,.0f}" if _cv is not None else "—",
+                           delta=(f"{_vp:+,.0f} vs ${_ovr:,.0f}" if _vp is not None else None))
+                vk2.metric("💥 Lifetime blow-ups", f"{_vsum.get('blow_count',0)}")
+                vk3.metric("Lives left (@ $1k)", f"~{_vsum.get('lives_left',0)}")
+                vk4.metric("Real backing", f"${_vsum.get('real_equity',0):,.0f}")
+                _bc = _vsum.get("blow_count", 0)
+                if _bc == 0:
+                    st.caption("💼 First $1k run still alive. If it ever hits $0, the bot "
+                               "banks the result, **auto-starts a fresh $1k**, and adds 1 "
+                               "to the blow-up counter — no manual reset needed.")
+                else:
+                    st.caption(f"💥 The strategy has blown **{_bc}** virtual $1k account(s) "
+                               f"so far. Each blow-up = ~$1k of the $100k buffer spent. "
+                               f"A low blow-up count with a rising run value = the edge is real.")
+                # Past runs table
+                _runs = [r for r in (_vsum.get("runs") or []) if r.get("status") == "BLOWN"]
+                if _runs:
+                    import pandas as _pdvp
+                    _rdf = _pdvp.DataFrame([{
+                        "Run #": r.get("id"),
+                        "Started": str(r.get("started_at", ""))[:10],
+                        "Blown": str(r.get("ended_at", ""))[:10],
+                        "Ended at": (f"${float(r.get('final_value')):,.0f}"
+                                     if r.get("final_value") is not None else "—"),
+                    } for r in _runs])
+                    with st.expander(f"💥 Blown $1k runs ({len(_runs)})"):
+                        st.dataframe(_rdf, use_container_width=True, hide_index=True)
+            except Exception as _vpe:
+                st.caption(f"_Virtual portfolio unavailable: {_vpe}_")
+
         # Options-enabled status (you trade options, so this is the key check)
         try:
             _ost = _bk.options_status()

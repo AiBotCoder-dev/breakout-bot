@@ -375,6 +375,215 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  PREMIUM DESIGN SYSTEM  —  "AlphaDesk"  (layered on top; overrides the above)
+#  Glassmorphism · animated aurora · gradient accents · premium typography.
+#  Pure presentation: every existing class name is preserved, so all panels
+#  keep working — they just look like a flagship product now.
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap');
+
+:root{
+  --bg0:#070912; --bg1:#0b0e1c; --bg2:#11152a;
+  --glass:rgba(20,25,46,.55); --glassbrd:rgba(255,255,255,.08);
+  --txt:#e8ecf6; --dim:#97a0ba;
+  --cyan:#00e5ff; --violet:#8b5cff; --green:#2ee6a6; --red:#ff5d73; --amber:#ffc857;
+  --grad:linear-gradient(135deg,#00e5ff 0%,#6f8bff 50%,#a85cff 100%);
+  --shadow:0 8px 30px rgba(0,0,0,.45);
+}
+
+/* ── App background: deep space + layered aurora ── */
+.stApp{
+  background:
+    radial-gradient(1200px 600px at 12% -10%, rgba(0,229,255,.10), transparent 60%),
+    radial-gradient(1000px 700px at 100% 0%, rgba(139,92,255,.12), transparent 55%),
+    radial-gradient(900px 600px at 50% 120%, rgba(46,230,166,.06), transparent 60%),
+    linear-gradient(180deg,#070912 0%,#090b18 50%,#070912 100%) !important;
+  background-attachment:fixed !important;
+  color:var(--txt) !important;
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif !important;
+}
+.stApp::before{
+  content:''; position:fixed; inset:0; pointer-events:none; z-index:0;
+  background:
+    radial-gradient(600px 320px at 22% 18%, rgba(0,229,255,.06), transparent 70%),
+    radial-gradient(700px 420px at 78% 62%, rgba(139,92,255,.07), transparent 70%);
+  animation:aurora 18s ease-in-out infinite alternate;
+}
+@keyframes aurora{ 0%{transform:translate3d(0,0,0) scale(1); opacity:.75;} 100%{transform:translate3d(0,-2%,0) scale(1.05); opacity:1;} }
+
+/* ── Content layer + entrance ── */
+.block-container{ position:relative; z-index:1; padding-top:2rem; max-width:1500px; animation:fadein .6s ease both; }
+@keyframes fadein{ from{opacity:0; transform:translateY(10px);} to{opacity:1; transform:none;} }
+
+/* ── Typography ── */
+h1,h2,h3,h4,h5{ font-family:'Space Grotesk','Inter',sans-serif !important; letter-spacing:-.02em; color:var(--txt) !important; }
+.stMarkdown p, .stMarkdown li, label, .stCaption, [data-testid="stCaptionContainer"]{ color:var(--txt); }
+
+/* ── Sidebar glass ── */
+section[data-testid="stSidebar"]{
+  background:linear-gradient(180deg, rgba(13,16,32,.92), rgba(9,11,24,.94)) !important;
+  border-right:1px solid var(--glassbrd) !important; backdrop-filter:blur(14px);
+}
+
+/* ── Tabs: premium pill bar ── */
+.stTabs [data-baseweb="tab-list"]{
+  background:var(--glass) !important; border:1px solid var(--glassbrd); border-radius:14px;
+  padding:6px; gap:6px; backdrop-filter:blur(12px); box-shadow:var(--shadow);
+}
+.stTabs [data-baseweb="tab"]{
+  border-radius:10px; color:var(--dim); font-weight:600; font-size:.86rem;
+  padding:8px 15px; transition:all .2s ease; border:1px solid transparent;
+}
+.stTabs [data-baseweb="tab"]:hover{ color:var(--txt); background:rgba(255,255,255,.04); }
+.stTabs [aria-selected="true"]{
+  background:linear-gradient(135deg, rgba(0,229,255,.16), rgba(139,92,255,.18)) !important;
+  color:#fff !important; border:1px solid rgba(0,229,255,.35) !important; box-shadow:0 0 18px rgba(0,229,255,.18);
+}
+.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"]{ background:transparent !important; }
+
+/* ── Buttons: gradient + glow ── */
+.stButton>button, .stDownloadButton>button, [data-testid="stFormSubmitButton"]>button{
+  background:var(--grad) !important; color:#06070f !important; font-weight:700 !important;
+  border:none !important; border-radius:11px !important; padding:.55rem 1.15rem !important;
+  box-shadow:0 6px 20px rgba(0,229,255,.22); transition:transform .15s ease, box-shadow .2s ease, filter .2s; letter-spacing:.01em;
+}
+.stButton>button:hover, .stDownloadButton>button:hover, [data-testid="stFormSubmitButton"]>button:hover{
+  transform:translateY(-2px); box-shadow:0 10px 30px rgba(139,92,255,.38); filter:brightness(1.07);
+}
+.stButton>button:active{ transform:translateY(0); }
+.stButton>button[kind="secondary"]{
+  background:var(--glass) !important; color:var(--txt) !important; border:1px solid var(--glassbrd) !important; box-shadow:none;
+}
+.stButton>button[kind="secondary"]:hover{ border-color:rgba(0,229,255,.4) !important; box-shadow:0 0 16px rgba(0,229,255,.12); }
+
+/* ── Metrics: glass cards ── */
+[data-testid="stMetric"]{
+  background:var(--glass); border:1px solid var(--glassbrd); border-radius:16px; padding:16px 18px;
+  backdrop-filter:blur(12px); box-shadow:var(--shadow); transition:transform .18s ease, border-color .2s;
+}
+[data-testid="stMetric"]:hover{ transform:translateY(-2px); border-color:rgba(0,229,255,.28); }
+[data-testid="stMetricLabel"]{ color:var(--dim) !important; text-transform:uppercase; letter-spacing:.08em; font-size:.7rem !important; font-weight:600; }
+[data-testid="stMetricValue"]{ font-family:'JetBrains Mono',monospace !important; font-weight:700; color:var(--txt); }
+[data-testid="stMetricDelta"]{ font-family:'JetBrains Mono',monospace; }
+
+/* ── Inputs / selects ── */
+[data-baseweb="select"]>div, [data-baseweb="input"], .stTextInput input, .stNumberInput input, .stDateInput input, textarea{
+  background:rgba(10,13,26,.72) !important; border:1px solid var(--glassbrd) !important; border-radius:11px !important; color:var(--txt) !important;
+}
+[data-baseweb="select"]>div:focus-within, .stTextInput input:focus, .stNumberInput input:focus{
+  border-color:var(--cyan) !important; box-shadow:0 0 0 3px rgba(0,229,255,.15) !important;
+}
+
+/* ── Expanders ── */
+[data-testid="stExpander"]{
+  background:var(--glass); border:1px solid var(--glassbrd) !important; border-radius:14px !important;
+  backdrop-filter:blur(10px); overflow:hidden; box-shadow:var(--shadow);
+}
+[data-testid="stExpander"] summary{ font-weight:600; color:var(--txt); }
+[data-testid="stExpander"] summary:hover{ color:var(--cyan); }
+
+/* ── Dataframes / tables / alerts ── */
+[data-testid="stDataFrame"], [data-testid="stTable"]{ border:1px solid var(--glassbrd); border-radius:14px; overflow:hidden; }
+[data-testid="stAlert"]{ border-radius:14px !important; border:1px solid var(--glassbrd) !important; backdrop-filter:blur(8px); }
+
+/* ── Dividers: gradient hairline ── */
+hr, [data-testid="stDivider"]{ border:none !important; height:1px !important;
+  background:linear-gradient(90deg, transparent, rgba(0,229,255,.35), rgba(139,92,255,.35), transparent) !important; }
+
+/* ── Slider accent ── */
+[data-testid="stSlider"] [role="slider"]{ background:var(--cyan) !important; box-shadow:0 0 10px rgba(0,229,255,.5); }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar{ width:10px; height:10px; }
+::-webkit-scrollbar-track{ background:transparent; }
+::-webkit-scrollbar-thumb{ background:linear-gradient(180deg,#1c2747,#2a1f4d); border-radius:10px; border:2px solid transparent; background-clip:padding-box; }
+::-webkit-scrollbar-thumb:hover{ background:linear-gradient(180deg,#00e5ff,#8b5cff); background-clip:padding-box; }
+
+/* ════ Upgrade existing custom components to the new system ════ */
+.kpi-card{
+  background:var(--glass) !important; border:1px solid var(--glassbrd) !important; border-radius:16px;
+  padding:18px 20px; text-align:center; backdrop-filter:blur(12px); box-shadow:var(--shadow);
+  transition:transform .18s ease, border-color .2s;
+}
+.kpi-card:hover{ transform:translateY(-3px); border-color:rgba(0,229,255,.3); }
+.kpi-label{ font-size:.7rem; color:var(--dim); text-transform:uppercase; letter-spacing:.09em; font-weight:600; }
+.kpi-value{ font-size:2rem; font-weight:700; margin:6px 0 0; font-family:'JetBrains Mono',monospace; }
+.kpi-green{ color:var(--green); } .kpi-red{ color:var(--red); } .kpi-yellow{ color:var(--amber); }
+.kpi-blue{ background:var(--grad); -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; }
+
+.section-hdr{
+  font-size:.72rem; font-weight:700; color:var(--dim); letter-spacing:.12em; text-transform:uppercase;
+  border-bottom:1px solid var(--glassbrd); padding-bottom:8px; margin-bottom:16px;
+}
+
+.badge{ display:inline-block; border-radius:7px; padding:3px 10px; font-size:.72rem; font-weight:700; letter-spacing:.02em; }
+.badge-green{ background:rgba(46,230,166,.14); color:var(--green); border:1px solid rgba(46,230,166,.3); }
+.badge-red{ background:rgba(255,93,115,.14); color:var(--red); border:1px solid rgba(255,93,115,.3); }
+.badge-yellow{ background:rgba(255,200,87,.14); color:var(--amber); border:1px solid rgba(255,200,87,.3); }
+.badge-blue{ background:rgba(0,229,255,.14); color:var(--cyan); border:1px solid rgba(0,229,255,.3); }
+
+.stock-card{
+  background:var(--glass) !important; border:1px solid var(--glassbrd) !important; border-radius:18px;
+  padding:18px 20px; margin-bottom:8px; position:relative; overflow:hidden; backdrop-filter:blur(12px);
+  box-shadow:var(--shadow); transition:transform .18s ease, border-color .2s, box-shadow .2s;
+}
+.stock-card:hover{ transform:translateY(-3px); border-color:rgba(0,229,255,.35); box-shadow:0 14px 40px rgba(0,229,255,.12); }
+.stock-card::before{ content:''; position:absolute; top:0; left:0; right:0; height:3px; }
+.card-high::before{ background:linear-gradient(90deg,var(--cyan),var(--green)); }
+.card-medium::before{ background:linear-gradient(90deg,var(--amber),#ff9f43); }
+.card-low::before{ background:linear-gradient(90deg,var(--red),#ff2e63); }
+.card-ticker{ font-family:'Space Grotesk',sans-serif; font-size:1.4rem; font-weight:700; color:var(--txt); letter-spacing:-.02em; }
+.card-price{ font-family:'JetBrains Mono',monospace; font-size:1.02rem; color:var(--dim); margin-left:8px; }
+.card-pattern{ font-size:.82rem; color:var(--cyan); margin-top:5px; font-weight:600; }
+.card-explosive{ font-size:.76rem; color:var(--amber); margin-top:3px; }
+.card-divider{ border:none; border-top:1px solid var(--glassbrd); margin:12px 0; }
+.tg-val{ font-family:'JetBrains Mono',monospace; font-weight:700; color:var(--txt); }
+.tg-green{ color:var(--green) !important; } .tg-red{ color:var(--red) !important; } .tg-blue{ color:var(--cyan) !important; }
+.card-move{ color:var(--green); } .card-catalyst{ color:var(--amber); } .card-risk{ color:var(--red); }
+
+.ctx-bar{
+  background:var(--glass) !important; border:1px solid var(--glassbrd) !important; border-radius:16px;
+  padding:14px 20px; backdrop-filter:blur(12px); box-shadow:var(--shadow);
+}
+.ctx-val{ font-family:'JetBrains Mono',monospace; color:var(--txt); }
+
+.page-header{
+  background:linear-gradient(135deg, rgba(0,229,255,.08), rgba(139,92,255,.10)) !important;
+  border:1px solid var(--glassbrd) !important; border-radius:18px; padding:22px 26px;
+  box-shadow:var(--shadow); backdrop-filter:blur(12px);
+}
+.page-title{ font-family:'Space Grotesk',sans-serif; font-size:1.7rem; font-weight:700;
+  background:var(--grad); -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; }
+.page-sub{ color:var(--dim); }
+
+/* ── Brand masthead ── */
+.masthead{
+  position:relative; z-index:1; display:flex; align-items:center; justify-content:space-between;
+  flex-wrap:wrap; gap:14px; margin:0 0 22px;
+  background:linear-gradient(135deg, rgba(0,229,255,.10), rgba(139,92,255,.12));
+  border:1px solid var(--glassbrd); border-radius:20px; padding:18px 26px;
+  backdrop-filter:blur(16px); box-shadow:var(--shadow); overflow:hidden;
+}
+.masthead::after{ content:''; position:absolute; inset:0; pointer-events:none;
+  background:radial-gradient(420px 130px at 8% -10%, rgba(0,229,255,.18), transparent 70%); }
+.mh-left{ display:flex; align-items:center; gap:16px; z-index:1; }
+.mh-logo{ width:46px; height:46px; border-radius:13px; display:grid; place-items:center;
+  font-size:22px; color:#06070f; background:var(--grad); box-shadow:0 6px 22px rgba(0,229,255,.35); }
+.mh-title{ font-family:'Space Grotesk',sans-serif; font-size:1.5rem; font-weight:700; color:#fff; letter-spacing:.02em; line-height:1; }
+.mh-title span{ background:var(--grad); -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; }
+.mh-tag{ font-size:.72rem; color:var(--dim); letter-spacing:.2em; text-transform:uppercase; margin-top:6px; }
+.mh-right{ display:flex; align-items:center; gap:10px; z-index:1; flex-wrap:wrap; }
+.mh-pill{ font-size:.72rem; font-weight:600; color:var(--dim); border:1px solid var(--glassbrd);
+  background:rgba(10,13,26,.5); border-radius:20px; padding:6px 14px; letter-spacing:.04em; }
+.mh-pill.live{ color:var(--green); border-color:rgba(46,230,166,.35); }
+.mh-pill.live::before{ content:'●'; margin-right:6px; animation:pulse 1.6s ease-in-out infinite; }
+@keyframes pulse{ 0%,100%{opacity:1;} 50%{opacity:.25;} }
+</style>
+""", unsafe_allow_html=True)
+
 
 # ── Bulletproof sidebar-reopen button (JS, version-independent) ───────────────
 # CSS alone proved unreliable (Streamlit's collapsed-control testid changes
@@ -451,6 +660,24 @@ st.components.v1.html(
     """,
     height=0,
 )
+
+# ── Brand masthead (premium top bar shown once, above the tabs) ───────────────
+st.markdown("""
+<div class="masthead">
+  <div class="mh-left">
+    <div class="mh-logo">◆</div>
+    <div>
+      <div class="mh-title">ALPHA<span>DESK</span></div>
+      <div class="mh-tag">Autonomous Options Intelligence</div>
+    </div>
+  </div>
+  <div class="mh-right">
+    <span class="mh-pill live">LIVE</span>
+    <span class="mh-pill">Alpaca Paper</span>
+    <span class="mh-pill">AI-Driven</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

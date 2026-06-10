@@ -4007,6 +4007,68 @@ with tab_analyst:
         st.caption("Discipline: act on TRIGGERED (50-SMA reclaim), watch BASING for "
                    "the trigger, avoid chasing EXTENDED. Stop below the base.")
 
+    # ── Bottom Fisher — validated oversold-at-support dip buy ──────────────────
+    st.markdown("---")
+    st.markdown("### 🎣 Bottom Fisher — Catch the Validated Bottom")
+    st.caption(
+        "The EARLY-entry edge: buy oversold names (RSI<30) sitting within 6% of "
+        "their 60-day low, the day they tick green. Backtest (88 names, 6y, "
+        "realistic tight-stop exit): PF 1.71, n=539, expectancy +0.99%/trade, "
+        "R:R 2.63, ~59% 5-day bounce — **MCPT p=0.005 (real edge).** "
+        "HONEST: this wins LESS than half the time (~39% tradeable); it makes "
+        "money on reward:risk, not accuracy. There is no 80% foolproof bottom. "
+        "The bot trades it as a SECONDARY signal (smaller size) alongside momentum."
+    )
+    if st.button("🎣 Scan Bottoms", key="bf_btn", type="primary"):
+        try:
+            from bottom_fisher import BottomFisher
+            _bp = st.progress(0.0, text="Scanning for oversold-at-support bottoms…")
+            def _bf_cb(i, n, t):
+                _bp.progress(min(i/max(n,1), 1.0), text=f"{t} ({i}/{n})")
+            with st.spinner("Scanning liquid universe for the p=0.005 setup…"):
+                _bf_res = BottomFisher(conn).scan(progress=_bf_cb)
+            _bp.empty()
+            st.session_state["_bf_res"] = _bf_res
+        except Exception as _bfe:
+            st.error(f"Bottom scan failed: {_bfe}")
+
+    _bf_res = st.session_state.get("_bf_res")
+    if _bf_res is None:
+        st.info("Hit **Scan Bottoms** to find oversold names sitting on support that "
+                "just turned green. TRIGGERED = the validated entry; WATCH = oversold "
+                "at support but the knife is still falling (no green candle yet).",
+                icon="🎣")
+    elif not _bf_res:
+        st.info("No oversold-at-support setups right now — the market isn't handing "
+                "you bottoms today. That's fine; don't force it.", icon="📭")
+    else:
+        _bf_meta = {"TRIGGERED": ("#3fb950", "🎯", "Oversold + at support + turned green — the validated entry"),
+                    "WATCH":     ("#e3b341", "👀", "Oversold + at support but NOT yet green — wait for the turn")}
+        for _stage in ["TRIGGERED", "WATCH"]:
+            _rows = [r for r in _bf_res if r["stage"] == _stage]
+            if not _rows:
+                continue
+            _col, _ic, _desc = _bf_meta[_stage]
+            st.markdown(f"<div style='color:{_col};font-weight:700;margin-top:8px'>"
+                        f"{_ic} {_stage} ({len(_rows)}) — <span style='font-weight:400;"
+                        f"color:#8b949e'>{_desc}</span></div>", unsafe_allow_html=True)
+            import pandas as _pdb
+            df = _pdb.DataFrame([{
+                "Ticker": r["ticker"],
+                "Price": f"${r['price']:.2f}",
+                "RSI(14)": f"{r['rsi14']:.0f}",
+                "Above 60d-low": f"{r['dist_from_60d_low_pct']:.1f}%",
+                "Entry": f"${r['entry']:.2f}",
+                "Stop": f"${r['stop']:.2f}",
+                "Risk": f"{r['risk_pct']:.1f}%",
+                "Target": f"${r['target']:.2f}",
+            } for r in _rows])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        st.caption("Discipline: act on TRIGGERED only. Tight stop below the swing low "
+                   "is what makes the 2.6:1 reward:risk work. For OPTIONS, hold for the "
+                   "bounce with the premium trailing stop (the tight underlying stop "
+                   "gets whipsawed — that's why the bot manages exits on premium, not price).")
+
 
 with tab_whale:
     conn, _ww_mode = get_db()

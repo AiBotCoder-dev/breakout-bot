@@ -121,9 +121,15 @@ def _pick_expiry(expiries: list[str]) -> str | None:
     return best
 
 
-def select_call_contract(ticker: str, underlying_price: float) -> dict | None:
+def select_call_contract(ticker: str, underlying_price: float,
+                         otm_min: float | None = None,
+                         otm_max: float | None = None) -> dict | None:
     """
     Pick the best CALL contract for a momentum-aligned lottery ticket.
+
+    otm_min/otm_max override the default 5-15% OTM strike band. Bottom-fisher
+    bounce plays pass a nearer-the-money band (e.g. 0-8%) because the expected
+    move is a snap-back, not a multi-week trend extension, so more delta helps.
 
     Returns None when nothing meets the gates (cheap enough, OTM enough, real
     volume/OI, IV not insane). That's intentional — skipping is the right move
@@ -131,6 +137,8 @@ def select_call_contract(ticker: str, underlying_price: float) -> dict | None:
     """
     if yf is None or underlying_price <= 0:
         return None
+    _otm_lo = OTM_PCT_MIN if otm_min is None else otm_min
+    _otm_hi = OTM_PCT_MAX if otm_max is None else otm_max
 
     try:
         tk = yf.Ticker(ticker)
@@ -151,8 +159,8 @@ def select_call_contract(ticker: str, underlying_price: float) -> dict | None:
     if calls is None or calls.empty:
         return None
 
-    strike_lo = underlying_price * (1 + OTM_PCT_MIN)
-    strike_hi = underlying_price * (1 + OTM_PCT_MAX)
+    strike_lo = underlying_price * (1 + _otm_lo)
+    strike_hi = underlying_price * (1 + _otm_hi)
     cand = calls[(calls["strike"] >= strike_lo) & (calls["strike"] <= strike_hi)]
     if cand.empty:
         return None

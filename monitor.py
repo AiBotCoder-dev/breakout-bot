@@ -2088,7 +2088,8 @@ def main():
                 # logic lives in exactly one place. `setup_tag` is what lands in
                 # the journal: 'momentum_call' (real edge) vs
                 # 'momentum_call_explore' (data-floor top-up, kept separate).
-                def _attempt_entry(s, setup_tag):
+                def _attempt_entry(s, setup_tag, budget_override=None):
+                    _bud = budget_override if budget_override else budget
                     if s["ticker"] in held_u:
                         return False
                     contract = _ob.find_option_contract(
@@ -2103,7 +2104,7 @@ def main():
                         print(f"    {s['ticker']:6s} — 1 contract ${one_ct_cost:.0f} "
                               f"> cap ${ticket_cap:.0f}, too big for account, skip")
                         return False
-                    qty = max(1, int(budget // one_ct_cost)) if one_ct_cost > 0 else 1
+                    qty = max(1, int(_bud // one_ct_cost)) if one_ct_cost > 0 else 1
                     res = _ob.submit_option_buy(contract["symbol"], qty)
                     if not res.get("ok"):
                         print(f"    ✗ {s['ticker']:6s} — Alpaca opt order failed: "
@@ -2133,9 +2134,14 @@ def main():
                              qty=qty, cost=prem * 100 * qty)
                     except Exception as _je:
                         print(f"    (journal log_entry skipped: {_je})")
+                    _is_bf = setup_tag.startswith("bottom_fisher")
+                    _strat_line = (
+                        "🎣 <b>BOTTOM FISHER</b> — oversold-at-support dip buy "
+                        "(validated MCPT p=0.005; secondary size)\n" if _is_bf else "")
                     send_telegram(
-                        f"🏦 <b>ALPACA PAPER OPTION BUY</b>"
+                        f"{'🎣' if _is_bf else '🏦'} <b>ALPACA PAPER OPTION BUY</b>"
                         f"{' 🧪 (data-floor)' if _is_ex else ''}\n"
+                        f"{_strat_line}"
                         f"{s['ticker']} ${contract['strike']:.0f}C exp {s['expiry']}\n"
                         f"Qty: {qty} contract(s) @ ~${prem:.2f} "
                         f"(~${prem*100*qty:.0f})\n"
@@ -2153,6 +2159,32 @@ def main():
                         break
                     if _attempt_entry(s, "momentum_call"):
                         opened += 1
+
+                # ── BOTTOM FISHER PASS — validated oversold-at-support edge ────
+                # Enters EARLIER than momentum (buys the dip, not the breakout).
+                # MCPT p=0.005, PF 1.71. Sub-50% win rate by nature, so it's a
+                # SECONDARY signal: smaller size (60% of the momentum budget) and
+                # capped at 2/cycle. Skipped during HIGH macro event risk.
+                bf_opened = 0
+                if not _macro_block:
+                    try:
+                        from bottom_fisher import BottomFisher
+                        bf_setups = BottomFisher(conn).find_option_setups(max_setups=2)
+                        for s in bf_setups:
+                            if bf_opened >= 2:
+                                break
+                            if _attempt_entry(s, "bottom_fisher_call",
+                                              budget_override=budget * 0.6):
+                                bf_opened += 1
+                                opened += 1
+                        if bf_setups:
+                            print(f"  🎣 Bottom Fisher: opened {bf_opened} of "
+                                  f"{len(bf_setups)} oversold-at-support setup(s)")
+                        else:
+                            print("  🎣 Bottom Fisher: no oversold-at-support "
+                                  "triggers this cycle.")
+                    except Exception as _bfe:
+                        print(f"  WARN bottom fisher pass failed: {_bfe}")
 
                 # ── DATA-COLLECTION FLOOR — guarantee a minimum daily sample ───
                 # Strict gates can mean very few trades, so it takes weeks to learn

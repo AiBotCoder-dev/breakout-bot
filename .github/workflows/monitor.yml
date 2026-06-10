@@ -9,7 +9,10 @@ name: Position Monitor
 
 on:
   schedule:
-    - cron: '*/5 13-20 * * 1-5'   # every 5 min, 13:00-20:59 UTC, Mon-Fri
+    # GitHub frequently DROPS high-frequency '*/5' crons on busy public runners.
+    # Explicit minute lists are honored far more reliably than '*/N'.
+    # Fires ~every 10 min across the session (13:00-20:50 UTC, Mon-Fri).
+    - cron: '0,10,20,30,40,50 13-20 * * 1-5'
 
   workflow_dispatch:               # also allow manual trigger from GitHub UI
 

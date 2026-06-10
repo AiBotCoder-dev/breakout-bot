@@ -194,6 +194,27 @@ def analyze(conn) -> dict:
     }
 
 
+def count_opened_today(conn) -> int:
+    """How many broker option positions were opened today (UTC date)?
+
+    Used by the data-collection floor: if strict gates kept the bot from
+    trading, top up the day to a minimum sample (those extra trades are tagged
+    'momentum_call_explore' so they never pollute the real-strategy stats).
+    """
+    _ensure(conn)
+    try:
+        today = datetime.now(timezone.utc).date().isoformat()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM broker_trade_journal WHERE opened_at LIKE ?",
+            (today + "%",)
+        ).fetchone()
+        if row is None:
+            return 0
+        return int(row[0] if not hasattr(row, "get") else row.get("count", 0) or 0)
+    except Exception:
+        return 0
+
+
 def recent(conn, limit: int = 40) -> list:
     _ensure(conn)
     try:

@@ -2050,65 +2050,108 @@ def main():
                     pass
 
                 held_u = _ob.held_option_underlyings()
-                # Higher frequency for a bigger profitability sample: scan more
-                # underlyings + open more per cycle. Quality gate stays at 55 so
-                # the sample is the REAL strategy, not watered-down trades.
-                setups = [] if _macro_block else _mopt.find_setups(
-                    top_n_underlyings=12, min_quality_score=55)
-                opened = 0
-                for s in setups:
-                    if opened >= 4:
-                        break
+
+                # ── Single-entry helper — shared by the real-strategy pass and
+                # the data-collection floor pass so the order/journal/Telegram
+                # logic lives in exactly one place. `setup_tag` is what lands in
+                # the journal: 'momentum_call' (real edge) vs
+                # 'momentum_call_explore' (data-floor top-up, kept separate).
+                def _attempt_entry(s, setup_tag):
                     if s["ticker"] in held_u:
-                        continue
+                        return False
                     contract = _ob.find_option_contract(
                         s["ticker"], s["expiry"], "call", s["strike"])
                     if not contract or not contract.get("tradable"):
                         print(f"    {s['ticker']:6s} — no tradable Alpaca contract, skip")
-                        continue
+                        return False
                     prem = s.get("premium") or contract.get("close_price") or 0
                     one_ct_cost = prem * 100 if prem > 0 else 0
                     # Per-ticket cap: skip contracts too expensive for the account
                     if one_ct_cost > ticket_cap:
                         print(f"    {s['ticker']:6s} — 1 contract ${one_ct_cost:.0f} "
                               f"> cap ${ticket_cap:.0f}, too big for account, skip")
-                        continue
+                        return False
                     qty = max(1, int(budget // one_ct_cost)) if one_ct_cost > 0 else 1
                     res = _ob.submit_option_buy(contract["symbol"], qty)
-                    if res.get("ok"):
-                        opened += 1
-                        print(f"    ✅ ALPACA OPT BUY {contract['symbol']} x{qty} "
-                              f"(~${prem:.2f}/ct, ${prem*100*qty:.0f})")
-                        # ── Journal: full attribution for later optimization ──
-                        try:
-                            from trade_journal import log_entry as _jle
-                            _jsec = ""
-                            try:
-                                import yfinance as _yfj
-                                _jsec = str((_yfj.Ticker(s["ticker"]).info or {}
-                                            ).get("sector", "") or "")
-                            except Exception:
-                                pass
-                            _jle(conn, contract_symbol=contract["symbol"],
-                                 underlying=s["ticker"], setup="momentum_call",
-                                 quality_score=s.get("quality_score"), sector=_jsec,
-                                 dte=s.get("dte"), iv=s.get("iv"),
-                                 otm_pct=s.get("otm_pct"), mom_6m=s.get("mom_6m"),
-                                 mom_3m=s.get("mom_3m"), entry_premium=prem,
-                                 qty=qty, cost=prem * 100 * qty)
-                        except Exception as _je:
-                            print(f"    (journal log_entry skipped: {_je})")
-                        send_telegram(
-                            f"🏦 <b>ALPACA PAPER OPTION BUY</b>\n"
-                            f"{s['ticker']} ${contract['strike']:.0f}C exp {s['expiry']}\n"
-                            f"Qty: {qty} contract(s) @ ~${prem:.2f} "
-                            f"(~${prem*100*qty:.0f})\n"
-                            f"Quality {s.get('quality_score','?')}/100 · real broker fills\n"
-                            f"Acct equity ${equity:,.0f}")
-                    else:
+                    if not res.get("ok"):
                         print(f"    ✗ {s['ticker']:6s} — Alpaca opt order failed: "
                               f"{res.get('error')}")
-                print(f"  Momentum options (Alpaca paper): opened {opened}")
+                        return False
+                    held_u.add(s["ticker"])     # don't double-buy this cycle
+                    _is_ex = setup_tag.endswith("explore")
+                    print(f"    {'🧪' if _is_ex else '✅'} ALPACA OPT BUY "
+                          f"{contract['symbol']} x{qty} (~${prem:.2f}/ct, "
+                          f"${prem*100*qty:.0f}){' [data-floor]' if _is_ex else ''}")
+                    # ── Journal: full attribution for later optimization ──
+                    try:
+                        from trade_journal import log_entry as _jle
+                        _jsec = ""
+                        try:
+                            import yfinance as _yfj
+                            _jsec = str((_yfj.Ticker(s["ticker"]).info or {}
+                                        ).get("sector", "") or "")
+                        except Exception:
+                            pass
+                        _jle(conn, contract_symbol=contract["symbol"],
+                             underlying=s["ticker"], setup=setup_tag,
+                             quality_score=s.get("quality_score"), sector=_jsec,
+                             dte=s.get("dte"), iv=s.get("iv"),
+                             otm_pct=s.get("otm_pct"), mom_6m=s.get("mom_6m"),
+                             mom_3m=s.get("mom_3m"), entry_premium=prem,
+                             qty=qty, cost=prem * 100 * qty)
+                    except Exception as _je:
+                        print(f"    (journal log_entry skipped: {_je})")
+                    send_telegram(
+                        f"🏦 <b>ALPACA PAPER OPTION BUY</b>"
+                        f"{' 🧪 (data-floor)' if _is_ex else ''}\n"
+                        f"{s['ticker']} ${contract['strike']:.0f}C exp {s['expiry']}\n"
+                        f"Qty: {qty} contract(s) @ ~${prem:.2f} "
+                        f"(~${prem*100*qty:.0f})\n"
+                        f"Quality {s.get('quality_score','?')}/100"
+                        f"{' · DATA-FLOOR top-up (not the core edge)' if _is_ex else ' · real broker fills'}\n"
+                        f"Acct equity ${equity:,.0f}")
+                    return True
+
+                # ── REAL-STRATEGY PASS — quality ≥ 55, the honest sample ───────
+                setups = [] if _macro_block else _mopt.find_setups(
+                    top_n_underlyings=12, min_quality_score=55)
+                opened = 0
+                for s in setups:
+                    if opened >= 4:
+                        break
+                    if _attempt_entry(s, "momentum_call"):
+                        opened += 1
+
+                # ── DATA-COLLECTION FLOOR — guarantee a minimum daily sample ───
+                # Strict gates can mean very few trades, so it takes weeks to learn
+                # whether the edge is real. MIN_TRADES_PER_DAY (env, default 0 =
+                # off) tops up the day with the BEST setups *below* the normal bar,
+                # TAGGED 'momentum_call_explore' so they live in a separate journal
+                # bucket and never inflate or deflate the real-strategy win rate.
+                _min_day = int(os.environ.get("MIN_TRADES_PER_DAY", "0") or 0)
+                if _min_day > 0 and not _macro_block:
+                    try:
+                        from trade_journal import count_opened_today as _cot
+                        _done = _cot(conn)
+                    except Exception:
+                        _done = opened
+                    _need = _min_day - _done
+                    if _need > 0:
+                        _ex_floor = float(os.environ.get("EXPLORE_QUALITY_FLOOR", "35") or 35)
+                        print(f"  📊 Data floor: {_done}/{_min_day} trades today — "
+                              f"topping up up to {_need} exploration trade(s) "
+                              f"(quality ≥ {_ex_floor:.0f}, tagged separately).")
+                        for s in _mopt.find_setups(top_n_underlyings=25,
+                                                   min_quality_score=_ex_floor):
+                            if _need <= 0:
+                                break
+                            if _attempt_entry(s, "momentum_call_explore"):
+                                opened += 1
+                                _need -= 1
+                    else:
+                        print(f"  📊 Data floor met: {_done}/{_min_day} trades today.")
+
+                print(f"  Momentum options (Alpaca paper): opened {opened} this cycle")
 
                 # ── Once-per-day broker scorecard (track profitability over days)
                 try:

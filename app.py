@@ -778,7 +778,10 @@ def _render_market_clock():
 }})();
 </script></body></html>"""
 
-    st.html(html)
+    # IMPORTANT: use components.v1.html (iframe) NOT st.html — st.html() strips
+    # <script> tags, so the live-clock JS never runs and the time stays frozen
+    # on its "--:--:--" placeholder. The iframe executes the script.
+    st.components.v1.html(html, height=230)
 
 
 def _render_regime_banner(regime: dict):

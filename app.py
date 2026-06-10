@@ -1479,6 +1479,27 @@ with tab_today:
                    f"{_acct.get('status','?')} · this is a REAL broker paper "
                    f"account (simulated money, real fills).")
 
+        # Surface the position-sizing override so it's clear it's active. The
+        # Equity metric above is the REAL Alpaca balance ($100k); the override
+        # does NOT change it — it only throttles how big each trade is sized.
+        try:
+            _ovr = float(os.environ.get("ACCOUNT_EQUITY_OVERRIDE", "0") or 0)
+        except Exception:
+            _ovr = 0.0
+        if _ovr > 0:
+            st.info(
+                f"🎯 **Sizing override ACTIVE — trading as ${_ovr:,.0f}.** "
+                f"The ${_acct.get('equity',0):,.0f} above is the real paper balance, "
+                f"but the bot sizes every trade as if the account were ${_ovr:,.0f} "
+                f"(≈${_ovr*0.05:,.0f} budget/cycle, ${_ovr*0.20:,.0f} max per ticket). "
+                f"This is the disciplined small-account behavior you set.",
+                icon="🎯")
+        else:
+            st.warning(
+                "⚠️ No sizing override set — the bot will size trades off the FULL "
+                "real balance. Set `ACCOUNT_EQUITY_OVERRIDE=1000` (Streamlit + GitHub "
+                "secrets) to trade it as a $1k account.", icon="⚠️")
+
         # Options-enabled status (you trade options, so this is the key check)
         try:
             _ost = _bk.options_status()

@@ -680,6 +680,68 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  PREMIUM CHART THEME  —  every Plotly chart inherits this automatically.
+#  A thin wrapper on st.plotly_chart restyles ALL figures (even ones that hard-
+#  code their own colors) to transparent glass + neon grid + crosshair hover +
+#  the AlphaDesk colorway, so the charts feel alive and match the UI everywhere.
+# ══════════════════════════════════════════════════════════════════════════════
+import plotly.io as _pio
+
+_ALPHADESK_COLORWAY = ["#00e5ff", "#8b5cff", "#2ee6a6", "#ffc857", "#ff5d73",
+                       "#6f8bff", "#ff9f43", "#a85cff", "#3ad0ff"]
+
+_pio.templates["alphadesk"] = go.layout.Template(layout=dict(
+    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(family="Inter, sans-serif", color="#cdd5ea", size=12),
+    colorway=_ALPHADESK_COLORWAY,
+    hoverlabel=dict(bgcolor="rgba(12,15,28,0.92)", bordercolor="rgba(0,229,255,0.45)",
+                    font=dict(family="JetBrains Mono, monospace", color="#e8ecf6", size=11)),
+    legend=dict(bgcolor="rgba(12,15,28,0.55)", bordercolor="rgba(255,255,255,0.08)",
+                borderwidth=1, font=dict(size=10)),
+    title=dict(font=dict(family="Space Grotesk, sans-serif", color="#e8ecf6", size=15)),
+    xaxis=dict(gridcolor="rgba(255,255,255,0.06)", zerolinecolor="rgba(255,255,255,0.10)",
+               linecolor="rgba(255,255,255,0.12)", showspikes=True,
+               spikecolor="rgba(0,229,255,0.5)", spikethickness=1,
+               spikemode="across", spikedash="dot"),
+    yaxis=dict(gridcolor="rgba(255,255,255,0.06)", zerolinecolor="rgba(255,255,255,0.10)",
+               linecolor="rgba(255,255,255,0.12)"),
+    margin=dict(l=12, r=12, t=44, b=12),
+))
+_pio.templates.default = "alphadesk"
+try:
+    px.defaults.template = "alphadesk"
+    px.defaults.color_discrete_sequence = _ALPHADESK_COLORWAY
+except Exception:
+    pass
+
+_orig_plotly_chart = st.plotly_chart
+def _themed_plotly_chart(fig, *args, **kwargs):
+    """Apply the AlphaDesk premium theme to any figure right before render."""
+    try:
+        fig.update_layout(
+            template="alphadesk",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(family="Inter, sans-serif", color="#cdd5ea"),
+            hoverlabel=dict(bgcolor="rgba(12,15,28,0.92)",
+                            bordercolor="rgba(0,229,255,0.45)",
+                            font=dict(family="JetBrains Mono, monospace", color="#e8ecf6")),
+        )
+        # Style every axis (incl. subplots) without wiping titles/ranges.
+        fig.update_xaxes(gridcolor="rgba(255,255,255,0.06)",
+                         zerolinecolor="rgba(255,255,255,0.10)",
+                         showspikes=True, spikecolor="rgba(0,229,255,0.5)",
+                         spikethickness=1, spikemode="across", spikedash="dot")
+        fig.update_yaxes(gridcolor="rgba(255,255,255,0.06)",
+                         zerolinecolor="rgba(255,255,255,0.10)")
+        if fig.layout.hovermode is None:
+            fig.update_layout(hovermode="x unified")
+    except Exception:
+        pass
+    return _orig_plotly_chart(fig, *args, **kwargs)
+st.plotly_chart = _themed_plotly_chart
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def kpi(label: str, value: str, colour: str = "blue"):
     st.markdown(
@@ -2563,12 +2625,29 @@ with tab_mgmt:
             # module-level _df() query helper (Streamlit tab blocks share module
             # scope), breaking every later _df(...) call with "DataFrame is not
             # callable". Use a distinct local name.
-            _bench_df = _pdb.DataFrame({
-                "date": [s["date"] for s in _ser],
-                "Bot (momentum)": [round(s["bot_ret_pct"], 2) for s in _ser],
-                "SPY": [round(s["spy_ret_pct"], 2) for s in _ser],
-            }).set_index("date")
-            st.line_chart(_bench_df)
+            _dates    = [s["date"] for s in _ser]
+            _bot_vals = [round(s["bot_ret_pct"], 2) for s in _ser]
+            _spy_vals = [round(s["spy_ret_pct"], 2) for s in _ser]
+            _fig_bench = go.Figure()
+            # SPY benchmark — muted violet line
+            _fig_bench.add_trace(go.Scatter(
+                x=_dates, y=_spy_vals, name="SPY",
+                mode="lines", line=dict(color="#8b5cff", width=2, shape="spline"),
+                fill="tozeroy", fillcolor="rgba(139,92,255,0.06)",
+            ))
+            # Bot — glowing cyan with gradient fill on top
+            _fig_bench.add_trace(go.Scatter(
+                x=_dates, y=_bot_vals, name="Bot (momentum)",
+                mode="lines", line=dict(color="#00e5ff", width=3, shape="spline"),
+                fill="tozeroy", fillcolor="rgba(0,229,255,0.12)",
+            ))
+            _fig_bench.add_hline(y=0, line_color="rgba(255,255,255,0.18)", line_width=1)
+            _fig_bench.update_layout(
+                height=320, hovermode="x unified",
+                yaxis_title="Return %", legend=dict(orientation="h", y=1.12, x=0),
+                margin=dict(l=10, r=10, t=20, b=10),
+            )
+            st.plotly_chart(_fig_bench, use_container_width=True)
         else:
             st.caption("📈 Equity curve appears once 2+ daily snapshots exist.")
     else:
@@ -4639,20 +4718,22 @@ with tab_chart:
                 open=raw["Open"], high=raw["High"],
                 low=raw["Low"],   close=raw["Close"],
                 name="Price",
-                increasing_line_color="#3fb950",
-                decreasing_line_color="#f85149",
-                increasing_fillcolor="#3fb950",
-                decreasing_fillcolor="#f85149",
+                increasing_line_color="#2ee6a6",
+                decreasing_line_color="#ff5d73",
+                increasing_fillcolor="rgba(46,230,166,0.55)",
+                decreasing_fillcolor="rgba(255,93,115,0.55)",
+                line=dict(width=1.4),
+                whiskerwidth=0.6,
             ), row=1, col=1)
 
-            # Moving averages
-            for period_ma, colour in [(20,"#58a6ff"), (50,"#e3b341"), (200,"#ff7b72")]:
+            # Moving averages (neon)
+            for period_ma, colour in [(20,"#00e5ff"), (50,"#ffc857"), (200,"#a85cff")]:
                 if len(raw) >= period_ma:
                     ma = raw["Close"].rolling(period_ma).mean()
                     fig.add_trace(go.Scatter(
                         x=raw.index, y=ma, name=f"SMA{period_ma}",
-                        line=dict(color=colour, width=1.2),
-                        opacity=0.85,
+                        line=dict(color=colour, width=1.6, shape="spline"),
+                        opacity=0.9,
                     ), row=1, col=1)
 
             # Entry / Stop / Target overlays from scan result
@@ -4686,16 +4767,16 @@ with tab_chart:
                 for band, name in [(ub, "BB Upper"), (lb, "BB Lower")]:
                     fig.add_trace(go.Scatter(
                         x=raw.index, y=band, name=name,
-                        line=dict(color="#6e40c9", width=0.8, dash="dot"),
-                        opacity=0.5,
+                        line=dict(color="#8b5cff", width=0.9, dash="dot"),
+                        opacity=0.55,
                     ), row=1, col=1)
 
             # Volume bars
-            colors = ["#3fb950" if c >= o else "#f85149"
+            colors = ["rgba(46,230,166,0.65)" if c >= o else "rgba(255,93,115,0.65)"
                       for c, o in zip(raw["Close"], raw["Open"])]
             fig.add_trace(go.Bar(
                 x=raw.index, y=raw["Volume"], name="Volume",
-                marker_color=colors, opacity=0.7,
+                marker_color=colors, marker_line_width=0,
             ), row=2, col=1)
 
             # RSI
@@ -4706,9 +4787,10 @@ with tab_chart:
             rsi   = 100 - (100 / (1 + rs))
             fig.add_trace(go.Scatter(
                 x=raw.index, y=rsi, name="RSI",
-                line=dict(color="#e3b341", width=1.3),
+                line=dict(color="#ffc857", width=1.6, shape="spline"),
+                fill="tozeroy", fillcolor="rgba(255,200,87,0.06)",
             ), row=3, col=1)
-            for level, col_ in [(70,"#f85149"),(30,"#3fb950"),(50,"#8b949e")]:
+            for level, col_ in [(70,"#ff5d73"),(30,"#2ee6a6"),(50,"#8b949e")]:
                 fig.add_shape(type="line",
                               x0=raw.index[0], x1=raw.index[-1],
                               y0=level, y1=level, xref="x3", yref="y3",
@@ -4877,22 +4959,22 @@ with tab_analytics:
         if not pnl_df.empty:
             pnl_df["pnl_$"] = pnl_df["outcome_pct"] * 10_000
             pnl_df["cum"]   = pnl_df["pnl_$"].cumsum()
+            _pnl_pos = (pnl_df["cum"].iloc[-1] >= 0) if len(pnl_df) else True
+            _pnl_col = "#2ee6a6" if _pnl_pos else "#ff5d73"
+            _pnl_fill = "rgba(46,230,166,0.13)" if _pnl_pos else "rgba(255,93,115,0.13)"
             fig_pnl = go.Figure()
             fig_pnl.add_trace(go.Scatter(
                 x=list(range(len(pnl_df))), y=pnl_df["cum"],
-                fill="tozeroy",
-                line=dict(color="#58a6ff", width=2),
-                fillcolor="rgba(88,166,255,0.1)",
+                fill="tozeroy", mode="lines",
+                line=dict(color=_pnl_col, width=2.6, shape="spline"),
+                fillcolor=_pnl_fill,
                 name="Cumulative P&L",
             ))
-            fig_pnl.add_hline(y=0, line_color="#30363d")
+            fig_pnl.add_hline(y=0, line_color="rgba(255,255,255,0.18)", line_width=1)
             fig_pnl.update_layout(
-                paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
-                font=dict(color="#c9d1d9"), height=300,
+                height=300, hovermode="x unified",
                 xaxis_title="Trade #", yaxis_title="Cumulative P&L ($)",
                 margin=dict(l=10, r=10, t=10, b=10),
-                xaxis=dict(gridcolor="#21262d"),
-                yaxis=dict(gridcolor="#21262d"),
             )
             st.plotly_chart(fig_pnl, use_container_width=True)
 

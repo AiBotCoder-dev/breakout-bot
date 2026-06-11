@@ -1923,6 +1923,56 @@ with tab_today:
     except Exception as _oeu:
         st.caption(f"(overnight edge panel unavailable: {_oeu})")
 
+    # ── 🤖 CLAUDE PM — the AI portfolio manager layer ──────────────────────────
+    st.markdown("### 🤖 Claude PM — AI Portfolio Manager")
+    st.caption(
+        "Every weekday pre-market, a scheduled Claude agent reads the FULL data "
+        "pack (positions, journal, scans, news, VIP posts, macro, panic state) "
+        "and issues directives: open/close positions, pause entries on dangerous "
+        "days, or just send a market read. The bot executes them with guardrails "
+        "(24h expiry, max 3 opens/day, paper only). PM trades are tagged "
+        "`claude_pm_*` — tracked separately, so whether Claude actually beats "
+        "the bot is answered with data, not vibes."
+    )
+    try:
+        import claude_pm as _cpmui
+        _cpmui.ensure_tables(conn)
+        _sc2 = _cpmui.scorecard(conn)
+        _b = _sc2.get("bot", {}); _c = _sc2.get("claude_pm", {})
+        _k1, _k2 = st.columns(2)
+        with _k1:
+            st.markdown("**🤖 Bot (rules)**")
+            st.caption(f"closed {_b.get('closed_trades',0)} · "
+                       f"win {_b.get('win_rate',0):.0f}% · "
+                       f"avg {_b.get('avg_return_pct',0):+.1f}% · "
+                       f"P&L ${_b.get('total_pnl',0):+,.0f}")
+        with _k2:
+            st.markdown("**🧠 Claude PM (judgment)**")
+            st.caption(f"closed {_c.get('closed_trades',0)} · "
+                       f"win {_c.get('win_rate',0):.0f}% · "
+                       f"avg {_c.get('avg_return_pct',0):+.1f}% · "
+                       f"P&L ${_c.get('total_pnl',0):+,.0f}")
+        _dirs = conn.execute("SELECT created_at, action, ticker, symbol, status, "
+                             "result, rationale FROM claude_directives "
+                             "ORDER BY id DESC LIMIT 15").fetchall()
+        if _dirs:
+            import pandas as _pdcd
+            st.dataframe(_pdcd.DataFrame([{
+                "When": str((d.get("created_at") if hasattr(d, "get") else d[0]) or "")[:16],
+                "Action": d.get("action") if hasattr(d, "get") else d[1],
+                "Ticker": (d.get("ticker") if hasattr(d, "get") else d[2]) or
+                          (d.get("symbol") if hasattr(d, "get") else d[3]) or "—",
+                "Status": d.get("status") if hasattr(d, "get") else d[4],
+                "Result": (d.get("result") if hasattr(d, "get") else d[5]) or "—",
+                "Claude's reasoning": (d.get("rationale") if hasattr(d, "get") else d[6]) or "",
+            } for d in _dirs]), use_container_width=True, hide_index=True)
+        else:
+            st.info("No PM directives yet — the routine runs each weekday "
+                    "pre-market. Decisions and reasoning will appear here.",
+                    icon="🤖")
+    except Exception as _cpue:
+        st.caption(f"(Claude PM panel unavailable: {_cpue})")
+
     # ── TRADE JOURNAL — attribution analytics (drives optimization) ───────────
     st.markdown("### 📓 Trade Journal — What's Actually Working")
     st.caption("Every broker option trade tagged by quality band, DTE, sector, "

@@ -22,7 +22,7 @@ import os
 import re as _re
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ── make sure trading_scanner is importable from the same directory ───────────
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2193,6 +2193,116 @@ def main():
                         f"Acct equity ${equity:,.0f}")
                     return True
 
+                # ── 🤖 CLAUDE PM DIRECTIVES — execute the AI portfolio manager ─
+                # A scheduled Claude agent reviews the full data pack each
+                # morning and writes directives; the bot executes them here with
+                # guardrails (24h TTL, max 3 opens/day, paper only). PM trades
+                # are tagged claude_pm_* in the journal — tracked separately so
+                # "is Claude better than the bot?" gets answered with data.
+                _claude_pause = False
+                try:
+                    import claude_pm as _cpm
+                    _cpm.ensure_tables(conn)
+                    # persist live state snapshot for the PM's data pack
+                    try:
+                        import json as _json
+                        _snap = {"account": {k: acct.get(k) for k in
+                                             ("equity", "cash", "buying_power",
+                                              "day_pnl", "day_pnl_pct")},
+                                 "effective_equity": equity,
+                                 "option_positions": _ob.get_option_positions(),
+                                 "stock_positions": _ob.get_positions()}
+                        conn.execute(
+                            "INSERT INTO broker_state_snapshot (snap_key, taken_at, payload) "
+                            "VALUES ('latest', ?, ?) ON CONFLICT (snap_key) DO UPDATE "
+                            "SET taken_at=excluded.taken_at, payload=excluded.payload",
+                            (datetime.now(timezone.utc).isoformat(),
+                             _json.dumps(_snap, default=str)))
+                    except Exception as _spe:
+                        print(f"  (state snapshot skipped: {_spe})")
+
+                    _pm_opens_today = 0
+                    try:
+                        _r = conn.execute(
+                            "SELECT COUNT(*) FROM claude_directives WHERE "
+                            "status='EXECUTED' AND action IN ('OPEN_CALL','OPEN_PUT') "
+                            "AND executed_at >= ?",
+                            (datetime.now(timezone.utc).strftime("%Y-%m-%d"),)).fetchone()
+                        _pm_opens_today = int(_r[0] if not hasattr(_r, "get")
+                                              else _r.get("count", 0) or 0)
+                    except Exception:
+                        pass
+
+                    for _d in _cpm.pending(conn):
+                        _did = _d.get("id"); _act = str(_d.get("action", "")).upper()
+                        _dtk = str(_d.get("ticker", "") or "").upper()
+                        _dsym = str(_d.get("symbol", "") or "").upper()
+                        _rat = str(_d.get("rationale", "") or "")[:400]
+                        _status, _result = "EXECUTED", ""
+                        try:
+                            if _act == "NOTE":
+                                send_telegram(f"🤖 <b>CLAUDE PM — MARKET READ</b>\n{_rat}")
+                                _result = "note sent"
+                            elif _act == "PAUSE_ENTRIES":
+                                _claude_pause = True
+                                send_telegram(f"🤖 <b>CLAUDE PM — ENTRIES PAUSED TODAY</b>\n{_rat}")
+                                _result = "entries paused this cycle-day"
+                            elif _act == "CLOSE_ALL_OPTIONS":
+                                _n = 0
+                                for _p in _ob.get_option_positions():
+                                    if _ob.close_option(_p["symbol"]).get("ok"):
+                                        _n += 1
+                                send_telegram(f"🤖 <b>CLAUDE PM — FLATTENED OPTIONS BOOK</b>\n"
+                                              f"Closed {_n} position(s).\n{_rat}")
+                                _result = f"closed {_n}"
+                            elif _act == "CLOSE_OPTION" and _dsym:
+                                _r2 = _ob.close_option(_dsym)
+                                if _r2.get("ok"):
+                                    send_telegram(f"🤖 <b>CLAUDE PM — CLOSED {_dsym}</b>\n{_rat}")
+                                    _result = "closed"
+                                else:
+                                    _status, _result = "FAILED", str(_r2.get("error"))[:200]
+                            elif _act in ("OPEN_CALL", "OPEN_PUT") and _dtk:
+                                if _pm_opens_today >= 3:
+                                    _status, _result = "SKIPPED", "max 3 PM opens/day"
+                                else:
+                                    _otype = "call" if _act == "OPEN_CALL" else "put"
+                                    _px = _ob.get_price(_dtk) or 0
+                                    if _otype == "call":
+                                        from momentum_options import select_call_contract as _scc
+                                        _c = _scc(_dtk, _px) if _px > 0 else None
+                                    else:
+                                        from put_engine import select_put_contract as _spc
+                                        _c = _spc(_dtk, _px) if _px > 0 else None
+                                    if not _c:
+                                        _status, _result = "FAILED", "no suitable contract"
+                                    else:
+                                        _c["option_type"] = _otype
+                                        _c["sources"] = ["claude_pm"]
+                                        _c["quality_score"] = _c.get("quality_score")
+                                        if _attempt_entry(_c, f"claude_pm_{_otype}",
+                                                          budget_override=budget * 0.6):
+                                            _pm_opens_today += 1
+                                            _result = f"opened {_c.get('contract_symbol','?')}"
+                                            send_telegram(f"🤖 <b>CLAUDE PM RATIONALE</b>\n{_rat}")
+                                        else:
+                                            _status, _result = "FAILED", "entry blocked (cap/held/order)"
+                            else:
+                                _status, _result = "FAILED", "bad directive shape"
+                        except Exception as _dxe:
+                            _status, _result = "FAILED", str(_dxe)[:200]
+                        try:
+                            conn.execute(
+                                "UPDATE claude_directives SET status=?, executed_at=?, "
+                                "result=? WHERE id=?",
+                                (_status, datetime.now(timezone.utc).isoformat(),
+                                 _result, _did))
+                        except Exception:
+                            pass
+                        print(f"  🤖 PM directive {_act} {_dtk or _dsym}: {_status} ({_result})")
+                except Exception as _cpe:
+                    print(f"  WARN claude_pm executor failed: {_cpe}")
+
                 # ══ FULL MARKET SCAN — the trader's primary engine ═════════════
                 # ONE scan across EVERY validated tool on the site (momentum,
                 # bottom-fisher, PEAD, whale, VIP, movers, put-engine, news-puts,
@@ -2202,7 +2312,7 @@ def main():
                 # persists results (Best Options table) and fires NEW-setup
                 # Telegram alerts, so it replaces the standalone hourly meta-scan.
                 opened = 0
-                if not _macro_block:
+                if not _macro_block and not _claude_pause:
                     try:
                         from options_scanner import OptionsScanner
                         _fms = OptionsScanner(conn)
@@ -2239,7 +2349,7 @@ def main():
                 # TAGGED 'momentum_call_explore' so they live in a separate journal
                 # bucket and never inflate or deflate the real-strategy win rate.
                 _min_day = int(os.environ.get("MIN_TRADES_PER_DAY", "0") or 0)
-                if _min_day > 0 and not _macro_block:
+                if _min_day > 0 and not _macro_block and not _claude_pause:
                     try:
                         from trade_journal import count_opened_today as _cot
                         _done = _cot(conn)

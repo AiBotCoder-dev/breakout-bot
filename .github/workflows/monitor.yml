@@ -66,4 +66,8 @@ jobs:
           # Set to 0 to disable (pure discipline). Tune via repo secret if desired.
           MIN_TRADES_PER_DAY:    ${{ secrets.MIN_TRADES_PER_DAY || '3' }}
           EXPLORE_QUALITY_FLOOR: ${{ secrets.EXPLORE_QUALITY_FLOOR || '35' }}
+          # Macro event gate: hard = block all entries when CPI/FOMC imminent
+          # (real-money setting), soft = half-size through events (paper
+          # data-collection default), off = no gate.
+          MACRO_GATE:            ${{ secrets.MACRO_GATE || 'soft' }}
         run: python monitor.py

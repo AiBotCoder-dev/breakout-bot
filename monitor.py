@@ -2071,16 +2071,33 @@ def main():
                     except Exception as _vpe:
                         print(f"  WARN virtual portfolio step failed: {_vpe}")
                 # ── MACRO EVENT GATE — don't buy into a binary data print ──────
-                # Conservative: only SKIPS new entries when a major release
-                # (CPI/FOMC/Jobs) is imminent. Never causes a trade; exits above
-                # still run. Protects against e.g. buying calls the morning of CPI.
+                # MACRO_GATE env modes:
+                #   hard — block ALL new entries while event risk is HIGH (the
+                #          right setting for real money)
+                #   soft — keep trading through CPI/FOMC weeks at HALF size
+                #          (default for the paper data-collection account: with
+                #          CPI+FOMC in the same week a hard gate starves the
+                #          sample for half the month; half-size keeps discipline
+                #          AND data flowing — event-week fills are honest data)
+                #   off  — no gate (not recommended)
+                # Exits always run regardless.
                 _macro_block = False
+                _macro_size_mult = 1.0
+                _gate_mode = os.environ.get("MACRO_GATE", "soft").strip().lower()
                 try:
                     from macro_engine import event_risk as _erk
                     if _erk().get("level") == "HIGH":
-                        _macro_block = True
-                        print("  ⏸ Macro event imminent (HIGH risk) — skipping new "
-                              "option buys this cycle (exits still active).")
+                        if _gate_mode == "hard":
+                            _macro_block = True
+                            print("  ⏸ Macro event imminent (HIGH risk) — gate=hard, "
+                                  "skipping new option buys (exits still active).")
+                        elif _gate_mode == "off":
+                            print("  ⚠️ Macro event imminent (HIGH risk) — gate=off, "
+                                  "trading full size anyway.")
+                        else:
+                            _macro_size_mult = 0.5
+                            print("  ⚠️ Macro event imminent (HIGH risk) — gate=soft, "
+                                  "new entries at HALF size this cycle.")
                 except Exception:
                     pass
 
@@ -2092,7 +2109,8 @@ def main():
                 # the journal: 'momentum_call' (real edge) vs
                 # 'momentum_call_explore' (data-floor top-up, kept separate).
                 def _attempt_entry(s, setup_tag, budget_override=None):
-                    _bud = budget_override if budget_override else budget
+                    # soft macro gate halves the per-ticket budget during events
+                    _bud = (budget_override if budget_override else budget) * _macro_size_mult
                     _otype = s.get("option_type", "call")
                     _oc = _otype[0].upper()                  # 'C' or 'P'
                     if s["ticker"] in held_u:

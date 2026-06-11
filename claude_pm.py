@@ -208,6 +208,113 @@ def scorecard(conn) -> dict:
     return out
 
 
+# ── AUTONOMOUS CLOUD BRAIN — runs inside the monitor (no PC needed) ──────────
+# The user's PC is off during the day, so the local real-Claude routine can't
+# be relied on. This fallback brain runs in the GitHub Actions cycle once per
+# trading day (~9:20 ET): it compacts the data pack, asks the free AI provider
+# (Groq llama-3.3-70b via ai_engine) for PM directives, and inserts them.
+# PRECEDENCE: if directives were already created today (e.g. the real-Claude
+# local routine ran because the app was open), the brain SKIPS — the smarter
+# PM wins, the cloud brain is the always-on stand-in.
+
+def _compact_pack(pack: dict) -> dict:
+    """Trim the pack to what fits an LLM context cheaply."""
+    slim = {}
+    bs = pack.get("broker_state", {})
+    slim["account"] = bs.get("account")
+    slim["option_positions"] = [
+        {k: p.get(k) for k in ("symbol", "underlying", "qty", "avg_entry",
+                               "current", "unrealized_pct")}
+        for p in (bs.get("option_positions") or [])][:10]
+    slim["stock_positions"] = [
+        {k: p.get(k) for k in ("ticker", "qty", "avg_entry", "current")}
+        for p in (bs.get("stock_positions") or [])][:6]
+    slim["journal_recent"] = [
+        {k: t.get(k) for k in ("underlying", "setup", "quality_score",
+                               "exit_reason", "pnl_pct", "pnl_dollars")}
+        for t in (pack.get("trade_journal_recent") or [])][:15]
+    slim["scan_top"] = [
+        {k: s.get(k) for k in ("ticker", "option_type", "quality_score",
+                               "quality_grade", "sources", "premium", "dte")}
+        for s in (pack.get("best_options_scan") or [])][:10]
+    slim["macro"] = pack.get("macro")
+    slim["panic"] = pack.get("panic")
+    slim["momentum_top10"] = pack.get("momentum_top10")
+    slim["overnight_recent"] = (pack.get("overnight_edge") or [])[:5]
+    slim["vip_recent"] = [
+        {"who": v.get("vip_name"), "text": str(v.get("text", ""))[:140],
+         "tickers": v.get("tickers"), "sentiment": v.get("sentiment")}
+        for v in (pack.get("vip_posts_7d") or [])][:8]
+    slim["my_past_directives"] = [
+        {k: d.get(k) for k in ("created_at", "action", "ticker", "status", "result")}
+        for d in (pack.get("my_past_directives") or [])][:10]
+    return slim
+
+
+_BRAIN_PROMPT = """You are the portfolio manager for an autonomous options PAPER-trading bot (simulated money, strategy research). Below is today's full data pack. Decide today's directives.
+
+RULES:
+- Be selective. Most days the right call is ONE "NOTE" directive (your market read) and nothing else. Only trade when you see something the bot's rules miss (news context, conflicting signals, event risk).
+- Valid actions: OPEN_CALL (needs ticker), OPEN_PUT (needs ticker), CLOSE_OPTION (needs symbol from option_positions), CLOSE_ALL_OPTIONS, PAUSE_ENTRIES (today looks dangerous), NOTE.
+- Max 2 opens. Every directive needs a "rationale" (1-2 sentences, written for the account owner reading it on Telegram).
+- Check my_past_directives and journal_recent for claude_pm trades: if your past calls performed badly, say so in the NOTE and be more conservative.
+- ALWAYS include exactly one NOTE directive summarizing your read.
+
+RESPOND WITH ONLY A JSON ARRAY, no markdown, no prose. Example:
+[{"action":"NOTE","rationale":"CPI cooled, futures green; bot positioning fine, no changes."}]
+
+DATA PACK:
+"""
+
+
+def run_brain(conn, telegram=None) -> dict:
+    """Once-per-day autonomous PM decision via the free AI provider."""
+    ensure_tables(conn)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        r = conn.execute("SELECT COUNT(*) FROM claude_directives "
+                         "WHERE created_at >= ?", (today,)).fetchone()
+        n_today = int(r[0] if not hasattr(r, "get") else r.get("count", 0) or 0)
+    except Exception:
+        n_today = 0
+    if n_today > 0:
+        return {"ran": False, "why": f"{n_today} directive(s) already exist today "
+                                     f"(real-Claude PM or earlier brain run)"}
+
+    try:
+        from ai_engine import AIAnalyst
+        ai = AIAnalyst()
+        if not ai.available:
+            return {"ran": False, "why": "no AI provider configured"}
+    except Exception as e:
+        return {"ran": False, "why": f"ai_engine failed: {e}"}
+
+    pack = _compact_pack(build_pack(conn))
+    prompt = _BRAIN_PROMPT + json.dumps(pack, default=_json_default)[:14000]
+    try:
+        raw = ai._call(prompt, max_tokens=900)
+    except Exception as e:
+        return {"ran": False, "why": f"AI call failed: {e}"}
+
+    # extract the JSON array robustly
+    try:
+        s, e = raw.find("["), raw.rfind("]")
+        directives = json.loads(raw[s:e + 1]) if s >= 0 and e > s else []
+    except Exception:
+        return {"ran": False, "why": f"unparseable AI response: {raw[:200]}"}
+    if not isinstance(directives, list) or not directives:
+        return {"ran": False, "why": "AI returned no directives"}
+
+    # honesty label: these came from the stand-in cloud brain, not real Claude
+    for d in directives:
+        if isinstance(d, dict) and d.get("rationale"):
+            d["rationale"] = "(auto-PM) " + str(d["rationale"])
+    res = insert_directives(conn, directives[:5])
+    return {"ran": True, **res,
+            "actions": [str(d.get("action")) for d in directives[:5]
+                        if isinstance(d, dict)]}
+
+
 def _json_default(o):
     return str(o)
 

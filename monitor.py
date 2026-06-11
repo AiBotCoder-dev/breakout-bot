@@ -2193,6 +2193,25 @@ def main():
                         f"Acct equity ${equity:,.0f}")
                     return True
 
+                # ── 🧠 AUTONOMOUS PM BRAIN — fully cloud, no PC required ──────
+                # Once per trading day (first cycle at/after 9:20 ET) the brain
+                # reviews the compacted data pack via the free AI provider and
+                # writes directives. If the user's local real-Claude routine
+                # already decided today, the brain defers (skip guard inside).
+                try:
+                    import trading_scanner as _tsb
+                    _et_now = _tsb.MarketClock.now_et()
+                    if (_et_now.hour, _et_now.minute) >= (9, 20):
+                        import claude_pm as _cpmb
+                        _br = _cpmb.run_brain(conn, telegram=send_telegram)
+                        if _br.get("ran"):
+                            print(f"  🧠 PM brain decided: {_br.get('actions')} "
+                                  f"(inserted {_br.get('inserted')})")
+                        elif "already exist" not in str(_br.get("why", "")):
+                            print(f"  🧠 PM brain skipped: {_br.get('why')}")
+                except Exception as _bre:
+                    print(f"  WARN PM brain failed: {_bre}")
+
                 # ── 🤖 CLAUDE PM DIRECTIVES — execute the AI portfolio manager ─
                 # A scheduled Claude agent reviews the full data pack each
                 # morning and writes directives; the bot executes them here with

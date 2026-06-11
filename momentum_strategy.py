@@ -56,7 +56,8 @@ LIQUID_UNIVERSE = [
     # Industrials / energy / materials
     "CAT", "DE", "BA", "GE", "HON", "UPS", "RTX", "LMT", "XOM", "CVX", "COP", "SLB", "FCX", "LIN",
     # High-beta / momentum favorites (still liquid)
-    "PLTR", "COIN", "MSTR", "SHOP", "SQ", "SOFI", "HOOD", "DKNG", "RBLX", "SNOW", "CRWD", "DDOG", "NET", "MRVL", "SMCI",
+    # NOTE: Block Inc. renamed SQ -> XYZ (2025); SQ returns "possibly delisted"
+    "PLTR", "COIN", "MSTR", "SHOP", "XYZ", "SOFI", "HOOD", "DKNG", "RBLX", "SNOW", "CRWD", "DDOG", "NET", "MRVL", "SMCI",
 ]
 
 

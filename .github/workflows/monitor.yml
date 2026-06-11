@@ -70,4 +70,8 @@ jobs:
           # (real-money setting), soft = half-size through events (paper
           # data-collection default), off = no gate.
           MACRO_GATE:            ${{ secrets.MACRO_GATE || 'soft' }}
+          # 🌙 Overnight edge: buy the close, sell the open (tracked separately).
+          OVERNIGHT_EDGE:          ${{ secrets.OVERNIGHT_EDGE || 'on' }}
+          OVERNIGHT_TICKER:        ${{ secrets.OVERNIGHT_TICKER || 'QQQ' }}
+          OVERNIGHT_NOTIONAL_FRAC: ${{ secrets.OVERNIGHT_NOTIONAL_FRAC || '0.20' }}
         run: python monitor.py

@@ -1883,6 +1883,46 @@ with tab_today:
                     "When": o["submitted_at"],
                 } for o in _ords]), use_container_width=True, hide_index=True)
 
+    # ── 🌙 OVERNIGHT EDGE — tracked completely separately ──────────────────────
+    st.markdown("### 🌙 Overnight Edge — Buy the Close, Sell the Open")
+    st.caption(
+        "The 'markets trade on news' strategy: news lands after hours, so nearly "
+        "ALL index returns accrue close→open (10y backtest: QQQ overnight +255% "
+        "vs +104% intraday; TSLA +158% overnight vs −22% intraday). The bot buys "
+        "a fixed notional near the close (3:40-4:00 PM ET) and sells at the next "
+        "open. Stock trade, zero chart reading, **tracked 100% separately** from "
+        "the options book so you can see exactly what this method contributes."
+    )
+    try:
+        from overnight_edge import OvernightEdge as _OE
+        _oe_ui = _OE(conn, None)
+        _oe_sc = _oe_ui.scorecard()
+        _c1, _c2, _c3, _c4 = st.columns(4)
+        _c1.metric("Nights traded", _oe_sc["n"])
+        _c2.metric("Green nights", f"{_oe_sc['wins']} ({_oe_sc['win_rate']:.0f}%)")
+        _c3.metric("Total P&L", f"${_oe_sc['total_pnl']:+,.2f}")
+        _c4.metric("Avg / night", f"${_oe_sc['avg_pnl']:+,.2f}")
+        _oe_hist = _oe_ui.history(limit=20)
+        if _oe_hist:
+            import pandas as _pdoe
+            st.dataframe(_pdoe.DataFrame([{
+                "Ticker":  h["ticker"],
+                "Status":  h["status"],
+                "Bought":  h["entry_date"],
+                "Entry":   f"${(h['entry_price'] or 0):.2f}",
+                "Notional": f"${(h['notional'] or 0):.0f}",
+                "Sold":    h["exit_date"] or "—",
+                "Exit":    f"${(h['exit_price'] or 0):.2f}" if h["exit_price"] else "—",
+                "P&L":     f"${(h['pnl'] or 0):+.2f}" if h["pnl"] is not None else "—",
+                "P&L %":   f"{(h['pnl_pct'] or 0):+.2f}%" if h["pnl_pct"] is not None else "—",
+            } for h in _oe_hist]), use_container_width=True, hide_index=True)
+        else:
+            st.info("No overnight trades yet — the first buy fires in the "
+                    "3:40-4:00 PM ET window, the sell at the next open. Watch for "
+                    "🌙 Telegram alerts.", icon="🌙")
+    except Exception as _oeu:
+        st.caption(f"(overnight edge panel unavailable: {_oeu})")
+
     # ── TRADE JOURNAL — attribution analytics (drives optimization) ───────────
     st.markdown("### 📓 Trade Journal — What's Actually Working")
     st.caption("Every broker option trade tagged by quality band, DTE, sector, "

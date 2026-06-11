@@ -192,6 +192,26 @@ class AlpacaPaperBroker:
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}
 
+    def submit_notional_buy(self, ticker: str, notional: float) -> dict:
+        """
+        Plain market buy by DOLLAR amount (fractional shares, no bracket).
+        Used by the Overnight Edge: buy the close, sell at the open — exits are
+        time-based, not price-based, so no stop/target is attached.
+        Notional orders must be time_in_force='day' on Alpaca.
+        """
+        if not self.available():
+            return {"ok": False, "error": "broker not configured"}
+        body = {
+            "symbol": ticker.upper(), "notional": str(round(notional, 2)),
+            "side": "buy", "type": "market", "time_in_force": "day",
+        }
+        try:
+            o = self._post("/v2/orders", body)
+            return {"ok": True, "order_id": o.get("id"),
+                    "notional": round(notional, 2)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
+
     def close_position(self, ticker: str) -> dict:
         try:
             self._delete(f"/v2/positions/{ticker.upper()}")

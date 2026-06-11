@@ -1497,6 +1497,27 @@ def main():
                 print(f"    {p['ticker']:8s}  trailing stop now: ${p['trailing_stop']:.2f}"
                       f"  (T1 hit ✓, highest: ${p.get('highest_since_t1',0):.2f})")
 
+    # ── 🌙 OVERNIGHT EDGE — must run BEFORE the AVOID early-return ────────────
+    # Its SELL fires at the first cycle after the open (9:30-9:45 ET), which is
+    # exactly the AVOID window, so it runs here on every open cycle. Validated:
+    # ~all index returns accrue close->open (QQQ +255% vs +104% intraday, 10y).
+    # Tracked 100% separately in overnight_edge_log.
+    if BROKER_MODE == "alpaca_paper":
+        try:
+            from broker import AlpacaPaperBroker as _OEB
+            from overnight_edge import OvernightEdge
+            _oeb = _OEB()
+            if _oeb.available():
+                _oe_eq = (ACCOUNT_EQUITY_OVERRIDE if ACCOUNT_EQUITY_OVERRIDE > 0
+                          else _oeb.get_account().get("equity", 0) or 0)
+                _oe_res = OvernightEdge(conn, _oeb).step(_oe_eq,
+                                                         telegram=send_telegram)
+                if _oe_res.get("action") not in ("wait", "hold",
+                                                 "market_closed", "disabled"):
+                    print(f"  🌙 Overnight edge: {_oe_res.get('action')}")
+        except Exception as _oee:
+            print(f"  WARN overnight edge failed: {_oee}")
+
     # ── Skip new entries during AVOID window ──────────────────────────────────
     if quality == "AVOID":
         print(f"\n  AVOID window — skipping auto-entry.")

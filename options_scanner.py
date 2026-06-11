@@ -37,11 +37,30 @@ MIN_QUALITY_SHOW   = 50      # what shows in the dashboard
 MIN_QUALITY_ALERT  = 70      # what fires a Telegram alert
 MAX_RESULTS        = 12
 PER_SOURCE_LIMIT   = {       # per-source candidate caps (controls API load)
-    "momentum": 15,
-    "pead":     10,
-    "whale":    10,
-    "vip":      10,
-    "mover":    10,
+    "momentum":      15,
+    "pead":          10,
+    "whale":         10,
+    "vip":           10,
+    "mover":         10,
+    "bottom_fisher":  6,     # validated oversold-at-support (p=0.005)  CALLS
+    "reversal":       6,     # downtrend→base→uptrend TRIGGERED         CALLS
+    "put_engine":     8,     # validated bearish edge                   PUTS
+    "news_put":       6,     # news-reversal puts (validated)           PUTS
+    "panic":          2,     # capitulation → index calls (100% 60d)    CALLS
+}
+
+# Per-source default direction + the validated-edge note shown to the user.
+SOURCE_META = {
+    "momentum":      ("call", "Cross-sectional momentum (MCPT p=0.004)"),
+    "pead":          ("call", "Post-earnings drift (the safe earnings edge)"),
+    "whale":         ("call", "Smart money — Congress / 13D / Form 4 / gov"),
+    "vip":           ("call", "Tracked VIP (Trump/Fed) mention < 7d"),
+    "mover":         ("call", "Unified-scanner catalyst mover"),
+    "bottom_fisher": ("call", "Oversold-at-support bottom (MCPT p=0.005)"),
+    "reversal":      ("call", "Downtrend→base→uptrend reclaim (62% @60d)"),
+    "put_engine":    ("put",  "Validated bearish breakdown edge"),
+    "news_put":      ("put",  "News-reversal put (validated)"),
+    "panic":         ("call", "Capitulation rebound (100% win @60d, 12y)"),
 }
 
 
@@ -75,20 +94,32 @@ class OptionsScanner:
         except Exception as e:
             print(f"  [opt-scan] table init failed: {e}")
 
-    # ── candidate gathering — pull from every signal source ────────────────────
-    def gather_candidates(self) -> dict[str, dict]:
+    # ── candidate gathering — pull from EVERY validated tool on the site ───────
+    def gather_candidates(self, fast: bool = False) -> dict[str, dict]:
         """
-        Returns { ticker: { "sources": set, "price_hint": float|None,
-                            "mom_6m": float|None, "mom_3m": float|None } }
+        The full market scan. Pulls option candidates (CALLS and PUTS) from every
+        validated engine, keyed by "TICKER|DIRECTION" so a name can appear as both
+        a call and a put idea from different tools.
+
+        fast=True bounds the heaviest network sources (skips the 2y reversal
+        download) so the live paper-trader cycle stays inside its time budget.
+        The user-triggered dashboard scan uses fast=False for full coverage.
+
+        Returns { "TICKER|dir": { ticker, direction, sources:set, price_hint,
+                                  mom_6m, mom_3m, thesis_hint } }
         """
         uni: dict[str, dict] = {}
 
-        def add(tk, source, price=None, mom_6m=None, mom_3m=None):
+        def add(tk, source, direction=None, price=None, mom_6m=None,
+                mom_3m=None, thesis=None):
             tk = str(tk or "").upper().strip()
             if not tk or "." in tk:
                 return
-            e = uni.setdefault(tk, {"sources": set(), "price_hint": None,
-                                    "mom_6m": None, "mom_3m": None})
+            d = direction or SOURCE_META.get(source, ("call", ""))[0]
+            key = f"{tk}|{d}"
+            e = uni.setdefault(key, {"ticker": tk, "direction": d, "sources": set(),
+                                     "price_hint": None, "mom_6m": None,
+                                     "mom_3m": None, "thesis_hint": None})
             e["sources"].add(source)
             if price and (e["price_hint"] is None):
                 e["price_hint"] = float(price)
@@ -96,73 +127,143 @@ class OptionsScanner:
                 e["mom_6m"] = float(mom_6m)
             if mom_3m is not None and e["mom_3m"] is None:
                 e["mom_3m"] = float(mom_3m)
+            if thesis is not None and (e["thesis_hint"] is None or thesis > e["thesis_hint"]):
+                e["thesis_hint"] = float(thesis)
 
-        # 1. Momentum leaders (PRIMARY — validated edge)
+        # 1. Momentum leaders (PRIMARY validated edge) — CALLS
         try:
             from momentum_strategy import MomentumStrategy
             for r in MomentumStrategy(self.conn).rank(
                     top_n=PER_SOURCE_LIMIT["momentum"], min_mom_6m=0.05):
-                add(r["ticker"], "momentum",
-                    price=r.get("price"),
-                    mom_6m=r.get("mom_6m"),
-                    mom_3m=r.get("mom_3m"))
+                add(r["ticker"], "momentum", "call", price=r.get("price"),
+                    mom_6m=r.get("mom_6m"), mom_3m=r.get("mom_3m"))
         except Exception as e:
             print(f"  [opt-scan] momentum source failed: {e}")
 
-        # 2. PEAD candidates
+        # 2. PEAD candidates — CALLS
         try:
             from earnings_engine import PEADScanner
             for r in PEADScanner(self.conn).get_latest()[:PER_SOURCE_LIMIT["pead"]]:
-                add(r["ticker"], "pead", price=r.get("entry_now"))
+                add(r["ticker"], "pead", "call", price=r.get("entry_now"))
         except Exception as e:
             print(f"  [opt-scan] pead source failed: {e}")
 
-        # 3. Whale-watch picks
+        # 3. Whale-watch picks — CALLS
         try:
             from whale_watch import WhaleWatchlist
             for r in WhaleWatchlist(self.conn).get_latest()[:PER_SOURCE_LIMIT["whale"]]:
-                add(r["ticker"], "whale", price=r.get("price_now"))
+                add(r["ticker"], "whale", "call", price=r.get("price_now"))
         except Exception as e:
             print(f"  [opt-scan] whale source failed: {e}")
 
-        # 4. VIP-mentioned tickers (last 7d)
+        # 4. VIP-mentioned tickers (last 7d) — CALLS
         try:
             cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
             rows = self.conn.execute(
                 "SELECT tickers FROM vip_posts WHERE fetched_at >= ? "
                 "AND tickers <> '' AND tickers IS NOT NULL",
                 (cutoff,)).fetchall()
+            _vc = 0
             for r in rows[:50]:
                 t_csv = r.get("tickers") if hasattr(r, "get") else r[0]
                 for tk in str(t_csv or "").split(","):
                     if tk:
-                        add(tk, "vip")
-                if sum(1 for v in uni.values() if "vip" in v["sources"]) >= PER_SOURCE_LIMIT["vip"]:
+                        add(tk, "vip", "call"); _vc += 1
+                if _vc >= PER_SOURCE_LIMIT["vip"]:
                     break
         except Exception as e:
             print(f"  [opt-scan] vip source failed: {e}")
 
-        # 5. Recent unified-scanner movers
+        # 5. Recent unified-scanner movers — CALLS
         try:
             from unified_scanner import get_latest_unified
             for r in get_latest_unified(self.conn, decisions=("BUY","WATCH"),
                                         limit=PER_SOURCE_LIMIT["mover"]):
-                add(r["ticker"], "mover")
+                add(r["ticker"], "mover", "call")
         except Exception as e:
             print(f"  [opt-scan] mover source failed: {e}")
 
+        # 6. Bottom Fisher — oversold-at-support (validated p=0.005) — CALLS
+        try:
+            from bottom_fisher import BottomFisher
+            _bf = [r for r in BottomFisher(self.conn).scan()
+                   if r.get("stage") == "TRIGGERED"][:PER_SOURCE_LIMIT["bottom_fisher"]]
+            for r in _bf:
+                add(r["ticker"], "bottom_fisher", "call",
+                    price=r.get("price"), thesis=9.0)
+        except Exception as e:
+            print(f"  [opt-scan] bottom_fisher source failed: {e}")
+
+        # 7. Reversal finder — downtrend→base→uptrend TRIGGERED — CALLS
+        #    (heavy 2y download; skipped in fast/live-trader mode)
+        if not fast:
+            try:
+                from reversal_finder import ReversalFinder
+                _rv = [r for r in ReversalFinder(self.conn).scan()
+                       if r.get("stage") == "TRIGGERED"][:PER_SOURCE_LIMIT["reversal"]]
+                for r in _rv:
+                    add(r["ticker"], "reversal", "call",
+                        price=r.get("price"), thesis=8.0)
+            except Exception as e:
+                print(f"  [opt-scan] reversal source failed: {e}")
+
+        # 8. Put engine — validated bearish breakdown edge — PUTS
+        #    Regime-gated: only when the market actually allows puts.
+        try:
+            from put_engine import bearish_rank, market_allows_puts
+            if market_allows_puts().get("allowed", False):
+                for r in bearish_rank(self.conn,
+                                      top_n=PER_SOURCE_LIMIT["put_engine"],
+                                      priority_only=True):
+                    add(r["ticker"], "put_engine", "put",
+                        price=r.get("price"), thesis=10.0)
+            else:
+                print("  [opt-scan] puts gated off (regime not bearish-friendly)")
+        except Exception as e:
+            print(f"  [opt-scan] put_engine source failed: {e}")
+
+        # 9. News-reversal puts — validated, news-driven breakdowns — PUTS
+        try:
+            from news_reversal_puts import NewsReversalPuts
+            for r in (NewsReversalPuts(self.conn).scan() or [])[:PER_SOURCE_LIMIT["news_put"]]:
+                add(r.get("ticker"), "news_put", "put",
+                    price=r.get("price"), thesis=10.0)
+        except Exception as e:
+            print(f"  [opt-scan] news_put source failed: {e}")
+
+        # 10. Panic detector — capitulation rebound → index CALLS (100% @60d)
+        #     status() = {snap, signatures[]}; panic is "on" if any signature is
+        #     currently firing or still active in the DB.
+        try:
+            from panic_detector import PanicDetector
+            _ps = PanicDetector(self.conn).status()
+            _sigs = (_ps or {}).get("signatures", []) or []
+            _panic_on = any(s.get("currently_fired") or s.get("active_in_db")
+                            for s in _sigs)
+            if _panic_on:
+                for tk in ("SPY", "QQQ")[:PER_SOURCE_LIMIT["panic"]]:
+                    add(tk, "panic", "call", thesis=12.0)
+        except Exception as e:
+            print(f"  [opt-scan] panic source failed: {e}")
+
         return uni
 
-    # ── score a single candidate end-to-end ───────────────────────────────────
-    def _score_candidate(self, tk: str, meta: dict) -> dict | None:
-        """Pick the best call contract for `tk` and quality-score it."""
+    # ── score a single candidate end-to-end (direction-aware) ──────────────────
+    def _score_candidate(self, meta: dict) -> dict | None:
+        """Pick the best CALL or PUT contract for the candidate and score it."""
         try:
-            from momentum_options import select_call_contract, _earnings_within, EARNINGS_AVOID_DAYS
+            from momentum_options import (select_call_contract, _earnings_within,
+                                          EARNINGS_AVOID_DAYS, MIN_THESIS_PCT)
             from options_analytics import options_trade_score
         except Exception:
             return None
 
-        # Skip if earnings imminent (IV crush risk on long premium)
+        tk        = meta.get("ticker")
+        direction = meta.get("direction", "call")
+        if not tk:
+            return None
+
+        # Skip if earnings imminent (IV crush risk on long premium, both sides)
         if _earnings_within(tk, EARNINGS_AVOID_DAYS):
             return None
 
@@ -177,28 +278,31 @@ class OptionsScanner:
         if not price or price <= 0:
             return None
 
-        c = select_call_contract(tk, price)
+        # Direction-aware contract pick (reuse existing engines, no duplication)
+        if direction == "put":
+            try:
+                from put_engine import select_put_contract
+                c = select_put_contract(tk, price)
+            except Exception:
+                c = None
+        else:
+            c = select_call_contract(tk, price)
         if not c:
             return None
+        c.update({"underlying_price": price, "option_type": direction})
 
-        c.update({
-            "underlying_price": price,
-            "option_type":      "call",
-        })
-
-        # Thesis = expected underlying move over the option's life. Uses the
-        # 3-month-equivalent (mom_6m/3) of the strategy's measured momentum,
-        # floored at 8% so we never surface options on theses too weak to pay
-        # for the strike OTM + theta. A momentum stock putting up +60% over 6m
-        # is genuinely expected to keep ~10%/mo, not 5%/mo (1/6 of cumulative).
-        from momentum_options import MIN_THESIS_PCT
-        mom6 = meta.get("mom_6m") or 0.0
-        thesis = max(MIN_THESIS_PCT, abs(mom6) / 3.0 * 100) if mom6 else MIN_THESIS_PCT
-        if thesis < MIN_THESIS_PCT:
-            return None
+        # Thesis = expected underlying move magnitude over the option's life.
+        # Prefer an explicit per-source thesis hint; else derive from momentum;
+        # floored at MIN_THESIS_PCT so thin moves (theta can't pay) are skipped.
+        mom6   = meta.get("mom_6m") or 0.0
+        thint  = meta.get("thesis_hint")
+        thesis = (thint if thint else
+                  (abs(mom6) / 3.0 * 100 if mom6 else MIN_THESIS_PCT))
+        thesis = max(MIN_THESIS_PCT, thesis)
 
         try:
-            qs = options_trade_score(self.conn, tk, {**c, "iv": c.get("iv", 0)},
+            qs = options_trade_score(self.conn, tk,
+                                     {**c, "iv": c.get("iv", 0)},
                                      thesis_move_pct=thesis)
         except Exception:
             return None
@@ -206,7 +310,7 @@ class OptionsScanner:
         return {
             "ticker":           tk,
             "contract_symbol":  c.get("contract_symbol", ""),
-            "option_type":      "call",
+            "option_type":      direction,
             "strike":           c.get("strike"),
             "expiry":           c.get("expiry"),
             "dte":              c.get("dte"),
@@ -221,23 +325,53 @@ class OptionsScanner:
             "thesis_pct":       round(thesis, 2),
         }
 
+    # Source priority — validated edges first. Controls which candidates get the
+    # expensive option-chain fetch when we cap scoring for the live cycle.
+    _SOURCE_PRIORITY = {
+        "momentum": 0, "bottom_fisher": 1, "put_engine": 2, "panic": 2,
+        "pead": 3, "news_put": 3, "whale": 4, "reversal": 5, "vip": 6, "mover": 7,
+    }
+
     # ── full scan ──────────────────────────────────────────────────────────────
     def scan(self, min_quality: int = MIN_QUALITY_SHOW,
-             max_results: int = MAX_RESULTS, progress=None) -> list:
-        cands = self.gather_candidates()
-        total = len(cands)
+             max_results: int = MAX_RESULTS, progress=None,
+             fast: bool = False, max_candidates: int | None = None) -> list:
+        cands = self.gather_candidates(fast=fast)
+        # Each scored candidate triggers an option-chain fetch (~1-2s). Cap how
+        # many we score so the live trader cycle stays inside its time budget,
+        # prioritizing the validated-edge sources. Default: tight in fast mode.
+        if max_candidates is None:
+            max_candidates = 18 if fast else 45
+        items = sorted(
+            cands.items(),
+            key=lambda kv: min((self._SOURCE_PRIORITY.get(s, 9)
+                                for s in kv[1].get("sources", [])), default=9),
+        )[:max_candidates]
+        total = len(items)
         results = []
-        for i, (tk, meta) in enumerate(cands.items()):
+        for i, (key, meta) in enumerate(items):
             if progress:
                 try:
-                    progress(i + 1, total, tk)
+                    progress(i + 1, total, meta.get("ticker", key))
                 except Exception:
                     pass
-            r = self._score_candidate(tk, meta)
+            r = self._score_candidate(meta)
             if r and r["quality_score"] >= min_quality:
                 results.append(r)
         results.sort(key=lambda r: r["quality_score"], reverse=True)
         return results[:max_results]
+
+    # ── tradeable setups for the paper trader (broker-ready shape) ─────────────
+    def tradeable_setups(self, min_quality: int = 55, max_results: int = 10,
+                         fast: bool = True) -> list:
+        """
+        The list the autonomous paper-trader executes. Same as scan() but defaults
+        to fast mode (bounded for the live cycle) and a stricter quality floor.
+        Each item already carries ticker/option_type/strike/expiry/premium/
+        contract_symbol so monitor's _attempt_entry can buy it directly.
+        """
+        return self.scan(min_quality=min_quality, max_results=max_results,
+                         fast=fast)
 
     # ── persist (and remember what we've already alerted on) ───────────────────
     def persist(self, results: list):
@@ -304,10 +438,12 @@ class OptionsScanner:
     def scan_and_alert(self, telegram_sender=None,
                        min_quality: int = MIN_QUALITY_SHOW,
                        alert_threshold: int = MIN_QUALITY_ALERT,
-                       progress=None) -> dict:
+                       progress=None, fast: bool = False,
+                       max_results: int = MAX_RESULTS) -> dict:
         """
         One-call cycle entrypoint: scan, persist, send Telegram for NEW setups
         meeting `alert_threshold`. Returns {scanned, results, alerts_sent}.
+        The autonomous trader calls this with fast=True and reads `results`.
         """
         # Read prior contracts so we only alert on truly new ones
         try:
@@ -322,7 +458,8 @@ class OptionsScanner:
         except Exception:
             prior_alerted = set()
 
-        results = self.scan(min_quality=min_quality, progress=progress)
+        results = self.scan(min_quality=min_quality, max_results=max_results,
+                             progress=progress, fast=fast)
         self.persist(results)
 
         alerts_sent = 0
@@ -350,14 +487,18 @@ class OptionsScanner:
     @staticmethod
     def _format_alert(r: dict) -> str:
         grade_emoji = {"A+": "🔥", "A": "⭐", "B": "✅"}.get(r["quality_grade"], "📊")
-        src = " · ".join(r["sources"])
+        is_put = r["option_type"] == "put"
+        dir_tag = "📉 PUT" if is_put else "📈 CALL"
+        # Translate source tags into the validated-edge note for the user
+        edges = [SOURCE_META.get(s, ("", s))[1] or s for s in r["sources"]]
+        why = " · ".join(dict.fromkeys(edges))     # dedupe, keep order
         return (
-            f"{grade_emoji} <b>OPTIONS SCAN — {r['quality_grade']} setup</b>\n"
+            f"{grade_emoji} <b>FULL-SCAN OPTIONS — {r['quality_grade']} {dir_tag}</b>\n"
             f"<b>{r['ticker']}</b>  ${r['strike']:.0f}{r['option_type'][0].upper()} "
             f"exp {r['expiry']} ({r['dte']}d)\n"
             f"Premium : <b>${r['premium']:.2f}</b>  "
             f"(1 contract = ${r['premium']*100:.0f})\n"
             f"Quality : <b>{r['quality_score']}/100</b>  →  {r['decision']}\n"
             f"IV : {r['iv_pct']:.0f}%  ·  Underlying: ${r['underlying_price']:.2f}\n"
-            f"Why : <i>{src}</i>"
+            f"Edge : <i>{why}</i>"
         )

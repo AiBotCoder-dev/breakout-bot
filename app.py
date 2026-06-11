@@ -6097,13 +6097,18 @@ with tab_options:
     # SUB-TAB 0 — BEST OPTIONS TRADES NOW (the meta-scanner)
     # ─────────────────────────────────────────────────────────────────────────
     with ot_best:
-        st.markdown("### 🎯 Best Options Trades — Right Now")
+        st.markdown("### 🌐 Full Market Scan — The Paper Trader's Engine")
         st.caption(
-            "ONE ranked list that pulls underlying candidates from EVERY signal "
-            "source (momentum leaders · PEAD · whale picks · VIP-mentioned · "
-            "movers), picks the best contract per name, scores via the quality "
-            "engine (IVR · IV-RV · expected move · Greeks · UOA). Telegram "
-            "fires for new A-grade setups automatically."
+            "ONE scan across **EVERY validated tool on the site** — momentum "
+            "(p=0.004) · Bottom Fisher oversold-at-support (p=0.005) · PEAD · "
+            "whale picks · VIP mentions · catalyst movers · put-engine & "
+            "news-reversal puts (regime-gated) · reversal · panic. Produces one "
+            "ranked list of **CALLS and PUTS**, each with the best contract and a "
+            "quality score (IVR · IV-RV · expected move vs thesis · Greeks · UOA). "
+            "**This is exactly what the Alpaca paper account trades from** every "
+            "cycle: it buys the top setups (momentum at full size, every other "
+            "edge sized down as secondary), and fires Telegram on new A-grade "
+            "setups automatically."
         )
         _bc1, _bc2, _bc3 = st.columns([3, 1, 1])
         with _bc2:
@@ -6114,9 +6119,11 @@ with tab_options:
                                 type="primary", use_container_width=True)
         with _bc1:
             st.info(
-                "Scan takes ~60–90s (pulls option chains + scores 20–40 "
-                "candidates). The monitor also runs this hourly during market "
-                "hours — Telegram alerts fire for any NEW setup with quality ≥ 70.",
+                "Full scan takes ~2–3 min (every tool + option chains + scoring). "
+                "The autonomous paper trader runs a FAST version of this exact "
+                "scan every cycle during market hours and trades the top setups; "
+                "Telegram fires for any NEW setup with quality ≥ 70. Puts only "
+                "appear when the market regime allows them.",
                 icon="📡",
             )
 

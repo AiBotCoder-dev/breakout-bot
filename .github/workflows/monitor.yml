@@ -20,7 +20,7 @@ jobs:
   monitor:
     name: Check open positions
     runs-on: ubuntu-latest
-    timeout-minutes: 4             # kill the job if it hangs
+    timeout-minutes: 8             # full-market scan needs headroom (was 4)
 
     steps:
       - name: Checkout repo

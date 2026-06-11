@@ -1829,11 +1829,14 @@ def main():
     # Throttled to once/hour to bound API load (full scan ~60s).
     try:
         from options_scanner import OptionsScanner
+        # In broker mode the autonomous-trader block below runs the SAME
+        # comprehensive scan (and fires the alerts) every cycle, so skip this
+        # standalone hourly copy to avoid double-scanning the whole market.
         _last = conn.execute(
             "SELECT MAX(scanned_at) FROM best_options_trades").fetchone()
         _last_iso = _last[0] if _last else None
-        _run_scan = True
-        if _last_iso:
+        _run_scan = (BROKER_MODE != "alpaca_paper")
+        if _last_iso and _run_scan:
             try:
                 _last_dt = datetime.fromisoformat(str(_last_iso).replace("Z", "+00:00"))
                 if (datetime.now(_last_dt.tzinfo) - _last_dt).total_seconds() < 3600:
@@ -2090,12 +2093,14 @@ def main():
                 # 'momentum_call_explore' (data-floor top-up, kept separate).
                 def _attempt_entry(s, setup_tag, budget_override=None):
                     _bud = budget_override if budget_override else budget
+                    _otype = s.get("option_type", "call")
+                    _oc = _otype[0].upper()                  # 'C' or 'P'
                     if s["ticker"] in held_u:
                         return False
                     contract = _ob.find_option_contract(
-                        s["ticker"], s["expiry"], "call", s["strike"])
+                        s["ticker"], s["expiry"], _otype, s["strike"])
                     if not contract or not contract.get("tradable"):
-                        print(f"    {s['ticker']:6s} — no tradable Alpaca contract, skip")
+                        print(f"    {s['ticker']:6s} — no tradable Alpaca {_otype}, skip")
                         return False
                     prem = s.get("premium") or contract.get("close_price") or 0
                     one_ct_cost = prem * 100 if prem > 0 else 0
@@ -2134,57 +2139,59 @@ def main():
                              qty=qty, cost=prem * 100 * qty)
                     except Exception as _je:
                         print(f"    (journal log_entry skipped: {_je})")
-                    _is_bf = setup_tag.startswith("bottom_fisher")
-                    _strat_line = (
-                        "🎣 <b>BOTTOM FISHER</b> — oversold-at-support dip buy "
-                        "(validated MCPT p=0.005; secondary size)\n" if _is_bf else "")
+                    _src = ", ".join(s.get("sources", []) or [])
+                    _why = f" · why: {_src}" if _src else ""
+                    _dir_emoji = "📉" if _otype == "put" else "📈"
                     send_telegram(
-                        f"{'🎣' if _is_bf else '🏦'} <b>ALPACA PAPER OPTION BUY</b>"
+                        f"{_dir_emoji} <b>ALPACA PAPER OPTION BUY — "
+                        f"{'PUT' if _otype=='put' else 'CALL'}</b>"
                         f"{' 🧪 (data-floor)' if _is_ex else ''}\n"
-                        f"{_strat_line}"
-                        f"{s['ticker']} ${contract['strike']:.0f}C exp {s['expiry']}\n"
+                        f"{s['ticker']} ${contract['strike']:.0f}{_oc} exp {s['expiry']}\n"
                         f"Qty: {qty} contract(s) @ ~${prem:.2f} "
                         f"(~${prem*100*qty:.0f})\n"
-                        f"Quality {s.get('quality_score','?')}/100"
-                        f"{' · DATA-FLOOR top-up (not the core edge)' if _is_ex else ' · real broker fills'}\n"
+                        f"Quality {s.get('quality_score','?')}/100{_why}\n"
+                        f"{'DATA-FLOOR top-up (not the core edge)' if _is_ex else 'Full-market scan · real broker fills'}\n"
                         f"Acct equity ${equity:,.0f}")
                     return True
 
-                # ── REAL-STRATEGY PASS — quality ≥ 55, the honest sample ───────
-                setups = [] if _macro_block else _mopt.find_setups(
-                    top_n_underlyings=12, min_quality_score=55)
+                # ══ FULL MARKET SCAN — the trader's primary engine ═════════════
+                # ONE scan across EVERY validated tool on the site (momentum,
+                # bottom-fisher, PEAD, whale, VIP, movers, put-engine, news-puts,
+                # reversal, panic). Returns ONE ranked list of CALLS and PUTS,
+                # each quality-scored by options_analytics. The paper trader buys
+                # the top setups from this single source of truth. This same call
+                # persists results (Best Options table) and fires NEW-setup
+                # Telegram alerts, so it replaces the standalone hourly meta-scan.
                 opened = 0
-                for s in setups:
-                    if opened >= 4:
-                        break
-                    if _attempt_entry(s, "momentum_call"):
-                        opened += 1
-
-                # ── BOTTOM FISHER PASS — validated oversold-at-support edge ────
-                # Enters EARLIER than momentum (buys the dip, not the breakout).
-                # MCPT p=0.005, PF 1.71. Sub-50% win rate by nature, so it's a
-                # SECONDARY signal: smaller size (60% of the momentum budget) and
-                # capped at 2/cycle. Skipped during HIGH macro event risk.
-                bf_opened = 0
                 if not _macro_block:
                     try:
-                        from bottom_fisher import BottomFisher
-                        bf_setups = BottomFisher(conn).find_option_setups(max_setups=2)
-                        for s in bf_setups:
-                            if bf_opened >= 2:
+                        from options_scanner import OptionsScanner
+                        _fms = OptionsScanner(conn)
+                        _rep = _fms.scan_and_alert(
+                            telegram_sender=send_telegram,
+                            min_quality=55, alert_threshold=70,
+                            fast=True, max_results=12)
+                        _fs = _rep["results"]
+                        print(f"  🌐 Full market scan: {len(_fs)} setup(s) "
+                              f"(quality≥55), {_rep['alerts_sent']} new alert(s).")
+                        # Execute the top setups. Momentum = full size (the primary
+                        # p=0.004 edge); every other source is SECONDARY → 60% size
+                        # (lower win-rate edges, sized down for discipline). PUTS
+                        # only fire when the put-engine regime gate already allowed
+                        # them upstream, so reaching here means the regime is OK.
+                        for s in _fs:
+                            if opened >= 5:
                                 break
-                            if _attempt_entry(s, "bottom_fisher_call",
-                                              budget_override=budget * 0.6):
-                                bf_opened += 1
+                            _srcs = s.get("sources", [])
+                            _is_primary = ("momentum" in _srcs)
+                            _tag = ("fullscan_" + (_srcs[0] if _srcs else "scan")
+                                    + "_" + s.get("option_type", "call"))
+                            _bo = None if _is_primary else budget * 0.6
+                            if _attempt_entry(s, _tag, budget_override=_bo):
                                 opened += 1
-                        if bf_setups:
-                            print(f"  🎣 Bottom Fisher: opened {bf_opened} of "
-                                  f"{len(bf_setups)} oversold-at-support setup(s)")
-                        else:
-                            print("  🎣 Bottom Fisher: no oversold-at-support "
-                                  "triggers this cycle.")
-                    except Exception as _bfe:
-                        print(f"  WARN bottom fisher pass failed: {_bfe}")
+                    except Exception as _fmse:
+                        print(f"  WARN full market scan failed: {_fmse}")
+                        traceback.print_exc()
 
                 # ── DATA-COLLECTION FLOOR — guarantee a minimum daily sample ───
                 # Strict gates can mean very few trades, so it takes weeks to learn

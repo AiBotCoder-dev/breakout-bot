@@ -1234,21 +1234,21 @@ def main():
     print(f"  Position Monitor  —  {now_utc}")
     print(f"{'='*60}")
 
-    # ── Telegram connection test (manual / workflow_dispatch triggers only) ───
-    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
-        print("  [Telegram] Sending connection test...")
+    # ── Telegram connection test ──────────────────────────────────────────────
+    # NOTE: cron-job.org triggers every cycle via workflow_dispatch, so this can
+    # NO LONGER key off the event name (that spammed a "Connected" ping every
+    # 10 min). Only send when explicitly asked via PING=1 (set on a manual run
+    # you do yourself to verify alerts), and only report the result on failure.
+    if os.environ.get("PING") == "1":
         sent = send_telegram(
-            f"✅ <b>Breakout Bot — Monitor Connected</b>\n"
-            f"Telegram alerts are working!\n"
-            f"Time: {now_utc}\n"
-            f"Next: alerts fire automatically when stops/targets are hit."
-        )
-        print(f"  [Telegram] {'✓ message sent!' if sent else '✗ FAILED — check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID secrets'}")
+            f"✅ <b>Breakout Bot — Telegram OK</b>\nTime: {now_utc}")
+        print(f"  [Telegram] {'✓ ping sent' if sent else '✗ FAILED — check TELEGRAM secrets'}")
 
     # ── BROKER SELF-TEST — runs even when market is closed ────────────────────
-    # Lets a manual workflow run verify the full chain (keys -> Alpaca -> options
-    # level -> BROKER_MODE) any day. Telegrams the result ONLY on a manual
-    # dispatch so the every-5-min runs don't spam.
+    # Verifies the full chain (keys -> Alpaca -> options level -> BROKER_MODE).
+    # Logs to the run output every cycle, but Telegrams ONLY on FAILURE (a
+    # broken connection is worth a ping; a healthy one every 10 min is spam).
+    # Force a success ping with PING=1 on a manual run if you want to verify.
     print(f"\n  EXECUTION MODE: {BROKER_MODE}")
     if BROKER_MODE == "alpaca_paper":
         try:
@@ -1262,11 +1262,15 @@ def main():
             else:
                 _line = f"❌ Alpaca paper NOT connected: {_t.get('error')}"
             print(f"  BROKER SELF-TEST: {_line}")
-            if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
-                send_telegram(f"🏦 <b>Broker self-test</b>\n{_line}\n"
-                              f"(BROKER_MODE={BROKER_MODE})")
+            # Only alert on failure (or an explicit PING) — never on healthy runs.
+            if not _t.get("ok"):
+                send_telegram(f"❌ <b>Broker connection FAILED</b>\n{_line}\n"
+                              f"(BROKER_MODE={BROKER_MODE}) — bot can't trade until fixed.")
+            elif os.environ.get("PING") == "1":
+                send_telegram(f"🏦 <b>Broker self-test</b>\n{_line}")
         except Exception as _ste:
             print(f"  BROKER SELF-TEST failed: {_ste}")
+            send_telegram(f"❌ <b>Broker self-test crashed</b>\n{str(_ste)[:200]}")
 
     # ── Market window check ───────────────────────────────────────────────────
     session = ts.MarketClock.get_session()

@@ -74,4 +74,9 @@ jobs:
           OVERNIGHT_EDGE:          ${{ secrets.OVERNIGHT_EDGE || 'on' }}
           OVERNIGHT_TICKER:        ${{ secrets.OVERNIGHT_TICKER || 'QQQ' }}
           OVERNIGHT_NOTIONAL_FRAC: ${{ secrets.OVERNIGHT_NOTIONAL_FRAC || '0.20' }}
+          # Opening-volatility entry gate (added after 2026-06-12 CPI whipsaw):
+          # no new option entries in the first N min after the open; wider on
+          # high-macro days. Exits + overnight edge still run.
+          NO_ENTRY_MIN:            ${{ secrets.NO_ENTRY_MIN || '45' }}
+          NO_ENTRY_MIN_MACRO:      ${{ secrets.NO_ENTRY_MIN_MACRO || '75' }}
         run: python monitor.py

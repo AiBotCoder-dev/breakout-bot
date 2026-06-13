@@ -369,7 +369,9 @@ class AlpacaPaperBroker:
                             activation_pct: float = 50.0, trail_frac: float = 0.30,
                             hard_stop_pct: float = -50.0, dte_floor: int = 2,
                             put_activation: float = 40.0, put_trail_frac: float = 0.25,
-                            put_hard_stop: float = -45.0) -> list:
+                            put_hard_stop: float = -45.0,
+                            grace_minutes: float = 60.0,
+                            grace_hard_stop: float = -80.0) -> list:
         """
         TRAILING-STOP exit manager — lets winners RUN (no take-profit cap) while
         protecting gains. This is the answer to 'don't sell a +300% runner at +70%.'
@@ -385,15 +387,29 @@ class AlpacaPaperBroker:
             nothing on the upside.
           • Always: DTE<=floor time-stop (theta cliff).
 
+        GRACE PERIOD (added after the 2026-06-12 CPI whipsaw, where fresh
+        positions were guillotined at the opening low by the -50% hard stop, then
+        the exact contracts ran +58% to +177%): for the first `grace_minutes` of a
+        position's life the hard stop is RELAXED to `grace_hard_stop` (-80%), so
+        normal opening option-leverage noise can't shake us out before the thesis
+        has a chance to work. Trailing stop and time stop still apply.
+
         conn (optional) persists the peak per contract across the 5-min cycles.
         Returns a list of {symbol, underlying, reason, pct, pnl, peak_pct}.
         """
-        from datetime import date as _date
+        from datetime import date as _date, datetime as _dt, timezone as _tz
+        _now_utc = _dt.now(_tz.utc)
         if conn is not None:
             try:
                 conn.execute("CREATE TABLE IF NOT EXISTS broker_option_peaks "
                              "(contract_symbol TEXT PRIMARY KEY, peak_premium REAL, "
                              "peak_pct REAL, activated INTEGER DEFAULT 0)")
+                # add first_seen column if missing (proxy for position age)
+                try:
+                    conn.execute("ALTER TABLE broker_option_peaks "
+                                 "ADD COLUMN first_seen TEXT")
+                except Exception:
+                    pass
             except Exception:
                 conn = None
 
@@ -401,27 +417,27 @@ class AlpacaPaperBroker:
             if conn is None:
                 return None
             try:
-                r = conn.execute("SELECT peak_premium, peak_pct, activated FROM "
-                                 "broker_option_peaks WHERE contract_symbol=?",
+                r = conn.execute("SELECT peak_premium, peak_pct, activated, first_seen "
+                                 "FROM broker_option_peaks WHERE contract_symbol=?",
                                  (sym,)).fetchone()
                 if not r:
                     return None
                 g = (lambda k, i: r.get(k) if hasattr(r, "get") else r[i])
                 return (float(g("peak_premium", 0) or 0), float(g("peak_pct", 0) or 0),
-                        int(g("activated", 0) or 0))
+                        int(g("activated", 0) or 0), g("first_seen", 3))
             except Exception:
                 return None
 
-        def _peak_write(sym, prem, pct, activated):
+        def _peak_write(sym, prem, pct, activated, first_seen):
             if conn is None:
                 return
             try:
                 conn.execute("INSERT INTO broker_option_peaks "
-                             "(contract_symbol, peak_premium, peak_pct, activated) "
-                             "VALUES (?,?,?,?) ON CONFLICT(contract_symbol) DO UPDATE SET "
+                             "(contract_symbol, peak_premium, peak_pct, activated, first_seen) "
+                             "VALUES (?,?,?,?,?) ON CONFLICT(contract_symbol) DO UPDATE SET "
                              "peak_premium=excluded.peak_premium, peak_pct=excluded.peak_pct, "
                              "activated=excluded.activated",
-                             (sym, prem, pct, int(activated)))
+                             (sym, prem, pct, int(activated), first_seen))
             except Exception:
                 pass
 
@@ -458,18 +474,32 @@ class AlpacaPaperBroker:
             _hard = put_hard_stop if is_put else hard_stop_pct
             _dte_floor = 2 if is_put else dte_floor
 
-            # update peak
+            # update peak (+ record first_seen on first sighting)
             prev = _peak_read(sym)
             peak_prem = max(prev[0] if prev else 0, cur_prem)
             peak_pct = max(prev[1] if prev else -999, pct)
             activated = bool((prev[2] if prev else 0)) or (peak_pct >= _act)
-            _peak_write(sym, peak_prem, peak_pct, activated)
+            _first_seen = (prev[3] if (prev and prev[3]) else _now_utc.isoformat())
+            _peak_write(sym, peak_prem, peak_pct, activated, _first_seen)
+
+            # position age (minutes) — within grace, relax the hard stop so opening
+            # volatility on a fresh cheap option can't guillotine a good thesis.
+            _age_min = 10**9
+            try:
+                _fs = _dt.fromisoformat(str(_first_seen).replace("Z", "+00:00"))
+                if _fs.tzinfo is None:
+                    _fs = _fs.replace(tzinfo=_tz.utc)
+                _age_min = (_now_utc - _fs).total_seconds() / 60.0
+            except Exception:
+                pass
+            _in_grace = _age_min < grace_minutes
+            _eff_hard = grace_hard_stop if _in_grace else _hard
 
             reason = None
             if dte is not None and dte <= _dte_floor:
                 reason = "TIME_STOP"
             elif not activated:
-                if pct <= _hard:
+                if pct <= _eff_hard:
                     reason = "STOP_LOSS"
             else:
                 # trailing: stop = peak premium minus trail fraction

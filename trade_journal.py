@@ -95,23 +95,42 @@ def log_exit(conn, contract_symbol, exit_reason, pnl_pct, pnl_dollars,
     _ensure(conn)
     try:
         row = conn.execute(
-            "SELECT opened_at, entry_premium FROM broker_trade_journal "
+            "SELECT opened_at, entry_premium, cost, qty FROM broker_trade_journal "
             "WHERE contract_symbol=? AND status='OPEN'", (contract_symbol,)
         ).fetchone()
         hold_days = 0
+        _cost = None
         if row:
-            opened = row[0] if not hasattr(row, "get") else row.get("opened_at")
+            def _g(k, i):
+                return row.get(k) if hasattr(row, "get") else row[i]
+            opened = _g("opened_at", 0)
             try:
                 od = datetime.fromisoformat(str(opened).replace("Z", "+00:00")).date()
                 hold_days = (date.today() - od).days
             except Exception:
                 hold_days = 0
+            try:
+                _cost = float(_g("cost", 2) or 0)
+            except Exception:
+                _cost = None
+
+        # ── P&L reconciliation ────────────────────────────────────────────────
+        # A long option can never lose more than its premium, so clamp pct to
+        # >= -100. And DERIVE the dollar P&L from THIS row's own entry cost and
+        # the % move, rather than trusting the broker's position-level figure
+        # (which can reflect a different contract count than this row logged and
+        # produced impossible losses, e.g. -$290 on a $130 ticket on 2026-06-12).
+        pct = max(-100.0, float(pnl_pct))
+        if _cost and _cost > 0:
+            dollars = round(pct / 100.0 * _cost, 2)
+        else:
+            dollars = round(max(float(pnl_dollars), -abs(_cost or 0))
+                            if _cost else float(pnl_dollars), 2)
         conn.execute(
             "UPDATE broker_trade_journal SET status='CLOSED', exit_reason=?, "
             "exit_premium=?, pnl_pct=?, pnl_dollars=?, hold_days=?, closed_at=? "
             "WHERE contract_symbol=? AND status='OPEN'",
-            (exit_reason, exit_premium, round(float(pnl_pct), 1),
-             round(float(pnl_dollars), 2), hold_days,
+            (exit_reason, exit_premium, round(pct, 1), dollars, hold_days,
              datetime.now(timezone.utc).isoformat(), contract_symbol)
         )
     except Exception as e:

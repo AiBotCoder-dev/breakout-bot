@@ -2122,6 +2122,30 @@ def main():
                 except Exception:
                     pass
 
+                # ── OPENING-VOLATILITY ENTRY GATE ──────────────────────────────
+                # The 2026-06-12 CPI whipsaw taught this the hard way: entries
+                # fired at 9:56 ET into the open got stopped at the 10:05 low,
+                # then ran +58% to +177%. Don't buy into the opening chaos. Block
+                # new entries for the first NO_ENTRY_MIN minutes after the open
+                # (longer on HIGH-macro days). Exits + overnight edge still run.
+                _entry_block_open = False
+                try:
+                    import trading_scanner as _tse
+                    _et = _tse.MarketClock.now_et()
+                    _mins_since_open = (_et.hour - 9) * 60 + (_et.minute - 30)
+                    _no_entry = int(os.environ.get("NO_ENTRY_MIN", "45") or 45)
+                    # widen the morning lockout on high-volatility macro days
+                    if _macro_size_mult < 1.0 or _macro_block:
+                        _no_entry = max(_no_entry, int(
+                            os.environ.get("NO_ENTRY_MIN_MACRO", "75") or 75))
+                    if 0 <= _mins_since_open < _no_entry:
+                        _entry_block_open = True
+                        print(f"  ⏳ Opening-volatility gate: {_mins_since_open}m "
+                              f"since open < {_no_entry}m — no new entries yet "
+                              f"(let the open settle). Exits still active.")
+                except Exception:
+                    pass
+
                 held_u = _ob.held_option_underlyings()
 
                 # ── Single-entry helper — shared by the real-strategy pass and
@@ -2282,7 +2306,11 @@ def main():
                                 else:
                                     _status, _result = "FAILED", str(_r2.get("error"))[:200]
                             elif _act in ("OPEN_CALL", "OPEN_PUT") and _dtk:
-                                if _pm_opens_today >= 3:
+                                if _entry_block_open:
+                                    _status, _result = "PENDING", "waiting out opening-volatility window"
+                                    # leave PENDING so it executes a later cycle
+                                    continue
+                                elif _pm_opens_today >= 3:
                                     _status, _result = "SKIPPED", "max 3 PM opens/day"
                                 else:
                                     _otype = "call" if _act == "OPEN_CALL" else "put"
@@ -2331,7 +2359,7 @@ def main():
                 # persists results (Best Options table) and fires NEW-setup
                 # Telegram alerts, so it replaces the standalone hourly meta-scan.
                 opened = 0
-                if not _macro_block and not _claude_pause:
+                if not _macro_block and not _claude_pause and not _entry_block_open:
                     try:
                         from options_scanner import OptionsScanner
                         _fms = OptionsScanner(conn)
@@ -2368,7 +2396,8 @@ def main():
                 # TAGGED 'momentum_call_explore' so they live in a separate journal
                 # bucket and never inflate or deflate the real-strategy win rate.
                 _min_day = int(os.environ.get("MIN_TRADES_PER_DAY", "0") or 0)
-                if _min_day > 0 and not _macro_block and not _claude_pause:
+                if (_min_day > 0 and not _macro_block and not _claude_pause
+                        and not _entry_block_open):
                     try:
                         from trade_journal import count_opened_today as _cot
                         _done = _cot(conn)

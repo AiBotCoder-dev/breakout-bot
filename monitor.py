@@ -2022,6 +2022,17 @@ def main():
             if not _ob.available() or not _ost["can_buy_longs"]:
                 print(f"  ⚠️ Broker options unavailable: {_ost.get('msg')} — skipping.")
             else:
+                # ── CLEAN UP STALE UNFILLED ORDERS first (limit-order hygiene) ──
+                # A marketable limit fills in seconds; anything still open from a
+                # prior cycle didn't fill — cancel it so it can't surprise-fill
+                # later or tie up buying power over the unattended week.
+                try:
+                    _ncxl = _ob.cancel_stale_orders(older_than_min=5)
+                    if _ncxl:
+                        print(f"  🧹 Canceled {_ncxl} stale unfilled order(s).")
+                except Exception as _cxe:
+                    print(f"  WARN stale-order cleanup failed: {_cxe}")
+
                 # ── AUTONOMOUS EXIT MANAGER — runs every cycle, closes on rules ─
                 # +100% take profit / -50% stop / DTE<=1 time-stop. This is what
                 # makes the bot safe to leave running for days unattended.
@@ -2614,6 +2625,51 @@ def main():
                         print(f"  Broker scorecard: equity ${real_equity:,.2f} "
                               f"({_chg:+.2f}%), true realized ${_recon['realized_pnl']:+,.2f}, "
                               f"{_recon['round_trips']} round-trips")
+
+                    # ── FRIDAY WEEK-IN-REVIEW — the one verdict message ────────
+                    # On the first Friday cycle, send a consolidated summary: real
+                    # P&L from fills + which GRADES actually won (attribution).
+                    if datetime.now().weekday() == 4:
+                        conn.execute("CREATE TABLE IF NOT EXISTS broker_week_review "
+                                     "(snapshot_date TEXT PRIMARY KEY)")
+                        _wr = conn.execute("SELECT 1 FROM broker_week_review "
+                                           "WHERE snapshot_date=?", (_today,)).fetchone()
+                        if not _wr:
+                            # win rate by grade (attribution — reliable even if $ are est.)
+                            _grade_lines = []
+                            try:
+                                _gr = conn.execute(
+                                    "SELECT quality_band g, COUNT(*) n, "
+                                    "SUM(CASE WHEN pnl_pct>0 THEN 1 ELSE 0 END) w "
+                                    "FROM broker_trade_journal WHERE status='CLOSED' "
+                                    "AND quality_band IS NOT NULL GROUP BY quality_band "
+                                    "ORDER BY quality_band").fetchall()
+                                for _r in _gr:
+                                    _d = dict(_r); _n = int(_d['n'] or 0)
+                                    if _n:
+                                        _grade_lines.append(
+                                            f"{_d['g']}: {int(_d['w'] or 0)}/{_n} "
+                                            f"({100*(_d['w'] or 0)/_n:.0f}%)")
+                            except Exception:
+                                pass
+                            _opos2 = _ob.get_option_positions()
+                            _unreal2 = sum(float(p.get("unrealized_pnl", 0) or 0)
+                                           for p in _opos2)
+                            send_telegram(
+                                f"📅 <b>WEEK IN REVIEW</b>\n"
+                                f"Real equity: ${real_equity:,.2f} "
+                                f"({_chg:+.2f}% since start)\n"
+                                f"Realized P&L (fills): ${_recon['realized_pnl']:+,.2f}\n"
+                                f"Open unrealized: ${_unreal2:+,.2f} "
+                                f"({len(_opos2)} positions)\n"
+                                f"Total round-trips: {_recon['round_trips']}\n"
+                                f"<b>Win rate by grade:</b> "
+                                f"{' · '.join(_grade_lines) if _grade_lines else 'no closed trades yet'}\n"
+                                f"<i>Judge the PROCESS + grade edge, not just the P&L. "
+                                f"Full detail on the dashboard.</i>")
+                            conn.execute("INSERT INTO broker_week_review "
+                                         "(snapshot_date) VALUES (?)", (_today,))
+                            print("  📅 Week-in-review sent.")
                 except Exception as _sce:
                     print(f"  WARN broker scorecard failed: {_sce}")
         else:

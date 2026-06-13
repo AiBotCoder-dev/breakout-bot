@@ -398,6 +398,36 @@ class AlpacaPaperBroker:
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}
 
+    def cancel_stale_orders(self, older_than_min: float = 5.0) -> int:
+        """
+        Cancel still-open orders older than `older_than_min` minutes. A marketable
+        limit should fill in seconds, so anything still open at the next 10-min
+        cycle didn't fill — leaving it risks a surprise late fill and ties up
+        buying power. Returns the count canceled. (Added with the limit-order
+        switch so unfilled limits can't linger over an unattended week.)
+        """
+        if not self.available():
+            return 0
+        from datetime import datetime as _dt, timezone as _tz
+        now = _dt.now(_tz.utc)
+        n = 0
+        try:
+            orders = self._get("/v2/orders", {"status": "open", "limit": 100})
+        except Exception:
+            return 0
+        for o in orders or []:
+            try:
+                sub = str(o.get("submitted_at") or o.get("created_at") or "")
+                if sub:
+                    ts = _dt.fromisoformat(sub.replace("Z", "+00:00"))
+                    if (now - ts).total_seconds() < older_than_min * 60:
+                        continue            # too fresh — give it a chance to fill
+                self._delete(f"/v2/orders/{o.get('id')}")
+                n += 1
+            except Exception:
+                continue
+        return n
+
     def get_option_positions(self) -> list:
         """Open OPTION positions (asset_class == us_option), with live P&L."""
         try:

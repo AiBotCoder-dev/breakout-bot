@@ -2110,8 +2110,12 @@ def main():
                     #    so the limit must be real dollars (the 6/12 mistake was
                     #    measuring danger on the $100k scale while sizing on $1k).
                     #    Default -$200 ≈ 20% of the intended $1k bankroll per day.
+                    # Default raised to -$1500 (~150% of the $1k bankroll) — this is
+                    # BLOWUP INSURANCE, not a daily throttle. It only trips when the
+                    # account is being destroyed (a runaway bug), because a blown
+                    # account ends data collection entirely. Normal bad days run free.
                     _dd_dollars = real_equity - _day_open_eq
-                    _max_loss = float(os.environ.get("MAX_DAILY_LOSS_DOLLARS", "200") or 200)
+                    _max_loss = float(os.environ.get("MAX_DAILY_LOSS_DOLLARS", "1500") or 1500)
                     if _dd_dollars <= -_max_loss:
                         _halt_entries = True
                         _halt_reason = (f"daily loss ${_dd_dollars:+.0f} "
@@ -2122,7 +2126,9 @@ def main():
                                        "WHERE snapshot_date=?", (_today_d,)).fetchone()
                     _entries_today = int((_et[0] if not hasattr(_et, "get")
                                           else _et.get("n")) or 0) if _et else 0
-                    _max_entries_day = int(os.environ.get("MAX_OPENS_PER_DAY", "10") or 10)
+                    # Raised to 50 — only stops a runaway churn explosion, never a
+                    # normal high-frequency data-collection day of distinct trades.
+                    _max_entries_day = int(os.environ.get("MAX_OPENS_PER_DAY", "50") or 50)
                     if _entries_today >= _max_entries_day:
                         _halt_entries = True
                         _halt_reason = (_halt_reason + " · " if _halt_reason else "") + \
@@ -2254,17 +2260,21 @@ def main():
                         return False
                     # REBUY COOLDOWN — don't re-enter a contract/underlying we exited
                     # within the cooldown window (stops the stop->rebuy->stop churn).
+                    # Block ONLY the exact contract we just exited (not the whole
+                    # underlying) — re-buying the SAME contract is duplicate/noise
+                    # data and was the churn bug; a DIFFERENT strike/expiry on the
+                    # same name later is a legitimate distinct data point.
                     try:
                         _cut = (datetime.now(timezone.utc)
                                 - timedelta(hours=_cooldown_hours)).isoformat()
                         _cd = conn.execute(
                             "SELECT 1 FROM broker_exit_cooldown WHERE exited_at >= ? "
-                            "AND (underlying = ? OR contract_symbol = ?) LIMIT 1",
-                            (_cut, s["ticker"], s.get("contract_symbol", ""))
+                            "AND contract_symbol = ? LIMIT 1",
+                            (_cut, s.get("contract_symbol", ""))
                         ).fetchone()
                         if _cd:
-                            print(f"    {s['ticker']:6s} — in rebuy cooldown "
-                                  f"(exited < {_cooldown_hours:.0f}h ago), skip")
+                            print(f"    {s.get('contract_symbol','?')} — same contract "
+                                  f"exited < {_cooldown_hours:.0f}h ago (anti-churn), skip")
                             return False
                     except Exception:
                         pass

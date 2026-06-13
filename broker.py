@@ -33,6 +33,7 @@ except Exception:                       # pragma: no cover
     requests = None
 
 PAPER_BASE = "https://paper-api.alpaca.markets"
+DATA_BASE  = "https://data.alpaca.markets"   # market data (option quotes)
 
 
 def _creds() -> tuple[str, str]:
@@ -338,19 +339,55 @@ class AlpacaPaperBroker:
         except Exception:
             return None
 
-    def submit_option_buy(self, occ_symbol: str, qty: int = 1) -> dict:
-        """Market buy-to-open `qty` contracts of an option (paper)."""
+    def get_option_quote(self, occ_symbol: str) -> dict | None:
+        """
+        Live bid/ask for one option contract from Alpaca market data.
+        Returns {bid, ask, mid, spread_pct} or None if no quote.
+        """
+        if not self.available():
+            return None
+        try:
+            r = requests.get(f"{DATA_BASE}/v1beta1/options/quotes/latest",
+                             headers=self._headers(),
+                             params={"symbols": occ_symbol}, timeout=10)
+            r.raise_for_status()
+            q = (r.json().get("quotes", {}) or {}).get(occ_symbol, {})
+            bid = float(q.get("bp", 0) or 0)
+            ask = float(q.get("ap", 0) or 0)
+            if bid <= 0 or ask <= 0 or ask < bid:
+                return None
+            mid = (bid + ask) / 2.0
+            return {"bid": bid, "ask": ask, "mid": round(mid, 4),
+                    "spread_pct": round((ask - bid) / mid * 100, 1) if mid > 0 else 999}
+        except Exception:
+            return None
+
+    def submit_option_buy(self, occ_symbol: str, qty: int = 1,
+                          limit_price: float | None = None) -> dict:
+        """
+        Buy-to-open `qty` contracts. If `limit_price` is given, submit a LIMIT
+        order (caps slippage — the 2026-06-12 lesson: a market order on a wide
+        spread filled a $1.30-estimated contract at $4.80). Falls back to market
+        only when no limit is provided.
+        """
         if not self.available():
             return {"ok": False, "error": "broker not configured"}
         st = self.options_status()
         if not st["can_buy_longs"]:
             return {"ok": False, "error": st["msg"]}
         body = {"symbol": occ_symbol, "qty": str(int(qty)), "side": "buy",
-                "type": "market", "time_in_force": "day"}
+                "time_in_force": "day"}
+        if limit_price and limit_price > 0:
+            body["type"] = "limit"
+            body["limit_price"] = str(round(float(limit_price), 2))
+        else:
+            body["type"] = "market"
         try:
             o = self._post("/v2/orders", body)
             return {"ok": True, "order_id": o.get("id"), "qty": int(qty),
-                    "symbol": occ_symbol, "status": o.get("status")}
+                    "symbol": occ_symbol, "status": o.get("status"),
+                    "order_type": body["type"],
+                    "limit_price": body.get("limit_price")}
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}
 

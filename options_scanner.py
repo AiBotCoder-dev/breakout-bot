@@ -307,6 +307,20 @@ class OptionsScanner:
         except Exception:
             return None
 
+        # ── RS/RVOL BONUS — momentum-type sources only ─────────────────────────
+        # Backtested: RVOL>=1.3x + RS>0 lifts momentum-long win rate ~+2pp. It
+        # HURTS dip setups, so applies_to() excludes bottom_fisher/reversal/puts.
+        _score = qs["score"]
+        _rsrv = None
+        _srcs = meta.get("sources", [])
+        try:
+            import rs_rvol
+            if rs_rvol.applies_to(_srcs):
+                _rsrv = rs_rvol.compute(tk)
+                _score = max(0, min(100, _score + _rsrv["bonus"]))
+        except Exception:
+            pass
+
         return {
             "ticker":           tk,
             "contract_symbol":  c.get("contract_symbol", ""),
@@ -317,11 +331,14 @@ class OptionsScanner:
             "premium":          c.get("premium"),
             "iv_pct":           round(float(c.get("iv", 0) or 0) * 100, 1),
             "underlying_price": round(price, 2),
-            "quality_score":    qs["score"],
+            "quality_score":    _score,
+            "base_score":       qs["score"],
+            "rs_rvol":          (_rsrv["label"] if _rsrv else None),
+            "rs_rvol_bonus":    (_rsrv["bonus"] if _rsrv else 0),
             "quality_grade":    qs["grade"],
             "decision":         qs["decision"],
             "components":       qs["components"],
-            "sources":          sorted(meta.get("sources", [])),
+            "sources":          sorted(_srcs),
             "thesis_pct":       round(thesis, 2),
         }
 

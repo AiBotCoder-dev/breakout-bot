@@ -2287,15 +2287,32 @@ def main():
                     if not contract or not contract.get("tradable"):
                         print(f"    {s['ticker']:6s} — no tradable Alpaca {_otype}, skip")
                         return False
-                    prem = s.get("premium") or contract.get("close_price") or 0
+
+                    # ── LIQUIDITY + REAL-PRICE GATE (the 6/12 slippage fix) ─────
+                    # Size and cap on the LIVE ask, not the stale scan estimate
+                    # (SOXX was estimated $1.30 but really $4.80). Reject wide
+                    # spreads, and buy with a LIMIT capped just above the ask so a
+                    # thin book can't fill us far above the quote.
+                    _q = _ob.get_option_quote(contract["symbol"])
+                    _max_spread = float(os.environ.get("MAX_OPT_SPREAD_PCT", "25") or 25)
+                    if not _q:
+                        print(f"    {s['ticker']:6s} — no live quote (illiquid), skip")
+                        return False
+                    if _q["spread_pct"] > _max_spread:
+                        print(f"    {s['ticker']:6s} — spread {_q['spread_pct']:.0f}% "
+                              f"> {_max_spread:.0f}% (illiquid), skip")
+                        return False
+                    prem = _q["ask"]                       # REAL price we'd pay
+                    _limit_px = round(_q["ask"] * 1.02, 2)  # cap slippage to +2%
                     one_ct_cost = prem * 100 if prem > 0 else 0
                     # Per-ticket cap: skip contracts too expensive for the account
                     if one_ct_cost > ticket_cap:
                         print(f"    {s['ticker']:6s} — 1 contract ${one_ct_cost:.0f} "
-                              f"> cap ${ticket_cap:.0f}, too big for account, skip")
+                              f"> cap ${ticket_cap:.0f} (live ask), skip")
                         return False
                     qty = max(1, int(_bud // one_ct_cost)) if one_ct_cost > 0 else 1
-                    res = _ob.submit_option_buy(contract["symbol"], qty)
+                    res = _ob.submit_option_buy(contract["symbol"], qty,
+                                                limit_price=_limit_px)
                     if not res.get("ok"):
                         print(f"    ✗ {s['ticker']:6s} — Alpaca opt order failed: "
                               f"{res.get('error')}")

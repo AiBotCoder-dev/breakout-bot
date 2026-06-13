@@ -86,4 +86,7 @@ jobs:
           REBUY_COOLDOWN_HOURS:    ${{ secrets.REBUY_COOLDOWN_HOURS || '8' }}
           MAX_DAILY_LOSS_DOLLARS:  ${{ secrets.MAX_DAILY_LOSS_DOLLARS || '1500' }}
           MAX_OPENS_PER_DAY:       ${{ secrets.MAX_OPENS_PER_DAY || '50' }}
+          # Reject option contracts with a bid-ask spread wider than this %
+          # (illiquid = bad fills). The 6/12 slippage fix.
+          MAX_OPT_SPREAD_PCT:      ${{ secrets.MAX_OPT_SPREAD_PCT || '25' }}
         run: python monitor.py

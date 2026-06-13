@@ -22,7 +22,7 @@ import os
 import re as _re
 import sys
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # ── make sure trading_scanner is importable from the same directory ───────────
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2021,10 +2021,32 @@ def main():
                 # ── AUTONOMOUS EXIT MANAGER — runs every cycle, closes on rules ─
                 # +100% take profit / -50% stop / DTE<=1 time-stop. This is what
                 # makes the bot safe to leave running for days unattended.
+                # Rebuy-cooldown table: once a contract/underlying is EXITED, it
+                # is locked out from re-entry for COOLDOWN_HOURS. This kills the
+                # 2026-06-12 churn loop where the scanner rebought TXN $340 ~19x
+                # in one day (stop -> rebuy -> stop), bleeding ~$1,300 the journal
+                # never showed. Without this, every other fix is undone by churn.
+                try:
+                    conn.execute("CREATE TABLE IF NOT EXISTS broker_exit_cooldown "
+                                 "(contract_symbol TEXT, underlying TEXT, "
+                                 "exited_at TEXT)")
+                except Exception:
+                    pass
+                _cooldown_hours = float(os.environ.get("REBUY_COOLDOWN_HOURS", "8") or 8)
+
                 try:
                     # Trailing-stop exit manager (lets winners run; no profit cap)
                     _exits = _ob.manage_option_exits(conn=conn)
                     for _x in _exits:
+                        # lock this contract AND underlying out of re-entry
+                        try:
+                            conn.execute(
+                                "INSERT INTO broker_exit_cooldown "
+                                "(contract_symbol, underlying, exited_at) VALUES (?,?,?)",
+                                (_x["symbol"], _x.get("underlying", ""),
+                                 datetime.now(timezone.utc).isoformat()))
+                        except Exception:
+                            pass
                         emoji = {"TRAILING_STOP": "🎯", "STOP_LOSS": "🛑",
                                  "TIME_STOP": "⏱"}.get(_x["reason"], "📕")
                         _peak = _x.get("peak_pct")
@@ -2160,6 +2182,22 @@ def main():
                     _oc = _otype[0].upper()                  # 'C' or 'P'
                     if s["ticker"] in held_u:
                         return False
+                    # REBUY COOLDOWN — don't re-enter a contract/underlying we exited
+                    # within the cooldown window (stops the stop->rebuy->stop churn).
+                    try:
+                        _cut = (datetime.now(timezone.utc)
+                                - timedelta(hours=_cooldown_hours)).isoformat()
+                        _cd = conn.execute(
+                            "SELECT 1 FROM broker_exit_cooldown WHERE exited_at >= ? "
+                            "AND (underlying = ? OR contract_symbol = ?) LIMIT 1",
+                            (_cut, s["ticker"], s.get("contract_symbol", ""))
+                        ).fetchone()
+                        if _cd:
+                            print(f"    {s['ticker']:6s} — in rebuy cooldown "
+                                  f"(exited < {_cooldown_hours:.0f}h ago), skip")
+                            return False
+                    except Exception:
+                        pass
                     contract = _ob.find_option_contract(
                         s["ticker"], s["expiry"], _otype, s["strike"])
                     if not contract or not contract.get("tradable"):
@@ -2441,15 +2479,28 @@ def main():
                                              "ORDER BY snapshot_date ASC LIMIT 1").fetchone()
                         _b0 = float(_base[0] if not hasattr(_base,'get') else _base.get('equity')) if _base else real_equity
                         _chg = (real_equity / _b0 - 1) * 100 if _b0 else 0
+                        # GROUND-TRUTH realized P&L from actual fills (the journal
+                        # under-counts churn). Surface churn so it can't hide again.
+                        _recon = _ob.realized_pnl_from_fills()
+                        _churn_txt = ""
+                        if _recon.get("churn"):
+                            _ct = ", ".join(f"{s.split()[0][:6]}×{n}"
+                                            for s, n in _recon["churn"][:4])
+                            _churn_txt = (f"\n⚠️ Churn detected (round-trips): {_ct}"
+                                          f"\nTotal round-trips: {_recon['round_trips']}")
                         send_telegram(
                             f"🏦 <b>BROKER DAILY SCORECARD</b>\n"
                             f"Real equity: ${real_equity:,.2f}\n"
                             f"Since start: {_chg:+.2f}%  (baseline ${_b0:,.0f})\n"
+                            f"<b>True realized P&L (from fills): ${_recon['realized_pnl']:+,.2f}</b>\n"
                             f"Open option positions: {_nopt}\n"
-                            f"Day P&L: ${acct.get('day_pnl',0):+,.2f}\n"
-                            f"<i>Autonomous paper run — gathering profitability data.</i>")
-                        print(f"  Broker scorecard logged: ${real_equity:,.2f} "
-                              f"({_chg:+.2f}% since start)")
+                            f"Day P&L: ${acct.get('day_pnl',0):+,.2f}"
+                            f"{_churn_txt}\n"
+                            f"<i>Realized P&L is computed from actual Alpaca fills, "
+                            f"not the journal estimate.</i>")
+                        print(f"  Broker scorecard: equity ${real_equity:,.2f} "
+                              f"({_chg:+.2f}%), true realized ${_recon['realized_pnl']:+,.2f}, "
+                              f"{_recon['round_trips']} round-trips")
                 except Exception as _sce:
                     print(f"  WARN broker scorecard failed: {_sce}")
         else:

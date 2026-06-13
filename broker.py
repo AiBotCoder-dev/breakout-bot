@@ -126,6 +126,52 @@ class AlpacaPaperBroker:
                 continue
         return out
 
+    def realized_pnl_from_fills(self, limit: int = 500) -> dict:
+        """
+        GROUND TRUTH realized P&L computed from actual filled orders (not the
+        journal's scan-estimated premiums, which under-counted churn ~8x on
+        2026-06-12). Pairs buy/sell fills per symbol: realized = sell proceeds -
+        buy cost for fully round-tripped quantity. Options use a 100x multiplier.
+
+        Returns {realized_pnl, round_trips, by_symbol:{sym:{buys,sells,pnl,trips}},
+                 churn:[(sym, trips)]}.
+        """
+        try:
+            orders = self._get("/v2/orders", {"status": "closed", "limit": limit,
+                                              "direction": "desc"})
+        except Exception:
+            return {"realized_pnl": 0.0, "round_trips": 0, "by_symbol": {}, "churn": []}
+        agg: dict = {}
+        for o in orders:
+            if str(o.get("status")) != "filled":
+                continue
+            sym = o.get("symbol", "")
+            fp = float(o.get("filled_avg_price", 0) or 0)
+            fq = float(o.get("filled_qty", 0) or 0)
+            if fp <= 0 or fq <= 0:
+                continue
+            mult = 100.0 if len(sym) > 8 else 1.0      # OCC option symbols are long
+            notional = fp * fq * mult
+            a = agg.setdefault(sym, {"buys": 0.0, "sells": 0.0,
+                                     "buy_ct": 0, "sell_ct": 0})
+            if o.get("side") == "buy":
+                a["buys"] += notional; a["buy_ct"] += 1
+            else:
+                a["sells"] += notional; a["sell_ct"] += 1
+        by_symbol, total, churn = {}, 0.0, []
+        for sym, a in agg.items():
+            trips = min(a["buy_ct"], a["sell_ct"])
+            pnl = a["sells"] - a["buys"]               # only meaningful if flat
+            by_symbol[sym] = {"buys": round(a["buys"], 2), "sells": round(a["sells"], 2),
+                              "pnl": round(pnl, 2), "trips": trips}
+            total += pnl
+            if trips >= 3:
+                churn.append((sym, trips))
+        churn.sort(key=lambda x: -x[1])
+        return {"realized_pnl": round(total, 2),
+                "round_trips": sum(min(a["buy_ct"], a["sell_ct"]) for a in agg.values()),
+                "by_symbol": by_symbol, "churn": churn}
+
     def get_orders(self, status: str = "all", limit: int = 50) -> list:
         try:
             rows = self._get("/v2/orders", {"status": status, "limit": limit,

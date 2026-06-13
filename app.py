@@ -1768,6 +1768,32 @@ with tab_today:
                    f"{_acct.get('status','?')} · this is a REAL broker paper "
                    f"account (simulated money, real fills).")
 
+        # ── GROUND-TRUTH P&L (from actual Alpaca fills, not the journal) ───────
+        # The journal logs SCAN-ESTIMATED entry prices and collapses repeated
+        # round-trips of one contract into a single row, so its $ were wrong
+        # (showed -$288 when the real loss was ~-$2,200 on 6/12). This block
+        # computes the truth by pairing real buy/sell fills.
+        try:
+            _recon = _bk.realized_pnl_from_fills()
+            _opos_now = _bk.get_option_positions()
+            _unreal = sum(float(p.get("unrealized_pnl", 0) or 0) for p in _opos_now)
+            st.markdown("**💵 Real P&L — from actual Alpaca fills (ground truth):**")
+            _t1, _t2, _t3, _t4 = st.columns(4)
+            _t1.metric("Realized (closed)", f"${_recon['realized_pnl']:+,.2f}")
+            _t2.metric("Unrealized (open)", f"${_unreal:+,.2f}")
+            _t3.metric("Net", f"${_recon['realized_pnl'] + _unreal:+,.2f}")
+            _t4.metric("Round-trips", _recon["round_trips"])
+            if _recon.get("churn"):
+                _ctxt = ", ".join(f"{s.split()[0][:8]}×{n}" for s, n in _recon["churn"][:6])
+                st.warning(f"⚠️ Churn detected (same contract round-tripped many "
+                           f"times — duplicate/noise, now blocked by the rebuy "
+                           f"cooldown): {_ctxt}", icon="🔁")
+            st.caption("This is the money truth, computed from real fills. The "
+                       "Trade Journal below uses estimated entry prices and is for "
+                       "per-setup ATTRIBUTION (which strategies fire), not P&L.")
+        except Exception as _rce:
+            st.caption(f"(real-fills P&L unavailable: {_rce})")
+
         # Surface the position-sizing override so it's clear it's active. The
         # Equity metric above is the REAL Alpaca balance ($100k); the override
         # does NOT change it — it only throttles how big each trade is sized.
@@ -1974,10 +2000,12 @@ with tab_today:
         st.caption(f"(Claude PM panel unavailable: {_cpue})")
 
     # ── TRADE JOURNAL — attribution analytics (drives optimization) ───────────
-    st.markdown("### 📓 Trade Journal — What's Actually Working")
-    st.caption("Every broker option trade tagged by quality band, DTE, sector, "
-               "and momentum. After ~2-4 weeks this tells you WHICH trades make "
-               "money — so optimization is driven by evidence, not guesses.")
+    st.markdown("### 📓 Trade Journal — Setup Attribution (not $ truth)")
+    st.caption("⚠️ Win-rate and grade breakdowns here are reliable, but the DOLLAR "
+               "figures use estimated entry prices and collapse repeated round-trips "
+               "— **for real money see the '💵 Real P&L from fills' block above.** "
+               "This panel answers WHICH setups/grades/DTEs win (attribution), so "
+               "optimization is driven by evidence. Dollar columns are indicative.")
     try:
         from trade_journal import analyze as _tj_analyze, recent as _tj_recent
         _ja = _tj_analyze(conn)

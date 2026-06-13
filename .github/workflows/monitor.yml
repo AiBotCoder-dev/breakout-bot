@@ -79,4 +79,9 @@ jobs:
           # high-macro days. Exits + overnight edge still run.
           NO_ENTRY_MIN:            ${{ secrets.NO_ENTRY_MIN || '45' }}
           NO_ENTRY_MIN_MACRO:      ${{ secrets.NO_ENTRY_MIN_MACRO || '75' }}
+          # Circuit breakers (the kill switches missing on the 6/12 churn day).
+          # Halt NEW entries for the rest of the day if either trips; exits run.
+          REBUY_COOLDOWN_HOURS:    ${{ secrets.REBUY_COOLDOWN_HOURS || '8' }}
+          MAX_DAILY_LOSS_DOLLARS:  ${{ secrets.MAX_DAILY_LOSS_DOLLARS || '200' }}
+          MAX_OPENS_PER_DAY:       ${{ secrets.MAX_OPENS_PER_DAY || '10' }}
         run: python monitor.py

@@ -2082,6 +2082,76 @@ def main():
                       f"(real ${real_equity:,.0f}) · ~${budget:.0f}/ticket · "
                       f"cap ${ticket_cap:.0f}")
 
+                # ══ CIRCUIT BREAKERS — the kill switches that were missing on ══
+                # 2026-06-12 (the churn loop bled -$2,708 all day with NOTHING
+                # halting it). Two independent floors; either trips -> no new
+                # entries for the rest of the day (exits ALWAYS keep running).
+                _halt_entries = False
+                _halt_reason = ""
+                try:
+                    conn.execute("CREATE TABLE IF NOT EXISTS broker_day_start "
+                                 "(snapshot_date TEXT PRIMARY KEY, equity REAL)")
+                    conn.execute("CREATE TABLE IF NOT EXISTS broker_daily_entries "
+                                 "(snapshot_date TEXT PRIMARY KEY, n INTEGER)")
+                    _today_d = datetime.now().strftime("%Y-%m-%d")
+                    _ds = conn.execute("SELECT equity FROM broker_day_start "
+                                       "WHERE snapshot_date=?", (_today_d,)).fetchone()
+                    if _ds is None:
+                        conn.execute("INSERT INTO broker_day_start "
+                                     "(snapshot_date, equity) VALUES (?,?)",
+                                     (_today_d, real_equity))
+                        _day_open_eq = real_equity
+                    else:
+                        _day_open_eq = float(_ds[0] if not hasattr(_ds, "get")
+                                             else _ds.get("equity") or real_equity)
+
+                    # 1) DAILY LOSS LIMIT — in REAL dollars. The override shrinks
+                    #    per-ticket SIZE but losses still hit the real account 1:1,
+                    #    so the limit must be real dollars (the 6/12 mistake was
+                    #    measuring danger on the $100k scale while sizing on $1k).
+                    #    Default -$200 ≈ 20% of the intended $1k bankroll per day.
+                    _dd_dollars = real_equity - _day_open_eq
+                    _max_loss = float(os.environ.get("MAX_DAILY_LOSS_DOLLARS", "200") or 200)
+                    if _dd_dollars <= -_max_loss:
+                        _halt_entries = True
+                        _halt_reason = (f"daily loss ${_dd_dollars:+.0f} "
+                                        f"(limit -${_max_loss:.0f})")
+
+                    # 2) MAX ENTRIES / DAY — a churn backstop independent of cause.
+                    _et = conn.execute("SELECT n FROM broker_daily_entries "
+                                       "WHERE snapshot_date=?", (_today_d,)).fetchone()
+                    _entries_today = int((_et[0] if not hasattr(_et, "get")
+                                          else _et.get("n")) or 0) if _et else 0
+                    _max_entries_day = int(os.environ.get("MAX_OPENS_PER_DAY", "10") or 10)
+                    if _entries_today >= _max_entries_day:
+                        _halt_entries = True
+                        _halt_reason = (_halt_reason + " · " if _halt_reason else "") + \
+                            f"{_entries_today}/{_max_entries_day} entries used today"
+
+                    if _halt_entries:
+                        print(f"  🛑 CIRCUIT BREAKER: {_halt_reason} — NO new entries "
+                              f"(exits still active).")
+                        # alert once per day
+                        _ha = conn.execute("SELECT 1 FROM broker_daily_entries "
+                                           "WHERE snapshot_date=? AND n<0", (_today_d,)).fetchone()
+                        conn.execute("CREATE TABLE IF NOT EXISTS broker_halt_alert "
+                                     "(snapshot_date TEXT PRIMARY KEY)")
+                        _already = conn.execute("SELECT 1 FROM broker_halt_alert "
+                                                "WHERE snapshot_date=?", (_today_d,)).fetchone()
+                        if not _already:
+                            send_telegram(
+                                f"🛑 <b>CIRCUIT BREAKER TRIPPED</b>\n"
+                                f"{_halt_reason}\n"
+                                f"Real equity ${real_equity:,.2f} "
+                                f"(day {_dd_dollars:+,.2f}).\n"
+                                f"No new entries the rest of today. Open positions "
+                                f"still managed by the exit rules. This is the "
+                                f"safety that was missing on the 6/12 churn day.")
+                            conn.execute("INSERT INTO broker_halt_alert "
+                                         "(snapshot_date) VALUES (?)", (_today_d,))
+                except Exception as _cbe:
+                    print(f"  WARN circuit breaker failed: {_cbe}")
+
                 # ── VIRTUAL $1k PORTFOLIO + auto-reset on blow-up ──────────────
                 # Track the $1k bankroll carved from the real $100k. If the bot
                 # loses it, don't stop — bank the result, bump a lifetime counter,
@@ -2217,6 +2287,15 @@ def main():
                               f"{res.get('error')}")
                         return False
                     held_u.add(s["ticker"])     # don't double-buy this cycle
+                    # bump the per-day entry counter (circuit-breaker backstop)
+                    try:
+                        conn.execute(
+                            "INSERT INTO broker_daily_entries (snapshot_date, n) "
+                            "VALUES (?,1) ON CONFLICT (snapshot_date) DO UPDATE "
+                            "SET n = broker_daily_entries.n + 1",
+                            (datetime.now().strftime("%Y-%m-%d"),))
+                    except Exception:
+                        pass
                     _is_ex = setup_tag.endswith("explore")
                     print(f"    {'🧪' if _is_ex else '✅'} ALPACA OPT BUY "
                           f"{contract['symbol']} x{qty} (~${prem:.2f}/ct, "
@@ -2344,7 +2423,9 @@ def main():
                                 else:
                                     _status, _result = "FAILED", str(_r2.get("error"))[:200]
                             elif _act in ("OPEN_CALL", "OPEN_PUT") and _dtk:
-                                if _entry_block_open:
+                                if _halt_entries:
+                                    _status, _result = "SKIPPED", f"circuit breaker: {_halt_reason}"
+                                elif _entry_block_open:
                                     _status, _result = "PENDING", "waiting out opening-volatility window"
                                     # leave PENDING so it executes a later cycle
                                     continue
@@ -2397,7 +2478,8 @@ def main():
                 # persists results (Best Options table) and fires NEW-setup
                 # Telegram alerts, so it replaces the standalone hourly meta-scan.
                 opened = 0
-                if not _macro_block and not _claude_pause and not _entry_block_open:
+                if (not _macro_block and not _claude_pause
+                        and not _entry_block_open and not _halt_entries):
                     try:
                         from options_scanner import OptionsScanner
                         _fms = OptionsScanner(conn)
@@ -2435,7 +2517,7 @@ def main():
                 # bucket and never inflate or deflate the real-strategy win rate.
                 _min_day = int(os.environ.get("MIN_TRADES_PER_DAY", "0") or 0)
                 if (_min_day > 0 and not _macro_block and not _claude_pause
-                        and not _entry_block_open):
+                        and not _entry_block_open and not _halt_entries):
                     try:
                         from trade_journal import count_opened_today as _cot
                         _done = _cot(conn)

@@ -46,6 +46,7 @@ PER_SOURCE_LIMIT   = {       # per-source candidate caps (controls API load)
     "reversal":       6,     # downtrend→base→uptrend TRIGGERED         CALLS
     "put_engine":     8,     # validated bearish edge                   PUTS
     "news_put":       6,     # news-reversal puts (validated)           PUTS
+    "exhaustion_put": 4,     # exhausted-high reversal (p=0.013, rare)  PUTS
     "panic":          2,     # capitulation → index calls (100% 60d)    CALLS
 }
 
@@ -60,6 +61,7 @@ SOURCE_META = {
     "reversal":      ("call", "Downtrend→base→uptrend reclaim (62% @60d)"),
     "put_engine":    ("put",  "Validated bearish breakdown edge"),
     "news_put":      ("put",  "News-reversal put (validated)"),
+    "exhaustion_put":("put",  "Exhausted-high reversal (60% win, p=0.013, rare)"),
     "panic":         ("call", "Capitulation rebound (100% win @60d, 12y)"),
 }
 
@@ -231,6 +233,45 @@ class OptionsScanner:
         except Exception as e:
             print(f"  [opt-scan] news_put source failed: {e}")
 
+        # 9b. Exhaustion-reversal puts — exhausted-high breakdown (p=0.013, RARE).
+        #     Heavy (2y download x40 names) but the setup persists for days, so we
+        #     THROTTLE the underlying scan to once / ~90 min and cache the tickers
+        #     — the live trader (fast) still sees it without paying the cost each
+        #     cycle. Regime-gated like the other puts.
+        try:
+            from put_engine import market_allows_puts as _map
+            if _map().get("allowed", False):
+                self.conn.execute("CREATE TABLE IF NOT EXISTS exhaustion_cache "
+                                  "(ticker TEXT, price REAL, scanned_at TEXT)")
+                _row = self.conn.execute(
+                    "SELECT MAX(scanned_at) FROM exhaustion_cache").fetchone()
+                _last = _row[0] if _row else None
+                _fresh = False
+                if _last:
+                    try:
+                        _dt = datetime.fromisoformat(str(_last).replace("Z", "+00:00"))
+                        _age = (datetime.now(_dt.tzinfo) - _dt).total_seconds()
+                        _fresh = _age < 5400          # 90 min
+                    except Exception:
+                        pass
+                if not _fresh:
+                    from exhaustion_reversal import ExhaustionReversal
+                    _ex = ExhaustionReversal(self.conn).scan()[:PER_SOURCE_LIMIT["exhaustion_put"]]
+                    _now = datetime.now(timezone.utc).isoformat()
+                    self.conn.execute("DELETE FROM exhaustion_cache")
+                    for r in _ex:
+                        self.conn.execute("INSERT INTO exhaustion_cache "
+                                          "(ticker, price, scanned_at) VALUES (?,?,?)",
+                                          (r["ticker"], r.get("price"), _now))
+                # read from cache (fresh or just-written)
+                for r in self.conn.execute(
+                        "SELECT ticker, price FROM exhaustion_cache").fetchall():
+                    _d = dict(r) if hasattr(r, "keys") else {"ticker": r[0], "price": r[1]}
+                    add(_d["ticker"], "exhaustion_put", "put",
+                        price=_d.get("price"), thesis=12.0)
+        except Exception as e:
+            print(f"  [opt-scan] exhaustion_put source failed: {e}")
+
         # 10. Panic detector — capitulation rebound → index CALLS (100% @60d)
         #     status() = {snap, signatures[]}; panic is "on" if any signature is
         #     currently firing or still active in the DB.
@@ -345,8 +386,9 @@ class OptionsScanner:
     # Source priority — validated edges first. Controls which candidates get the
     # expensive option-chain fetch when we cap scoring for the live cycle.
     _SOURCE_PRIORITY = {
-        "momentum": 0, "bottom_fisher": 1, "put_engine": 2, "panic": 2,
-        "pead": 3, "news_put": 3, "whale": 4, "reversal": 5, "vip": 6, "mover": 7,
+        "momentum": 0, "bottom_fisher": 1, "exhaustion_put": 1, "put_engine": 2,
+        "panic": 2, "pead": 3, "news_put": 3, "whale": 4, "reversal": 5,
+        "vip": 6, "mover": 7,
     }
 
     # ── full scan ──────────────────────────────────────────────────────────────

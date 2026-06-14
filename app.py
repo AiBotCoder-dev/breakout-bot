@@ -4187,6 +4187,57 @@ with tab_analyst:
                    "bounce with the premium trailing stop (the tight underlying stop "
                    "gets whipsawed — that's why the bot manages exits on premium, not price).")
 
+    # ── Exhaustion Reversal — rare exhausted-high PUT setups ───────────────────
+    st.markdown("---")
+    st.markdown("### 💥 Exhaustion Reversal — Rare Exhausted-High PUTS")
+    st.caption(
+        "The 'max-profit reversal': a stock PEAKS near its 252-day high while "
+        "stretched (≥12% above 50-SMA) with exhaustion at the top (RSI divergence "
+        "or drying volume), then DECISIVELY breaks down (close < 10-day low). "
+        "Backtest (53 names, 9y, managed exit): **60% win, PF 1.92, MCPT p=0.013** "
+        "— but RARE (~2/yr) and small sample (n=20), so it's a high-conviction "
+        "secondary signal. The IV edge is the payoff: at a complacent high IV is "
+        "cheap, and the reversal expands it hard, so the put gains on delta AND "
+        "vega → modeled **option expectancy ≈ +100%/trade** (win +218% / loss −70%)."
+    )
+    if st.button("💥 Scan Exhaustion Reversals", key="exh_btn", type="primary"):
+        try:
+            from exhaustion_reversal import ExhaustionReversal
+            _ep = st.progress(0.0, text="Scanning for exhausted-high breakdowns…")
+            def _ex_cb(i, n, t):
+                _ep.progress(min(i/max(n,1), 1.0), text=f"{t} ({i}/{n})")
+            with st.spinner("Scanning for the p=0.013 reversal setup…"):
+                _exr = ExhaustionReversal(conn).scan(progress=_ex_cb)
+            _ep.empty()
+            st.session_state["_exr"] = _exr
+        except Exception as _exe:
+            st.error(f"Exhaustion scan failed: {_exe}")
+    _exr = st.session_state.get("_exr")
+    if _exr is None:
+        st.info("Hit **Scan Exhaustion Reversals**. Most of the time this is empty "
+                "(~2 setups/year) — that's the discipline. When one appears, it's a "
+                "stretched name that peaked on exhaustion and is now breaking down.",
+                icon="💥")
+    elif not _exr:
+        st.info("No exhaustion-reversal setups right now — nothing is peaking-and-"
+                "breaking today. Expected; don't force it.", icon="📭")
+    else:
+        import pandas as _pde
+        st.dataframe(_pde.DataFrame([{
+            "Ticker": r["ticker"],
+            "Price": f"${r['price']:.2f}",
+            "Peak": f"${r['peak']:.2f}",
+            "Off peak": f"{r['off_peak_pct']:+.1f}%",
+            "RSI": f"{r['rsi']:.0f}",
+            "Exhaustion": r["exhaustion"],
+            "Entry(PUT)": f"${r['entry']:.2f}",
+            "Stop": f"${r['stop']:.2f}",
+            "Target": f"${r['target']:.2f}",
+        } for r in _exr]), use_container_width=True, hide_index=True)
+        st.caption("Trade: slightly-OTM PUT, prefer LOW IV-rank (cheap vol with room "
+                   "to expand). Stop just above the peak/swing high; the reversal's "
+                   "IV expansion is where the outsized option gain comes from.")
+
 
 with tab_whale:
     conn, _ww_mode = get_db()

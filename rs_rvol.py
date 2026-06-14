@@ -96,7 +96,8 @@ def compute(ticker: str) -> dict:
 
 # sources that are UPTREND/momentum-type (RS/RVOL helps). Dip sources excluded.
 MOMENTUM_SOURCES = {"momentum", "pead", "whale", "vip", "mover", "panic"}
-DIP_SOURCES      = {"bottom_fisher", "reversal", "put_engine", "news_put"}
+DIP_SOURCES      = {"bottom_fisher", "reversal", "put_engine", "news_put",
+                    "exhaustion_put"}
 
 
 def applies_to(sources) -> bool:

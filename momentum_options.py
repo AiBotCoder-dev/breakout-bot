@@ -50,8 +50,19 @@ TARGET_DTE_MAX          = 14       # ~2 weeks max (was 28) — quick in/out
 TARGET_DTE_IDEAL        = 9        # ~1.5 weeks — short hold, cheaper contract for $1k acct
 MIN_THESIS_PCT          = 8.0      # don't trade options if the expected move is < 8%
                                    # (the OTM strike + theta math doesn't pay otherwise)
-OTM_PCT_MIN             = 0.05     # 5% OTM minimum
-OTM_PCT_MAX             = 0.15     # 15% OTM maximum
+# NEAR-THE-MONEY by default (was 5-15% OTM). Backtest — option_structure_backtest.py,
+# n≈20k momentum longs, 6y: deep-OTM calls win only 33.5% (median -54% — a pure
+# lottery), while ATM-to-5%-OTM wins ~45% (+11pp) with a ~breakeven median. We trade
+# the rare moonshot for far fewer -50%/-90% bleeds and a far more execution-robust
+# trade (near-money is much less theta/IV-crush/slippage sensitive). The selector
+# scores closest-to-ATM highest, so it leans ATM when affordable, 5% OTM when not.
+OTM_PCT_MIN             = 0.00     # ATM
+OTM_PCT_MAX             = 0.07     # up to 7% OTM — the selector scores closest-to-
+                                   # money highest (and penalizes premium), so it
+                                   # picks ATM when it fits the $ budget and only
+                                   # drifts toward 7% OTM on pricier names. This
+                                   # keeps the win-rate lift while preserving volume
+                                   # (a 0-5% band skipped too many $100+ leaders).
 LOTTERY_SIZE_PCT        = 0.05     # 5% of options cash per ticket (lottery)
 MAX_CONCURRENT_POSITIONS = 8
 MAX_NEW_PER_CYCLE       = 2

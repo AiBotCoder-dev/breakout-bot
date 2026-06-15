@@ -188,6 +188,16 @@ def classify(conn, ticker: str) -> dict | None:
     except Exception:
         exp = None
 
+    # 4c) DEALER POSITIONING (follow the market makers) — options-hedging walls
+    #     and max-pain pin. Context only (modest, near-expiry pull); not a trigger.
+    try:
+        from dealer_positioning import get_dealer_positioning
+        dp = get_dealer_positioning(ticker)
+        for _s in (dp.get("signals") or [])[:3]:
+            reasons.append(_s)
+    except Exception:
+        pass
+
     # 5) reaction read — did the move hold or fade?
     if big:
         if day > 0 and range_pos >= 0.66:

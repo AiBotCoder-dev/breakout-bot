@@ -176,13 +176,22 @@ def select_call_contract(ticker: str, underlying_price: float,
     if cand.empty:
         return None
 
+    # NaN-safe float — yfinance returns NaN for volume/OI/bid on thin contracts,
+    # and `NaN or 0` stays NaN (NaN is truthy), so `int(NaN)` later crashed the
+    # whole scan ("cannot convert float NaN to integer", 2026-06-15).
+    def _nz(v, d=0.0):
+        try:
+            x = float(v)
+            return x if x == x else d        # x != x is True only for NaN
+        except Exception:
+            return d
+
     # Premium estimate: midpoint of bid/ask (fall back to lastPrice)
     def _mid(row):
-        b = float(row.get("bid", 0) or 0)
-        a = float(row.get("ask", 0) or 0)
+        b = _nz(row.get("bid")); a = _nz(row.get("ask"))
         if b > 0 and a > 0 and a >= b:
             return (a + b) / 2.0
-        return float(row.get("lastPrice", 0) or 0)
+        return _nz(row.get("lastPrice"))
 
     today = datetime.utcnow().date()
     try:
@@ -195,14 +204,16 @@ def select_call_contract(ticker: str, underlying_price: float,
         prem = _mid(row)
         if prem <= 0 or prem > COST_CAP_PER_CONTRACT:
             continue
-        vol  = float(row.get("volume", 0) or 0)
-        oi   = float(row.get("openInterest", 0) or 0)
+        vol  = _nz(row.get("volume"))
+        oi   = _nz(row.get("openInterest"))
         if vol < MIN_VOLUME and oi < MIN_OPEN_INTEREST:
             continue
-        iv = float(row.get("impliedVolatility", 0) or 0)
+        iv = _nz(row.get("impliedVolatility"))
         if iv and iv > IV_HARD_CEILING:
             continue
-        strike = float(row["strike"])
+        strike = _nz(row.get("strike"))
+        if strike <= 0:
+            continue
         otm_pct = (strike - underlying_price) / underlying_price
         # Score: prefer slightly closer-to-ATM (more delta), but penalise rich premium
         # and reward liquidity. Keep simple and inspectable.

@@ -2319,17 +2319,28 @@ def main():
                     # (SOXX was estimated $1.30 but really $4.80). Reject wide
                     # spreads, and buy with a LIMIT capped just above the ask so a
                     # thin book can't fill us far above the quote.
+                    # FAIL-OPEN: if the options-quote endpoint isn't available on
+                    # this account, DON'T halt all trading — fall back to the scan
+                    # estimate with a conservative limit (fills when the estimate is
+                    # roughly right; harmlessly no-fills when it's way off, which is
+                    # exactly the bad-fill case we want to avoid anyway).
                     _q = _ob.get_option_quote(contract["symbol"])
                     _max_spread = float(os.environ.get("MAX_OPT_SPREAD_PCT", "25") or 25)
-                    if not _q:
-                        print(f"    {s['ticker']:6s} — no live quote (illiquid), skip")
-                        return False
-                    if _q["spread_pct"] > _max_spread:
-                        print(f"    {s['ticker']:6s} — spread {_q['spread_pct']:.0f}% "
-                              f"> {_max_spread:.0f}% (illiquid), skip")
-                        return False
-                    prem = _q["ask"]                       # REAL price we'd pay
-                    _limit_px = round(_q["ask"] * 1.02, 2)  # cap slippage to +2%
+                    if _q:
+                        if _q["spread_pct"] > _max_spread:
+                            print(f"    {s['ticker']:6s} — spread {_q['spread_pct']:.0f}% "
+                                  f"> {_max_spread:.0f}% (illiquid), skip")
+                            return False
+                        prem = _q["ask"]                       # REAL price we'd pay
+                        _limit_px = round(_q["ask"] * 1.02, 2)  # cap slippage to +2%
+                    else:
+                        prem = s.get("premium") or contract.get("close_price") or 0
+                        if prem <= 0:
+                            print(f"    {s['ticker']:6s} — no quote and no estimate, skip")
+                            return False
+                        _limit_px = round(prem * 1.10, 2)     # est + 10% buffer
+                        print(f"    {s['ticker']:6s} — no live quote; fallback to "
+                              f"estimate ${prem:.2f} w/ limit ${_limit_px:.2f}")
                     one_ct_cost = prem * 100 if prem > 0 else 0
                     # Per-ticket cap: skip contracts too expensive for the account
                     if one_ct_cost > ticket_cap:

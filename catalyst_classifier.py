@@ -176,6 +176,18 @@ def classify(conn, ticker: str) -> dict | None:
             reasons.append(f"IV-rank {ivr:.0f}% — vol is CHEAP with room to expand; "
                            f"naked long has real convexity.")
 
+    # 4b) EXPECTATIONS + POSITIONING (free analyst/short data) — the missing half
+    #     of (reality − expectations). Priced-for-perfection = fade risk on good
+    #     news; rising estimates = tailwind; high short interest = squeeze fuel.
+    exp = None
+    try:
+        from expectations import get_expectations
+        exp = get_expectations(ticker)
+        for _s in (exp.get("signals") or [])[:3]:
+            reasons.append(_s)
+    except Exception:
+        exp = None
+
     # 5) reaction read — did the move hold or fade?
     if big:
         if day > 0 and range_pos >= 0.66:
@@ -196,17 +208,29 @@ def classify(conn, ticker: str) -> dict | None:
         bias = "neutral"
         structure = "wait for the SECOND move (continuation or reversal), don't chase the gap"
     else:
-        # technical/flow — read the prior run + reaction
+        # technical/flow — read the prior run + reaction + EXPECTATIONS.
+        # "priced for perfection" (above analyst target) amplifies fade risk;
+        # rising/falling estimate revisions confirm the directional lean.
+        _ppf = bool(exp and exp.get("priced_for_perfection"))
+        _exp_bias = (exp or {}).get("positioning_bias", "neutral")
+        _fade = extended or _ppf
         if beaten and (day > 0 and range_pos >= 0.6):
             readability, bias = "READABLE", "bullish"
-        elif extended and (day < 0 or range_pos <= 0.4):
+        elif _fade and (day < 0 or range_pos <= 0.4):
             readability, bias = "READABLE", "bearish"
-        elif day > 0 and range_pos >= 0.66 and not extended:
+        elif day > 0 and range_pos >= 0.66 and not _fade:
             readability, bias = "READABLE", "bullish"
         elif day < 0 and range_pos <= 0.34 and not beaten:
             readability, bias = "READABLE", "bearish"
         else:
             readability, bias = "COIN_FLIP", "neutral"
+        # expectations confirmation: a matching analyst lean upgrades conviction;
+        # a contradicting one knocks a READABLE down to a coin-flip.
+        if readability == "READABLE" and _exp_bias != "neutral":
+            if _exp_bias != bias:
+                readability = "COIN_FLIP"
+                reasons.append(f"…but analyst positioning leans {_exp_bias} "
+                               f"(conflicts with the price read) — downgraded to coin-flip.")
         if ivr is not None and ivr >= 65:
             structure = "debit spread (IV too high for a naked long)"
         elif bias == "bullish":

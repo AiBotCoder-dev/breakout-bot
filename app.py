@@ -4238,6 +4238,55 @@ with tab_analyst:
                    "to expand). Stop just above the peak/swing high; the reversal's "
                    "IV expansion is where the outsized option gain comes from.")
 
+    # ── Catalyst Read — the decision-tree applied to any ticker ────────────────
+    st.markdown("---")
+    st.markdown("### 🧠 Catalyst Read — How Will Price React?")
+    st.caption(
+        "Applies the catalyst decision-tree to any ticker: is this a SHOCK or a "
+        "SCHEDULED event? How much of the implied move is already used? Is it "
+        "extended (sell-the-news risk) or beaten down (relief-pop)? Is IV cheap "
+        "or about to crush? Did the move HOLD or FADE? Output: **READABLE / "
+        "COIN-FLIP / AVOID** + the structure to use. The honest point — it tells "
+        "you when the move is *readable* and, just as importantly, when it's a "
+        "coin-flip you should NOT bet on (earnings, shocks)."
+    )
+    _cr_in = st.text_input("Ticker", value="", key="cr_ticker",
+                           placeholder="e.g. NVDA, PLTR, SOFI").strip().upper()
+    if _cr_in:
+        try:
+            from catalyst_classifier import classify as _cl
+            with st.spinner(f"Reading {_cr_in}…"):
+                _cr = _cl(conn, _cr_in)
+            if not _cr:
+                st.warning(f"No data for {_cr_in}.", icon="⚠️")
+            else:
+                _rc = {"READABLE": "#3fb950", "COIN_FLIP": "#e3b341",
+                       "AVOID": "#f85149"}.get(_cr["readability"], "#8b949e")
+                st.markdown(
+                    f"<div style='background:#161b22;border:1px solid {_rc};"
+                    f"border-radius:10px;padding:14px 16px;'>"
+                    f"<span style='font-size:1.15rem;font-weight:800;color:{_rc}'>"
+                    f"{_cr['readability'].replace('_',' ')}</span>"
+                    f"<span style='color:#8b949e'> · {_cr['classification']} · "
+                    f"conf {_cr['confidence']}%</span><br>"
+                    f"<span style='color:#e6edf3'>{_cr['ticker']} ${_cr['price']:.2f} "
+                    f"({_cr['day_pct']:+.1f}% day, gap {_cr['gap_pct']:+.1f}%, "
+                    f"RVOL {_cr['rvol']:.1f}x, RSI {_cr['rsi']:.0f})</span><br>"
+                    f"<span style='color:{_rc};font-weight:600'>→ {_cr['structure_hint']}</span>"
+                    f"</div>", unsafe_allow_html=True)
+                st.markdown("**The read, step by step:**")
+                for _r in _cr["reasons"]:
+                    st.markdown(f"- {_r}")
+                if _cr["readability"] == "AVOID":
+                    st.error("Binary event — the reaction is a coin-flip dressed up as "
+                             "a thesis. Wait for the print, then read the reaction.",
+                             icon="🛑")
+                elif _cr["readability"] == "COIN_FLIP":
+                    st.warning("Not readable enough to bet on yet — wait for the move to "
+                               "confirm (hold vs fade) before committing.", icon="🪙")
+        except Exception as _cre:
+            st.error(f"Catalyst read failed: {_cre}")
+
 
 with tab_whale:
     conn, _ww_mode = get_db()

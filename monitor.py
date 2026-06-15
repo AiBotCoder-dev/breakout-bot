@@ -1547,6 +1547,20 @@ def main():
             item = hi["item"]
             cls  = hi["classification"]
             tickers_str = ", ".join(cls.get("affected_tickers", [])) or "—"
+            # ── CATALYST READ — apply the decision tree to the named ticker(s) ──
+            _read_txt = ""
+            try:
+                from catalyst_classifier import classify as _clx
+                for _rt in (cls.get("affected_tickers", []) or [])[:1]:
+                    _cr = _clx(conn, _rt)
+                    if _cr:
+                        _emo = {"READABLE": "✅", "COIN_FLIP": "🪙",
+                                "AVOID": "🛑"}.get(_cr["readability"], "")
+                        _read_txt = (f"\n{_emo} <b>Catalyst read:</b> "
+                                     f"{_cr['readability'].replace('_',' ')} "
+                                     f"({_cr['classification']}) → {_cr['structure_hint']}")
+            except Exception:
+                pass
             send_telegram(
                 f"🚨 <b>HIGH-IMPACT NEWS</b>\n"
                 f"<b>{item.get('headline', '')[:200]}</b>\n"
@@ -1555,6 +1569,7 @@ def main():
                 f"Impact: {cls.get('impact_score', 0)}/10\n"
                 f"Affects  : {tickers_str}\n"
                 f"Source   : {item.get('source', '')}"
+                f"{_read_txt}"
             )
             # ── Attach the exact affordable WEEKLY option for each named ticker ──
             try:

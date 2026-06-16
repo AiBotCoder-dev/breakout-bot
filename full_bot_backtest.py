@@ -93,8 +93,8 @@ def _rsi(c, p=14):
     return out
 
 
-def _load(t):
-    end = datetime.now(); start = end - timedelta(days=int(5*365.25)+260)
+def _load(t, years=5):
+    end = datetime.now(); start = end - timedelta(days=int(years*365.25)+260)
     raw = yf.download(t, start=start, end=end, progress=False, auto_adjust=True)
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
@@ -150,12 +150,16 @@ def _scan_stock(df, entry_iv_premium=ENTRY_IV_PREMIUM):
     return sigs
 
 
-def _load_all():
-    """Download every name once so run() and sweep() can reuse the same data."""
+def _load_all(years=5):
+    """Download every name once so run() and sweep() can reuse the same data.
+
+    `years` controls how much history is pulled; walk_forward.py asks for more
+    (10y) so it has enough post-warmup data to cut multiple OOS folds.
+    """
     dfs = {}
     for t in STOCKS:
         try:
-            dfs[t] = _load(t)
+            dfs[t] = _load(t, years)
         except Exception as e:
             print(f"{t}: load failed {e}")
     return dfs

@@ -216,3 +216,98 @@ cheaply you assume you can buy volatility. In a high-IV regime — which is exac
 momentum breakouts fire and everyone is bidding up calls — the edge compresses toward
 zero. Until the backtest uses **real historical option prices**, read the option
 win-rate / return as the RANGE above, not a single number.
+
+---
+
+## 7. Walk-forward (out-of-sample) validation — `walk_forward.py`
+
+**Date:** 2026-06-16
+**New file:** `walk_forward.py`
+**Also touched:** `full_bot_backtest.py` (`_load`/`_load_all` now take a `years=` arg).
+
+### Why this exists
+
+§4 listed the last big lie: **thresholds are tuned on the same window they're tested
+on.** `full_bot_backtest.py` checks `mom6 > 0.10` on the data that 0.10 was eyeballed
+from — the textbook way to fool yourself. This harness tests the MOMENTUM entry
+*honestly* with rolling walk-forward folds, where the optimiser only ever sees the past.
+
+### Method
+
+1. Slide a **2-year in-sample (IS)** window across 10 years of history.
+2. On each IS window, pick the 6-month momentum threshold (`MOM_GRID =
+   [0.00 … 0.25]`) that maximised average forward return — optimiser sees past only.
+3. Apply that threshold to the next **6-month out-of-sample (OOS)** window — data the
+   optimiser never touched — and bank those trades.
+4. Roll forward 6 months, repeat. Pool all OOS trades = honest performance estimate.
+
+Two controls make it interpretable:
+- **Fixed-0.10 baseline** run on the *same* OOS windows. If adaptive tuning can't beat
+  a constant, the tuning adds nothing.
+- **Chosen-threshold histogram.** If the "best" threshold jumps fold-to-fold, the
+  parameter is noise, not an edge.
+
+### The result that matters (actual run, 10y, 15 folds, 5 names)
+
+```
+ WALK-FORWARD AGGREGATE - 15 folds, MOMENTUM only
+  In-sample SELECTED avg fwd return (optimistic) : +2.1%
+  --- OUT-OF-SAMPLE (the honest number) ---
+  WF OOS  directional   n=354  win 57.1%  avg +1.9%
+  WF OOS  option NET    n=354  win 39.3%  avg +71.7%
+  --- FIXED 0.10 baseline on the SAME OOS windows ---
+  Fixed   directional   n=394  win 59.9%  avg +2.2%
+  Fixed   option NET    n=394  win 42.6%  avg +93.7%
+
+  >>> OVERFITTING TAX (IS-selected minus OOS) : +0.2% avg return <<<
+  >>> ADAPTIVE EDGE vs fixed 0.10 (OOS)       : -0.4% avg return <<<
+  Thresholds picked per fold: {0.25: 4, 0.0: 3, 0.2: 3, 0.15: 4, 0.1: 1}
+```
+
+### How to read this honestly — three findings
+
+1. **The momentum entry survives out-of-sample.** OOS directional win 57.1%, avg
+   +1.9% per 10-day hold. The **overfitting tax is only +0.2%** — the IS-selected
+   number barely beats OOS, so the *direction* signal is not curve-fit. That's the
+   good news, and it's a real (if modest) edge on the underlying.
+2. **Adaptive tuning is worthless — actually slightly harmful (-0.4%).** Re-optimising
+   the threshold every fold did *worse* than just hard-coding 0.10. The fixed baseline
+   even ran more trades (394 vs 354) at a higher win rate. **Conclusion: keep the
+   threshold fixed; do not "optimise" it.** Every knob you add is a chance to overfit
+   for no gain.
+3. **The "best" threshold is noise.** It scattered across the entire grid
+   (`0.25` four times, `0.15` four times, `0.0`/`0.20` three times each). There is no
+   stable optimal momentum cutoff — which is exactly why tuning it doesn't help.
+
+The option-NET averages (+72% / +94%) carry the same caveat as §6: they're dominated
+by the unknowable entry-IV assumption and a fat right tail, so judge this test on the
+**directional** numbers first.
+
+### What changed in `full_bot_backtest.py`
+
+- `_load(t)` → `_load(t, years=5)` and `_load_all()` → `_load_all(years=5)`. Default
+  behaviour is unchanged (the main backtest still runs 5y); walk-forward calls
+  `_load_all(10)` so there's enough post-warmup history to cut 15 folds instead of 3.
+- `walk_forward.py` imports the pricing/data layer (`bs_call`, `buy_fill`, `sell_fill`,
+  `_load_all`, constants) directly from `full_bot_backtest.py` so the two never drift.
+
+### Limitations (read before trusting it)
+
+- **MOMENTUM only.** BOTTOM_FISHER produced ~13 trades total — too few to fold.
+- **One knob.** Optimises only the momentum threshold over a fixed trend filter. Real
+  overfitting risk grows with more knobs; this is a FLOOR on the problem, not a ceiling.
+- **Same 5 survivor names**, same bull-ish window — survivorship bias (§4) still applies.
+- Boundary effects at window edges are minor (signals bucketed by entry date).
+
+### How to run
+
+```powershell
+python walk_forward.py
+```
+
+### Next step
+
+Re-run this whenever the entry logic changes. If you ever add knobs to the entry
+(extra filters, dynamic strikes), add them to `MOM_GRID`-style grids here FIRST and
+confirm the OOS edge survives before trusting them live. The pattern to keep: **every
+new parameter must beat its own fixed-constant baseline out-of-sample, or it gets cut.**

@@ -60,6 +60,13 @@ MIN_HALF_SPREAD = 0.02         # $/share floor for the half-spread (cheap opts t
 COMMISSION_PER_SHARE = 0.0065  # $0.65 / contract ÷ 100 shares, charged on EACH side
 IV_CRUSH = 0.10                # exit IV = entry IV × (1 − IV_CRUSH): vol mean-reversion
 
+# Entry IV = realized vol × ENTRY_IV_PREMIUM. The original code hard-coded 1.10.
+# A LIVE snapshot (option_iv_calibration.py, 2026-06-16) measured the real near-money
+# IV/realized ratio at ~0.87 for these names — i.e. CURRENTLY implied < realized.
+# That ratio is regime-dependent and NOT recoverable from price history, so the honest
+# tool is the sensitivity sweep (`python full_bot_backtest.py sweep`), not one number.
+ENTRY_IV_PREMIUM = 0.87
+
 
 def _half_spread(mid: float) -> float:
     """Half the bid/ask spread in $/share: the larger of a % of mid or a $ floor."""
@@ -101,56 +108,74 @@ def _load(t):
     return df.dropna()
 
 
-def run():
-    print(f"Replaying the bot's CALL process - {len(STOCKS)} stocks, 5y, {HOLD}d hold\n")
-    agg_dir, agg_opt, agg_gross, agg_setup = [], [], [], []
-    per_stock = {}
-    examples = {}
+def _scan_stock(df, entry_iv_premium=ENTRY_IV_PREMIUM):
+    """Walk one name's history; return its non-overlapping call signals.
 
+    Each signal tuple: (date, setup, spot, dir_ret%, opt_net%, opt_gross%).
+    `entry_iv_premium` scales realized vol into the assumed entry IV — the single
+    biggest unknown in the whole backtest, which is why it's a parameter you can sweep.
+    """
+    C = df["Close"].values
+    s50 = df["sma50"].values; s200 = df["sma200"].values
+    rsi = df["rsi"].values; low60 = df["low60"].values
+    mom6 = df["mom6"].values; rv = df["rv20"].values
+    idx = df.index
+    n = len(C); i = 210
+    sigs = []
+    while i < n - HOLD:
+        setup = None
+        if (C[i] > s50[i] > s200[i] and s50[i] > s50[i-10]
+                and s200[i] > s200[i-20] and mom6[i] > 0.10):
+            setup = "MOMENTUM"
+        elif (rsi[i] < 30 and low60[i] > 0 and (C[i]/low60[i]-1) <= 0.06
+              and C[i] > C[i-1]):
+            setup = "BOTTOM_FISHER"
+        if setup:
+            S0 = C[i]; S1 = C[i+HOLD]
+            dir_ret = (S1/S0 - 1) * 100
+            iv0 = max(0.15, min(1.5, rv[i]*entry_iv_premium))  # entry IV (calibrated premium)
+            iv1 = max(0.05, iv0 * (1.0 - IV_CRUSH))            # exit IV after the crush
+            K = S0 * 1.03            # near-money call (the bot's default band)
+            mid_e = bs_call(S0, K, 21/365, iv0)                # theoretical mid at entry
+            mid_x = bs_call(S1, K, 11/365, iv1)                # theoretical mid at exit
+            # GROSS = the old frictionless lie (mid-to-mid); NET = ask in / bid out + comm
+            opt_gross = (mid_x/mid_e - 1) * 100 if mid_e > 0.01 else 0.0
+            cost = buy_fill(mid_e); proceeds = sell_fill(mid_x)
+            opt_net = (proceeds/cost - 1) * 100 if cost > 0.01 else 0.0
+            sigs.append((idx[i].date(), setup, round(S0, 2),
+                         round(dir_ret, 1), round(opt_net, 0), round(opt_gross, 0)))
+            i += HOLD               # non-overlapping
+        else:
+            i += 1
+    return sigs
+
+
+def _load_all():
+    """Download every name once so run() and sweep() can reuse the same data."""
+    dfs = {}
     for t in STOCKS:
         try:
-            df = _load(t)
+            dfs[t] = _load(t)
         except Exception as e:
-            print(f"{t}: load failed {e}"); continue
-        C = df["Close"].values; H = df["High"].values; L = df["Low"].values
-        s50 = df["sma50"].values; s200 = df["sma200"].values
-        rsi = df["rsi"].values; low60 = df["low60"].values
-        mom6 = df["mom6"].values; rv = df["rv20"].values
-        idx = df.index
-        n = len(C); i = 210
-        sigs = []
-        while i < n - HOLD:
-            setup = None
-            if (C[i] > s50[i] > s200[i] and s50[i] > s50[i-10]
-                    and s200[i] > s200[i-20] and mom6[i] > 0.10):
-                setup = "MOMENTUM"
-            elif (rsi[i] < 30 and low60[i] > 0 and (C[i]/low60[i]-1) <= 0.06
-                  and C[i] > C[i-1]):
-                setup = "BOTTOM_FISHER"
-            if setup:
-                S0 = C[i]; S1 = C[i+HOLD]
-                dir_ret = (S1/S0 - 1) * 100
-                iv0 = max(0.15, min(1.5, rv[i]*1.1))     # entry IV (realized-vol proxy)
-                iv1 = max(0.05, iv0 * (1.0 - IV_CRUSH))  # exit IV after the crush
-                K = S0 * 1.03            # near-money call (the bot's default band)
-                mid_e = bs_call(S0, K, 21/365, iv0)      # theoretical mid at entry
-                mid_x = bs_call(S1, K, 11/365, iv1)      # theoretical mid at exit
+            print(f"{t}: load failed {e}")
+    return dfs
 
-                # GROSS = the old frictionless lie (mid-to-mid, flat IV) — kept for contrast
-                opt_gross = (mid_x/mid_e - 1) * 100 if mid_e > 0.01 else 0.0
-                # NET   = reality: pay the ask, sell the bid, pay commission, IV crushed
-                cost = buy_fill(mid_e); proceeds = sell_fill(mid_x)
-                opt_net = (proceeds/cost - 1) * 100 if cost > 0.01 else 0.0
 
-                sigs.append((idx[i].date(), setup, round(S0, 2),
-                             round(dir_ret, 1), round(opt_net, 0), round(opt_gross, 0)))
-                agg_dir.append(dir_ret); agg_opt.append(opt_net)
-                agg_gross.append(opt_gross); agg_setup.append(setup)
-                i += HOLD               # non-overlapping
-            else:
-                i += 1
-        per_stock[t] = sigs
-        examples[t] = sigs
+def run(dfs=None, entry_iv_premium=ENTRY_IV_PREMIUM):
+    print(f"Replaying the bot's CALL process - {len(STOCKS)} stocks, 5y, {HOLD}d hold")
+    print(f"(entry IV = realized vol x {entry_iv_premium:.2f}, IV crush {IV_CRUSH*100:.0f}%, "
+          f"~{HALF_SPREAD_PCT*200:.0f}% round-trip spread + commission)\n")
+    if dfs is None:
+        dfs = _load_all()
+    agg_dir, agg_opt, agg_gross, agg_setup = [], [], [], []
+
+    for t in STOCKS:
+        if t not in dfs:
+            continue
+        sigs = _scan_stock(dfs[t], entry_iv_premium)
+        for s in sigs:
+            agg_dir.append(s[3]); agg_opt.append(s[4])
+            agg_gross.append(s[5]); agg_setup.append(s[1])
         d = np.array([s[3] for s in sigs])
         o = np.array([s[4] for s in sigs]); g = np.array([s[5] for s in sigs])
         if len(sigs):
@@ -191,5 +216,42 @@ def run():
                   f"(gross {gs.mean():+.0f}%)")
 
 
+def sweep(premiums=(0.80, 0.90, 1.00, 1.10, 1.20, 1.40)):
+    """Re-price every signal across a RANGE of entry-IV premiums.
+
+    The whole point: option P&L is highly sensitive to entry IV, and entry IV is
+    NOT recoverable from price data. So we show the entire range instead of
+    pretending one multiplier is right. Data is loaded once and reused per premium.
+    """
+    print("ENTRY-IV SENSITIVITY SWEEP - the option edge vs an IV we can't actually pin down")
+    print("(live calibration today put the real near-money IV/realized ratio near 0.87,")
+    print(" but it swings hard by regime - so treat the option win rate as a RANGE.)\n")
+    dfs = _load_all()
+    print(f"  {'IV premium':>10} | {'NET win%':>8} | {'NET avg%':>8} | "
+          f"{'gross win%':>10} | {'gross avg%':>10} | {'n':>4}")
+    print("  " + "-" * 66)
+    for p in premiums:
+        net, gross = [], []
+        for t in STOCKS:
+            if t not in dfs:
+                continue
+            for s in _scan_stock(dfs[t], p):
+                net.append(s[4]); gross.append(s[5])
+        net = np.array(net); gross = np.array(gross)
+        if not len(net):
+            continue
+        flag = "  <- live-calibrated" if abs(p - ENTRY_IV_PREMIUM) < 1e-9 else ""
+        print(f"  {p:>10.2f} | {100*(net>0).mean():>7.1f}% | {net.mean():>+7.0f}% | "
+              f"{100*(gross>0).mean():>9.1f}% | {gross.mean():>+9.0f}% | {len(net):>4}{flag}")
+    print("\n  Takeaway: the NET edge moves materially with the entry-IV assumption, and")
+    print("  that assumption is NOT knowable from price history. Only REAL historical")
+    print("  option chains can settle it. Until then, the option win rate is a RANGE,")
+    print("  not a single number - size and expectations accordingly.")
+
+
 if __name__ == "__main__":
-    run()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "sweep":
+        sweep()
+    else:
+        run()

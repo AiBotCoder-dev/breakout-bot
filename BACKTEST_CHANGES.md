@@ -126,8 +126,10 @@ rate/return, and the difference between them. Per-stock and per-example lines sh
 
 ## 4. What is STILL not modeled (do not over-trust this backtest yet)
 
-- **Real historical option prices / IV surface** — entry IV is still a realized-vol
-  proxy, and there's no volatility skew (OTM strikes trade at higher IV).
+- **Real historical option prices / IV surface** — entry IV is a realized-vol proxy
+  (now **calibrated to live data and swept**, see §6), but there is still no true
+  historical IV or volatility skew (OTM strikes trade at higher IV). This remains
+  the single biggest weakness.
 - **Partial fills / liquidity** — assumes you always get filled at one price.
 - **Early exits / stops** — holds a fixed 10 days; the live bot exits dynamically.
 - **Survivorship bias** — universe is 5 mega-cap survivors (NVDA/AAPL/TSLA/AMD/JPM)
@@ -142,10 +144,75 @@ rate/return, and the difference between them. Per-stock and per-example lines sh
 ```powershell
 # deps (yfinance/numpy/pandas were NOT installed locally — install once):
 python -m pip install yfinance numpy pandas
-python full_bot_backtest.py
+
+python option_iv_calibration.py     # live IV / spread calibration (grounds the assumptions)
+python full_bot_backtest.py         # single run at the calibrated ENTRY_IV_PREMIUM
+python full_bot_backtest.py sweep   # entry-IV SENSITIVITY sweep (the honest view)
 ```
 
-Tune `HALF_SPREAD_PCT`, `MIN_HALF_SPREAD`, `COMMISSION_PER_SHARE`, and `IV_CRUSH`
-at the top of the file to match your own broker and the liquidity of the names you
-actually trade. Wider spreads (less liquid tickers, retail fills) will widen the
-gap between GROSS and NET.
+Tune `HALF_SPREAD_PCT`, `MIN_HALF_SPREAD`, `COMMISSION_PER_SHARE`, `IV_CRUSH`, and
+`ENTRY_IV_PREMIUM` at the top of the file to match your own broker and the liquidity
+of the names you actually trade. Wider spreads (less liquid tickers, retail fills)
+will widen the gap between GROSS and NET.
+
+---
+
+## 6. Follow-up — entry-IV calibration + sensitivity sweep
+
+The biggest remaining lie above was the **entry IV** (`realized vol × 1.10`). I went
+after it next. True *historical* option chains aren't free, but the **current** chain
+is — so a new helper, `option_iv_calibration.py`, samples today's live near-money
+(~3% OTM, ~21-DTE) call for each name and measures real IV vs trailing realized vol.
+
+### What the live calibration found (2026-06-16)
+
+```
+NVDA  IV 35.6%  RV 43.7%  IV/RV 0.81  spread 0.9%
+AAPL  IV 22.3%  RV 24.8%  IV/RV 0.90  spread 3.2%
+TSLA  IV 43.0%  RV 47.2%  IV/RV 0.91  spread 1.4%
+AMD   IV 72.3%  RV 83.1%  IV/RV 0.87  spread 5.6%
+JPM   IV 20.7%  RV 24.6%  IV/RV 0.84  spread 7.8%
+Median IV/RV = 0.87   |   Median round-trip spread = 3.2%
+```
+
+Two surprises, reported straight:
+
+1. **Implied vol is currently BELOW realized (ratio 0.87), not above it.** The
+   original `1.10` actually *overstated* entry cost in today's calm regime. So my
+   earlier claim that "entry IV is understated, so returns are overstated" was wrong
+   for this snapshot. The honest conclusion is stronger: **the IV/realized ratio is
+   not a constant you can guess — it swings across regimes from below 1 to well
+   above 1.**
+2. **Real spreads on liquid names are tighter than my 5% assumption** (median 3.2%,
+   NVDA just 0.9%), though wide names (JPM 7.8%) exceed it. The 5% round-trip default
+   is a reasonable-to-conservative middle, so it was left unchanged.
+
+### What changed in `full_bot_backtest.py`
+
+- Replaced the magic `1.1` with a named `ENTRY_IV_PREMIUM` (default **0.87**,
+  calibrated to the live data above).
+- Refactored the per-name scan into `_scan_stock(df, entry_iv_premium)` + `_load_all()`
+  so the data downloads once and can be re-priced at many IV assumptions.
+- Added a **sensitivity sweep**: `python full_bot_backtest.py sweep`.
+
+### The result that matters — the sweep
+
+```
+  IV premium | NET win% | NET avg% | gross win% | gross avg% |    n
+        0.80 |    41.2% |     +88% |      42.2% |      +100% |  199
+        0.90 |    40.7% |     +67% |      41.2% |       +78% |  199
+        1.00 |    39.7% |     +50% |      40.7% |       +59% |  199
+        1.10 |    39.2% |     +37% |      39.7% |       +45% |  199   <- old assumption
+        1.20 |    38.2% |     +26% |      39.7% |       +34% |  199
+        1.40 |    33.7% |     +11% |      36.7% |       +17% |  199
+```
+
+**The average return swings from +88% to +11% — an ~8x range — purely on an entry-IV
+assumption that cannot be recovered from price data.** Win rate is steadier (34–41%),
+because IV mostly scales the *size* of winners, not how often they happen.
+
+**Bottom line:** the call strategy's apparent profitability is dominated by how
+cheaply you assume you can buy volatility. In a high-IV regime — which is exactly when
+momentum breakouts fire and everyone is bidding up calls — the edge compresses toward
+zero. Until the backtest uses **real historical option prices**, read the option
+win-rate / return as the RANGE above, not a single number.

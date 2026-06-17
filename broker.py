@@ -391,6 +391,46 @@ class AlpacaPaperBroker:
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}
 
+    def submit_option_spread(self, long_symbol: str, short_symbol: str,
+                             qty: int = 1, net_debit_limit: float | None = None) -> dict:
+        """Buy-to-open a DEBIT (bull-call) spread as ONE multi-leg (mleg) order.
+
+        long_symbol  — the near-money call we BUY  (buy_to_open)
+        short_symbol — the further-OTM call we SELL (sell_to_open), SAME expiry
+        net_debit_limit — max NET debit per spread ($/share). Submitted as an mleg
+        LIMIT so we never pay more than the modeled debit + buffer; market only if
+        no limit is given. Alpaca fills/cancels both legs atomically, so there is no
+        legging risk. Requires options level 3 (spreads) — guarded by options_status.
+
+        Returns {ok, order_id, ...} shaped like submit_option_buy().
+        """
+        if not self.available():
+            return {"ok": False, "error": "broker not configured"}
+        st = self.options_status()
+        if not st["can_buy_longs"]:
+            return {"ok": False, "error": st["msg"]}
+        legs = [
+            {"symbol": long_symbol,  "ratio_qty": "1", "side": "buy",
+             "position_intent": "buy_to_open"},
+            {"symbol": short_symbol, "ratio_qty": "1", "side": "sell",
+             "position_intent": "sell_to_open"},
+        ]
+        body = {"order_class": "mleg", "qty": str(int(qty)),
+                "time_in_force": "day", "legs": legs}
+        if net_debit_limit and net_debit_limit > 0:
+            body["type"] = "limit"
+            body["limit_price"] = str(round(float(net_debit_limit), 2))
+        else:
+            body["type"] = "market"
+        try:
+            o = self._post("/v2/orders", body)
+            return {"ok": True, "order_id": o.get("id"), "qty": int(qty),
+                    "symbol": f"{long_symbol}/{short_symbol}",
+                    "status": o.get("status"), "order_type": body["type"],
+                    "limit_price": body.get("limit_price"), "order_class": "mleg"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
+
     def close_option(self, occ_symbol: str) -> dict:
         try:
             self._delete(f"/v2/positions/{occ_symbol}")
@@ -562,12 +602,73 @@ class AlpacaPaperBroker:
             except Exception:
                 pass
 
+        # ── SPREAD AWARENESS — manage each debit spread as ONE unit ─────────────
+        # broker_spread_legs (written by monitor.py when OPTION_STRUCTURE=spread)
+        # maps a long call -> its short hedge. When the table is empty (the
+        # default 'naked' state) every spread branch below is skipped and the
+        # naked-call exit path is byte-for-byte unchanged.
+        _long_pair = {}    # long_symbol -> (short_symbol, entry_debit_per_share)
+        _short_set = set()  # short legs: never stopped on their own
+        if conn is not None:
+            try:
+                conn.execute("CREATE TABLE IF NOT EXISTS broker_spread_legs "
+                             "(long_symbol TEXT PRIMARY KEY, short_symbol TEXT, "
+                             "underlying TEXT, entry_debit REAL, opened_at TEXT)")
+                for r in conn.execute("SELECT long_symbol, short_symbol, "
+                                      "entry_debit FROM broker_spread_legs").fetchall():
+                    try:
+                        _ls, _ss, _ed = (r["long_symbol"], r["short_symbol"],
+                                         r["entry_debit"])
+                    except Exception:
+                        _ls, _ss, _ed = r[0], r[1], r[2]
+                    if _ls and _ss:
+                        _long_pair[_ls] = (_ss, float(_ed or 0) or 0.0)
+                        _short_set.add(_ss)
+            except Exception:
+                _long_pair, _short_set = {}, set()
+
+        positions = self.get_option_positions()
+        _by_sym = {p["symbol"]: p for p in positions}
+
+        # ORPHAN-SHORT CLEANUP: if a spread's long leg is already gone but the
+        # short hedge is still open, buy it back NOW so we are never left holding
+        # a naked SHORT call (unbounded risk).
+        for _ls, (_ss, _ed) in list(_long_pair.items()):
+            if _ls not in _by_sym and _ss in _by_sym:
+                try:
+                    self.close_option(_ss)
+                except Exception:
+                    pass
+                _peak_clear(_ss)
+                if conn is not None:
+                    try:
+                        conn.execute("DELETE FROM broker_spread_legs "
+                                     "WHERE long_symbol=?", (_ls,))
+                    except Exception:
+                        pass
+
         closed = []
-        for p in self.get_option_positions():
+        for p in positions:
             sym = p["symbol"]
-            pct = p["unrealized_pct"]
-            pnl = p["unrealized_pnl"]
-            cur_prem = p.get("current", 0) or 0
+            if sym in _short_set:
+                continue  # short leg is closed together with its long leg
+            _spread_short = None
+            if sym in _long_pair:
+                # SPREAD: value, %, and P&L are computed on the NET (long premium
+                # minus short premium); the pair is stopped and closed as one unit.
+                _ss, _ed = _long_pair[sym]
+                _sp = _by_sym.get(_ss)
+                _long_cur = p.get("current", 0) or 0
+                _short_cur = (_sp.get("current", 0) or 0) if _sp else 0.0
+                cur_prem = _long_cur - _short_cur
+                _qty = abs(p.get("qty", 0) or 0) or 1
+                pct = ((cur_prem / _ed - 1) * 100) if _ed > 0 else 0.0
+                pnl = (cur_prem - _ed) * 100 * _qty
+                _spread_short = _ss
+            else:
+                pct = p["unrealized_pct"]
+                pnl = p["unrealized_pnl"]
+                cur_prem = p.get("current", 0) or 0
             # GUARD: if Alpaca reports no/zero price (illiquid contract, thin
             # quotes, before-open), do NOT make an exit decision — a 0 price would
             # look like -100% and falsely trigger a stop. Skip until a real quote.
@@ -624,7 +725,22 @@ class AlpacaPaperBroker:
                 res = self.close_option(sym)
                 if res.get("ok"):
                     _peak_clear(sym)
-                    closed.append({"symbol": sym,
+                    if _spread_short is not None:
+                        # close the short hedge in the same cycle and clear the
+                        # pairing so the spread leaves the book as one unit.
+                        try:
+                            self.close_option(_spread_short)
+                        except Exception:
+                            pass
+                        _peak_clear(_spread_short)
+                        if conn is not None:
+                            try:
+                                conn.execute("DELETE FROM broker_spread_legs "
+                                             "WHERE long_symbol=?", (sym,))
+                            except Exception:
+                                pass
+                    closed.append({"symbol": (f"{sym}/{_spread_short}"
+                                              if _spread_short else sym),
                                    "underlying": p.get("underlying", ""),
                                    "reason": reason, "pct": pct, "pnl": pnl,
                                    "peak_pct": round(peak_pct, 0), "dte": dte})

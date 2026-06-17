@@ -67,6 +67,14 @@ IV_CRUSH = 0.10                # exit IV = entry IV × (1 − IV_CRUSH): vol mea
 # tool is the sensitivity sweep (`python full_bot_backtest.py sweep`), not one number.
 ENTRY_IV_PREMIUM = 0.87
 
+# Debit (bull-call) SPREAD structure — long a near-money call, short a further-OTM
+# call at the SAME expiry. Caps the home-run tail but (a) raises win rate, (b) cuts
+# the typical loss, and (c) is largely vega-neutral, so it sidesteps the unknowable
+# entry IV that dominates the naked-call P&L (see BACKTEST_CHANGES.md section 6).
+# Strikes are multiples of spot at entry; used by _price_spread() / compare().
+SPREAD_LONG_OTM  = 0.00     # long leg strike  = S0 * (1 + this)  -> ATM (highest delta)
+SPREAD_SHORT_OTM = 0.10     # short leg strike = S0 * (1 + this)  -> +10% OTM (the cap)
+
 
 def _half_spread(mid: float) -> float:
     """Half the bid/ask spread in $/share: the larger of a % of mid or a $ floor."""
@@ -81,6 +89,38 @@ def buy_fill(mid: float) -> float:
 def sell_fill(mid: float) -> float:
     """Price you ACTUALLY collect to close a call: bid − commission (never < 0)."""
     return max(0.0, mid - _half_spread(mid) - COMMISSION_PER_SHARE)
+
+
+# ── option-structure pricers ───────────────────────────────────────────────
+# Each returns (net%, gross%) for the hold. NET crosses the bid/ask spread and
+# pays commission on EVERY leg — a spread pays friction on 4 legs (2 per side),
+# and that extra cost is the honest price of the structure, included here so the
+# comparison isn't rigged in the spread's favour.
+def _price_naked(S0, S1, iv0, iv1):
+    """The CURRENT structure: one near-money (3% OTM) long call."""
+    K = S0 * 1.03
+    mid_e = bs_call(S0, K, 21/365, iv0)
+    mid_x = bs_call(S1, K, 11/365, iv1)
+    gross = (mid_x/mid_e - 1) * 100 if mid_e > 0.01 else 0.0
+    cost = buy_fill(mid_e); proceeds = sell_fill(mid_x)
+    net = (proceeds/cost - 1) * 100 if cost > 0.01 else 0.0
+    return net, gross
+
+
+def _price_spread(S0, S1, iv0, iv1):
+    """Debit spread: long S0*(1+LONG_OTM), short S0*(1+SHORT_OTM), same expiry."""
+    Kl = S0 * (1 + SPREAD_LONG_OTM); Ks = S0 * (1 + SPREAD_SHORT_OTM)
+    le = bs_call(S0, Kl, 21/365, iv0); se = bs_call(S0, Ks, 21/365, iv0)   # entry mids
+    lx = bs_call(S1, Kl, 11/365, iv1); sx = bs_call(S1, Ks, 11/365, iv1)   # exit  mids
+    # GROSS: mid-to-mid on the net debit
+    debit_g = le - se; value_g = lx - sx
+    gross = (value_g/debit_g - 1) * 100 if debit_g > 0.01 else 0.0
+    # NET: open = pay ask on long, collect bid on short; close = sell long at bid,
+    # buy the short back at ask. Friction therefore hits all four legs.
+    debit_n = buy_fill(le) - sell_fill(se)
+    value_n = max(0.0, sell_fill(lx) - buy_fill(sx))
+    net = (value_n/debit_n - 1) * 100 if debit_n > 0.01 else 0.0
+    return net, gross
 
 
 def _rsi(c, p=14):
@@ -108,7 +148,7 @@ def _load(t, years=5):
     return df.dropna()
 
 
-def _scan_stock(df, entry_iv_premium=ENTRY_IV_PREMIUM):
+def _scan_stock(df, entry_iv_premium=ENTRY_IV_PREMIUM, structure="naked"):
     """Walk one name's history; return its non-overlapping call signals.
 
     Each signal tuple: (date, setup, spot, dir_ret%, opt_net%, opt_gross%).
@@ -135,13 +175,12 @@ def _scan_stock(df, entry_iv_premium=ENTRY_IV_PREMIUM):
             dir_ret = (S1/S0 - 1) * 100
             iv0 = max(0.15, min(1.5, rv[i]*entry_iv_premium))  # entry IV (calibrated premium)
             iv1 = max(0.05, iv0 * (1.0 - IV_CRUSH))            # exit IV after the crush
-            K = S0 * 1.03            # near-money call (the bot's default band)
-            mid_e = bs_call(S0, K, 21/365, iv0)                # theoretical mid at entry
-            mid_x = bs_call(S1, K, 11/365, iv1)                # theoretical mid at exit
-            # GROSS = the old frictionless lie (mid-to-mid); NET = ask in / bid out + comm
-            opt_gross = (mid_x/mid_e - 1) * 100 if mid_e > 0.01 else 0.0
-            cost = buy_fill(mid_e); proceeds = sell_fill(mid_x)
-            opt_net = (proceeds/cost - 1) * 100 if cost > 0.01 else 0.0
+            # GROSS = frictionless mid-to-mid; NET = ask in / bid out + commission on
+            # every leg. `structure` swaps the naked call for the ATM/+10% debit spread.
+            if structure == "spread":
+                opt_net, opt_gross = _price_spread(S0, S1, iv0, iv1)
+            else:
+                opt_net, opt_gross = _price_naked(S0, S1, iv0, iv1)
             sigs.append((idx[i].date(), setup, round(S0, 2),
                          round(dir_ret, 1), round(opt_net, 0), round(opt_gross, 0)))
             i += HOLD               # non-overlapping
@@ -253,9 +292,64 @@ def sweep(premiums=(0.80, 0.90, 1.00, 1.10, 1.20, 1.40)):
     print("  not a single number - size and expectations accordingly.")
 
 
+def compare(entry_iv_premium=ENTRY_IV_PREMIUM):
+    """Head-to-head: the CURRENT naked near-money call vs the ATM/+10% DEBIT SPREAD,
+    NET of friction + IV crush, on the SAME signals. This is the gate that has to
+    pass before any live structure change is worth building.
+    """
+    print("STRUCTURE COMPARISON - naked near-money call vs ATM/+10% debit spread")
+    print(f"(NET of bid/ask + commission on EVERY leg, IV crush {IV_CRUSH*100:.0f}%, "
+          f"entry IV = realized x {entry_iv_premium:.2f})\n")
+    dfs = _load_all()
+    res = {}
+    for struct in ("naked", "spread"):
+        net, gross, dirr, setups = [], [], [], []
+        for t in STOCKS:
+            if t not in dfs:
+                continue
+            for s in _scan_stock(dfs[t], entry_iv_premium, struct):
+                dirr.append(s[3]); net.append(s[4]); gross.append(s[5]); setups.append(s[1])
+        res[struct] = (np.array(net), np.array(gross), np.array(dirr), setups)
+
+    print(f"  {'structure':<22} | {'n':>5} | {'NET win%':>8} | {'NET mean%':>9} | "
+          f"{'NET median%':>11} | {'gross win%':>10}")
+    print("  " + "-" * 80)
+    for label, key in (("naked call (CURRENT)", "naked"), ("debit spread ATM/+10%", "spread")):
+        o, g, _, _ = res[key]
+        if not len(o):
+            continue
+        print(f"  {label:<22} | {len(o):>5} | {100*(o>0).mean():>7.1f}% | "
+              f"{o.mean():>+8.0f}% | {np.median(o):>+10.0f}% | {100*(g>0).mean():>9.1f}%")
+
+    no, _, _, nsets = res["naked"]; so = res["spread"][0]
+    if len(no) and len(so):
+        print()
+        print(f"  >>> WIN-RATE:  spread {100*(so>0).mean():.1f}%  vs  naked "
+              f"{100*(no>0).mean():.1f}%   ({100*(so>0).mean()-100*(no>0).mean():+.1f} pts) <<<")
+        print(f"  >>> MEDIAN  :  spread {np.median(so):+.0f}%  vs  naked "
+              f"{np.median(no):+.0f}%   ({np.median(so)-np.median(no):+.0f} pts) <<<")
+        print(f"  >>> MEAN    :  spread {so.mean():+.0f}%  vs  naked {no.mean():+.0f}%  "
+              f"(spreads CAP the fat-tail mean - expected) <<<")
+        print()
+        for st in ("MOMENTUM", "BOTTOM_FISHER"):
+            ni = [k for k in range(len(nsets)) if nsets[k] == st]
+            if not ni:
+                continue
+            nn = no[ni]; ss = so[ni]
+            print(f"    {st:<14} n={len(ni):<4} win  naked {100*(nn>0).mean():.0f}% "
+                  f"-> spread {100*(ss>0).mean():.0f}%   median  naked {np.median(nn):+.0f}% "
+                  f"-> spread {np.median(ss):+.0f}%")
+    print("\n  Verdict rule: prefer the spread if it raises NET win rate AND median without")
+    print("  pushing expectancy negative. If ONLY the mean falls, that's the tail being")
+    print("  capped - acceptable for a steadier curve on a small account.")
+
+
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "sweep":
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg == "sweep":
         sweep()
+    elif arg == "compare":
+        compare()
     else:
         run()

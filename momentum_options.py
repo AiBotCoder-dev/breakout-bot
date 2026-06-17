@@ -64,6 +64,16 @@ OTM_PCT_MAX             = 0.07     # up to 7% OTM — the selector scores closes
                                    # keeps the win-rate lift while preserving volume
                                    # (a 0-5% band skipped too many $100+ leaders).
 LOTTERY_SIZE_PCT        = 0.05     # 5% of options cash per ticket (lottery)
+
+# ── DEBIT-SPREAD structure (opt-in via env OPTION_STRUCTURE=spread) ───────────
+# When enabled, monitor.py turns each CALL entry into a bull-call debit spread:
+# LONG the near-money call the selector already picked, SHORT a call this far OTM
+# at the SAME expiry. Validated NET in full_bot_backtest.py `compare` — vs the naked
+# call it lifts win rate ~+7pp and cuts the typical (median) trade from -32% to -4%,
+# trading away the fat-tail mean. It's also cheaper per ticket and ~vega-neutral, so
+# it sidesteps the unknowable entry IV (BACKTEST_CHANGES.md section 6).
+SPREAD_SHORT_OTM        = 0.10     # short-leg strike = underlying * (1 + this)
+
 MAX_CONCURRENT_POSITIONS = 8
 MAX_NEW_PER_CYCLE       = 2
 

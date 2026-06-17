@@ -2348,8 +2348,71 @@ def main():
                               f"> cap ${ticket_cap:.0f} (live ask), skip")
                         return False
                     qty = max(1, int(_bud // one_ct_cost)) if one_ct_cost > 0 else 1
-                    res = _ob.submit_option_buy(contract["symbol"], qty,
-                                                limit_price=_limit_px)
+
+                    # ── OPTION STRUCTURE — optional DEBIT SPREAD (opt-in, CALLS only) ─
+                    # OPTION_STRUCTURE=spread turns each CALL entry into a bull-call
+                    # debit spread: LONG the near-money call already picked, SHORT
+                    # ~10% further OTM at the SAME expiry. Validated NET in
+                    # full_bot_backtest.py `compare` (+7pp win rate; typical trade
+                    # -32% -> -4%). DEFAULT is 'naked' (unchanged). ANY failure here
+                    # falls through to the naked buy below, so it can only improve or
+                    # no-op — it never blocks a trade.
+                    _is_spread = False
+                    _short_sym = ""
+                    res = {"ok": False}
+                    if (os.environ.get("OPTION_STRUCTURE", "naked").strip().lower()
+                            == "spread" and _otype == "call"):
+                        try:
+                            from momentum_options import SPREAD_SHORT_OTM as _SSO
+                            _under = contract["strike"] / (1 + (s.get("otm_pct") or 0.0))
+                            _short = _ob.find_option_contract(
+                                s["ticker"], s["expiry"], "call", _under * (1 + _SSO))
+                            if (_short and _short.get("tradable")
+                                    and _short["symbol"] != contract["symbol"]):
+                                _sq = _ob.get_option_quote(_short["symbol"])
+                                _short_bid = (_sq["bid"] if _sq
+                                              else max(0.01, prem * 0.30))
+                                _net_debit = max(0.05, prem - _short_bid)
+                                _debit_cost = _net_debit * 100
+                                qty = (max(1, int(_bud // _debit_cost))
+                                       if _debit_cost > 0 else 1)
+                                res = _ob.submit_option_spread(
+                                    contract["symbol"], _short["symbol"], qty,
+                                    net_debit_limit=round(_net_debit * 1.05, 2))
+                                if res.get("ok"):
+                                    _is_spread = True
+                                    _short_sym = _short["symbol"]
+                                    prem = _net_debit   # net debit is the cost basis
+                                    # persist the leg pairing so the exit manager
+                                    # treats the spread as ONE unit (close both legs,
+                                    # stop on net value, never strip the short hedge).
+                                    try:
+                                        conn.execute(
+                                            "CREATE TABLE IF NOT EXISTS broker_spread_legs "
+                                            "(long_symbol TEXT PRIMARY KEY, short_symbol "
+                                            "TEXT, underlying TEXT, entry_debit REAL, "
+                                            "opened_at TEXT)")
+                                        conn.execute(
+                                            "INSERT OR REPLACE INTO broker_spread_legs "
+                                            "(long_symbol, short_symbol, underlying, "
+                                            "entry_debit, opened_at) VALUES (?,?,?,?,?)",
+                                            (contract["symbol"], _short["symbol"],
+                                             s["ticker"], _net_debit,
+                                             datetime.now(timezone.utc).isoformat()))
+                                    except Exception:
+                                        pass
+                                else:
+                                    print(f"    spread order failed "
+                                          f"({res.get('error')}); naked fallback")
+                            else:
+                                print(f"    {s['ticker']:6s} — no tradable short leg "
+                                      f"for spread; naked fallback")
+                        except Exception as _spe:
+                            print(f"    spread setup error ({_spe}); naked fallback")
+
+                    if not _is_spread:
+                        res = _ob.submit_option_buy(contract["symbol"], qty,
+                                                    limit_price=_limit_px)
                     if not res.get("ok"):
                         print(f"    ✗ {s['ticker']:6s} — Alpaca opt order failed: "
                               f"{res.get('error')}")
@@ -2365,9 +2428,12 @@ def main():
                     except Exception:
                         pass
                     _is_ex = setup_tag.endswith("explore")
-                    print(f"    {'🧪' if _is_ex else '✅'} ALPACA OPT BUY "
-                          f"{contract['symbol']} x{qty} (~${prem:.2f}/ct, "
-                          f"${prem*100*qty:.0f}){' [data-floor]' if _is_ex else ''}")
+                    print(f"    {'🧪' if _is_ex else '✅'} ALPACA "
+                          f"{'OPT SPREAD' if _is_spread else 'OPT BUY'} "
+                          f"{contract['symbol']}"
+                          f"{(' /short ' + _short_sym) if _is_spread else ''} "
+                          f"x{qty} (~${prem:.2f}/ct, ${prem*100*qty:.0f})"
+                          f"{' [data-floor]' if _is_ex else ''}")
                     # ── Journal: full attribution for later optimization ──
                     try:
                         from trade_journal import log_entry as _jle
@@ -2391,11 +2457,14 @@ def main():
                     _why = f" · why: {_src}" if _src else ""
                     _dir_emoji = "📉" if _otype == "put" else "📈"
                     send_telegram(
-                        f"{_dir_emoji} <b>ALPACA PAPER OPTION BUY — "
+                        f"{_dir_emoji} <b>ALPACA PAPER "
+                        f"{'CALL DEBIT SPREAD' if _is_spread else 'OPTION BUY'} — "
                         f"{'PUT' if _otype=='put' else 'CALL'}</b>"
                         f"{' 🧪 (data-floor)' if _is_ex else ''}\n"
-                        f"{s['ticker']} ${contract['strike']:.0f}{_oc} exp {s['expiry']}\n"
-                        f"Qty: {qty} contract(s) @ ~${prem:.2f} "
+                        f"{s['ticker']} ${contract['strike']:.0f}{_oc} exp {s['expiry']}"
+                        f"{(' / short ' + _short_sym) if _is_spread else ''}\n"
+                        f"Qty: {qty} {'spread(s)' if _is_spread else 'contract(s)'} "
+                        f"@ ~${prem:.2f} {'net debit' if _is_spread else ''} "
                         f"(~${prem*100*qty:.0f})\n"
                         f"Quality {s.get('quality_score','?')}/100{_why}\n"
                         f"{'DATA-FLOOR top-up (not the core edge)' if _is_ex else 'Full-market scan · real broker fills'}\n"

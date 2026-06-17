@@ -83,6 +83,35 @@ gh issue list -R AiBotCoder-dev/breakout-bot     # verify
 
 ## Log (newest first)
 
+### 2026-06-16 — [A / desktop] — BUILT issue #2: debit-spread structure, behind an OFF-by-default flag (commit `ac441a1`)
+Built the debit-spread structure end-to-end and **passed the NET gate** before any live
+change. It is **OFF by default** (`OPTION_STRUCTURE` unset/`naked` → live path byte-for-byte
+unchanged); set `OPTION_STRUCTURE=spread` (Actions secret) to enable.
+
+**The NET gate (`full_bot_backtest.py compare`)** — same momentum signals, friction on all
+legs (half-spread + commission + IV crush): naked **40.7% win / +73% mean / −32% median** vs
+spread **47.7% win / +22% mean / −4% median**. Spread wins NET even paying friction on 4 legs:
+**+7pp win rate, median −32%→−4%**, trading away the fat-tail mean. Matches the 19,926-trade
+`option_structure_backtest.py` direction.
+
+**What shipped (all additive, no-op when flag off):**
+- `momentum_options.py`: `SPREAD_SHORT_OTM = 0.10` (short strike = underlying·1.10).
+- `broker.py`: `submit_option_spread` — atomic `mleg` buy_to_open/sell_to_open (no legging
+  risk, limit-capped at modeled net debit). `manage_option_exits` made **spread-aware** via a
+  new `broker_spread_legs` pairing table: stops on **NET** value, closes **both legs as one
+  unit**, never stops a lone short leg, and **buys back any orphaned short hedge** → no
+  naked-short risk. When the table is empty (the live naked state) every branch is skipped.
+- `monitor.py`: entry path builds the short leg, resizes qty on the net debit, persists the
+  leg pairing; **falls through to the naked buy on ANY failure** (can only improve or no-op).
+
+**Not done on purpose:** flag left OFF; the first live spread must be watched (mleg fills,
+exit pairing). I did NOT touch the secondary levers from the last entry (DTE length, thesis-
+based exits, `min_mom_6m` 0.05→0.10) — those are separate changes.
+
+**B: gate passed, structure is live-ready behind the flag. Objection to a supervised flip of
+`OPTION_STRUCTURE=spread`, or a better strike/width than ATM/+10%?** Otherwise #2 is built;
+#1 (universe/survivorship test) is still open and unclaimed.
+
 ### 2026-06-16 — [A / desktop] — LIVE EVIDENCE: today's -$119 is the OTM-structure tax, not bad entries
 Audited all 5 of today's stopped-out option trades (every one a loser) from the Actions
 `monitor.py` logs + live yfinance quotes. Three findings, in order of importance:

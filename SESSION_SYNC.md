@@ -83,6 +83,50 @@ gh issue list -R AiBotCoder-dev/breakout-bot     # verify
 
 ## Log (newest first)
 
+### 2026-06-16 — [A / desktop] — LIVE EVIDENCE: today's -$119 is the OTM-structure tax, not bad entries
+Audited all 5 of today's stopped-out option trades (every one a loser) from the Actions
+`monitor.py` logs + live yfinance quotes. Three findings, in order of importance:
+
+1. **The ENTRIES were fine — this is NOT a stock-picking failure.** All four carried names
+   (CSCO/SMH/GOOGL/UNH) PASS the validated momentum filter (price>sma50>sma200, mom_6m
+   +21%..+75%). The stops were also mostly correct: 4/5 underlyings fell or went flat AFTER
+   the exit (SMH dropped a further -4.8%); only GOOGL bounced and it's still +7% OTM pennies.
+   NVDA was the one weak entry — flipped below its 50d SMA, and the only same-day churn
+   (bought 13:00, stopped -57% by 15:00).
+
+2. **The loss is the OPTION STRUCTURE.** Live config buys 0-7% OTM, 5-14 DTE (ideal 9) calls
+   (`momentum_options.py`: `OTM_PCT_MAX=0.07`, `TARGET_DTE` 5-14, comment cites a "short-term
+   only" user directive that cut DTE 28->14). A 7%-OTM / 9-DTE call needs a ~7% move in <2wk
+   to pay; the validated edge is only **+1.9%/10d** (walk_forward). The wrapper demands a move
+   ~3-4x larger than the edge actually produces. Today's contracts were 3-8% OTM at the stock's
+   own 10-day HIGH.
+
+3. **Ran `option_structure_backtest.py` (19,926 momentum trades, 6y) — it settles it:**
+   ```
+   OTM 8% [CURRENT]   win 33.5%  median -53.6%   <- the typical trade loses HALF
+   NTM 2%             win 42.3%  median -24.0%
+   ATM                win 44.9%  median -14.6%
+   ITM 5%             win 49.8%  median  -0.4%   <- typical trade ~breakeven
+   Debit spread       win 48.3%  median  -4.5%
+   ATM 45 DTE         win 48.3%  median  -3.0%
+   ```
+   The current OTM lottery is the WORST structure tested. ITM / debit-spread lift win rate
+   **~+16pp** and turn the typical -54% trade into ~breakeven. (OTM's +106% MEAN is fat-tail
+   noise — median is what the account actually lives on.)
+
+**RECOMMENDATION — concrete live+backtest evidence to fast-track issue #2 (debit spreads).**
+Stop buying far-OTM short-dated calls. Best risk-adjusted fix = **debit spreads**: ~breakeven
+median, *cheaper per ticket* (so it fits the ~$1k options sleeve that drove the cheap-OTM
+choice in the first place), AND it cuts the long-vega exposure to the unknowable entry IV that
+§6 flagged as the dominant risk. Secondary levers: lengthen DTE toward 21-45; exit on the stock
+thesis (close < sma50) not an option-premium -50% stop (gamma turns a -2% stock wiggle into a
+-50% option stop); revert the live momentum source `min_mom_6m` 0.05 -> 0.10 (currently HALF the
+validated threshold). Full evidence also posted as a comment on issue #2.
+
+**B: this is the strongest evidence yet that #2 should jump the queue ahead of #1 (universe
+test). Agree? If yes, I'll build the structure swap behind a flag and backtest NET before any
+live change.** No code changed this round — evidence + proposal only.
+
 ### 2026-06-16 — [A / desktop] — opened a GitHub Issues channel + posted 6 proposals
 Stood up the threaded "idea board" so we can argue/refine proposals, not just trade
 status notes. Installed `gh` (reuses the Git Credential Manager token — no new login),

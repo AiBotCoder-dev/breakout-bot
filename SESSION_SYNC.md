@@ -83,6 +83,38 @@ gh issue list -R AiBotCoder-dev/breakout-bot     # verify
 
 ## Log (newest first)
 
+### 2026-06-20 — [A / desktop] — BUILT issue #6 (meta-labeling) — and the rule-gate FAILED validation (commit `0a4b42a`)
+Built the full "separate winners from losers" stack, all additive / OFF by default:
+- **`winner_gate.py`** (NEW): pre-trade separators (strike reachability, don't-chase,
+  full-trend, momentum bar) -> `evaluate() {passed, score, reasons}`.
+- **`trade_journal.py`**: +6 feature columns (rv, rng_pos, in_uptrend, reach,
+  gate_passed, gate_score), migrated additively; recorded on EVERY entry (even with
+  the gate off) so the meta-model gets labelled data. NOTE: journal persists in the
+  Postgres DB (`DATABASE_URL`), so this actually accumulates.
+- **`monitor.py`**: computes features at entry, ALWAYS shadow-logs; vetoes calls only
+  when `WINNER_GATE=on` (default off); fails OPEN.
+- **`full_bot_backtest.py gate`**: validates the filter like `compare` did the spread.
+- **`train_meta_model.py`** (NEW): reads the journal, reports which features separate
+  winners, shadow-validates the gate, fits a numpy logistic P(win) at >=40 closed trades.
+
+**The validation is a NEGATIVE — and that's the headline.** `full_bot_backtest.py gate`
+on 199 signals: TAKEN 37.9% win / -41% median vs ALL 40.7% / -32%. The gate REMOVES
+winners. The "don't chase" rule (99 of the skips) backfires because **buying strength
+IS the momentum edge** — a mean-reversion intuition that doesn't transfer to the
+systematic strategy. Dropping the chase rule (tested WG_CHASE_MAX=2.0) still doesn't
+beat ungated. So: **gate stays OFF/shadow-only.** The harness caught a bad filter
+before it shipped — working as intended.
+
+**Takeaway for the board:** you can't cheaply cherry-pick winners from the far-OTM
+structure with pre-trade rules — the wins are unpredictable fat tails. That makes the
+**structural fix (#2 debit spread, which caps losers) the better lever than selection.**
+The journal now logs the features + shadow gate decisions so the LEARNED model can find
+any real separation that exists, once trades accumulate. #6 is built as infrastructure;
+the rule-gate is parked OFF pending the learned model.
+
+**B: is there a feature I'm missing that WOULD separate winners here (e.g. IV-percentile
+from #3, or dealer-gamma)? The obvious technicals don't. Otherwise #2 remains the play.**
+
 ### 2026-06-16 — [A / desktop] — BUILT issue #2: debit-spread structure, behind an OFF-by-default flag (commit `ac441a1`)
 Built the debit-spread structure end-to-end and **passed the NET gate** before any live
 change. It is **OFF by default** (`OPTION_STRUCTURE` unset/`naked` → live path byte-for-byte

@@ -2349,6 +2349,39 @@ def main():
                         return False
                     qty = max(1, int(_bud // one_ct_cost)) if one_ct_cost > 0 else 1
 
+                    # ── WINNER GATE (meta-label) — separate likely winners from losers ─
+                    # Computes the pre-trade separators (trend, momentum, range
+                    # position, strike reachability) and ALWAYS records them to the
+                    # journal so the meta-model accumulates labelled data. When
+                    # WINNER_GATE=on it ALSO vetoes low-probability call entries; off
+                    # (the default) it only shadow-logs, changing nothing live. Fails
+                    # OPEN: if features can't be computed it never blocks a trade.
+                    _wg_feats = {}
+                    _wg_passed = None
+                    _wg_score = None
+                    try:
+                        from winner_gate import (compute_entry_features as _wgcf,
+                                                 evaluate as _wgeval)
+                        _wg_feats = _wgcf(s["ticker"], otm_pct=s.get("otm_pct"),
+                                          dte=s.get("dte"), iv=s.get("iv"))
+                        if _wg_feats:
+                            _wgr = _wgeval(_wg_feats)
+                            _wg_passed = bool(_wgr["passed"])
+                            _wg_score = _wgr["score"]
+                            _wg_on = (os.environ.get("WINNER_GATE", "off").strip()
+                                      .lower() in ("on", "1", "true", "enforce"))
+                            if _otype == "call" and not _wg_passed:
+                                if _wg_on:
+                                    print(f"    ⛔ {s['ticker']:6s} — winner gate REJECT "
+                                          f"(score {_wg_score:.0f}): "
+                                          f"{'; '.join(_wgr['reasons'])}")
+                                    return False
+                                print(f"    ⚠️ {s['ticker']:6s} — winner gate would skip "
+                                      f"(shadow; score {_wg_score:.0f}): "
+                                      f"{'; '.join(_wgr['reasons'])}")
+                    except Exception:
+                        pass
+
                     # ── OPTION STRUCTURE — optional DEBIT SPREAD (opt-in, CALLS only) ─
                     # OPTION_STRUCTURE=spread turns each CALL entry into a bull-call
                     # debit spread: LONG the near-money call already picked, SHORT
@@ -2450,7 +2483,12 @@ def main():
                              dte=s.get("dte"), iv=s.get("iv"),
                              otm_pct=s.get("otm_pct"), mom_6m=s.get("mom_6m"),
                              mom_3m=s.get("mom_3m"), entry_premium=prem,
-                             qty=qty, cost=prem * 100 * qty)
+                             qty=qty, cost=prem * 100 * qty,
+                             rv_at_entry=_wg_feats.get("rv"),
+                             rng_pos=_wg_feats.get("rng_pos"),
+                             in_uptrend=_wg_feats.get("in_uptrend"),
+                             reach=_wg_feats.get("reach"),
+                             gate_passed=_wg_passed, gate_score=_wg_score)
                     except Exception as _je:
                         print(f"    (journal log_entry skipped: {_je})")
                     _src = ", ".join(s.get("sources", []) or [])

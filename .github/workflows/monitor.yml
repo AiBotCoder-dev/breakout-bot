@@ -89,4 +89,12 @@ jobs:
           # Reject option contracts with a bid-ask spread wider than this %
           # (illiquid = bad fills). The 6/12 slippage fix.
           MAX_OPT_SPREAD_PCT:      ${{ secrets.MAX_OPT_SPREAD_PCT || '25' }}
+          # Option structure: 'naked' (default, unchanged) or 'spread' to route each
+          # CALL entry into a validated ATM/+10% bull-call debit spread.
+          OPTION_STRUCTURE:        ${{ secrets.OPTION_STRUCTURE || 'naked' }}
+          # Winner gate (meta-label): 'off' (default) shadow-logs the win/loss
+          # separators to the journal only; 'on' also VETOES low-probability call
+          # entries (not in uptrend / weak momentum / chasing highs / unreachable
+          # strike). Validate with `python full_bot_backtest.py gate` before enabling.
+          WINNER_GATE:             ${{ secrets.WINNER_GATE || 'off' }}
         run: python monitor.py

@@ -21,6 +21,30 @@ from __future__ import annotations
 from datetime import datetime, date, timezone
 
 
+# Extra winner-gate / meta-label feature columns, added by _migrate() so existing
+# databases pick them up without a manual schema change. Every entry records these
+# (even when the gate is OFF) so the meta-model has training data to learn from.
+_EXTRA_COLS = [
+    ("rv_at_entry", "REAL"),    # realized vol at entry (for strike reachability)
+    ("rng_pos", "REAL"),        # position in 20-day range 0..1 (chase detector)
+    ("in_uptrend", "INTEGER"),  # price>sma50>sma200 at entry
+    ("reach", "REAL"),          # otm_pct / expected_move (strike reachability)
+    ("gate_passed", "INTEGER"), # would the winner gate have taken this trade?
+    ("gate_score", "REAL"),     # winner gate 0..100 score (also for sizing later)
+]
+
+
+def _migrate(conn):
+    """Additively add the winner-gate feature columns to an existing table.
+    Each ALTER runs in its own try/except so 'column already exists' is harmless
+    (works on both the sqlite and the Postgres-adapter backends)."""
+    for col, typ in _EXTRA_COLS:
+        try:
+            conn.execute(f"ALTER TABLE broker_trade_journal ADD COLUMN {col} {typ}")
+        except Exception:
+            pass
+
+
 def _ensure(conn):
     try:
         conn.execute("""
@@ -46,9 +70,16 @@ def _ensure(conn):
                 pnl_pct          REAL,
                 pnl_dollars      REAL,
                 hold_days        INTEGER,
-                closed_at        TEXT
+                closed_at        TEXT,
+                rv_at_entry      REAL,
+                rng_pos          REAL,
+                in_uptrend       INTEGER,
+                reach            REAL,
+                gate_passed      INTEGER,
+                gate_score       REAL
             )
         """)
+        _migrate(conn)
     except Exception as e:
         print(f"  [journal] table init failed: {e}")
 
@@ -63,16 +94,28 @@ def _band(score) -> str:
 
 def log_entry(conn, *, contract_symbol, underlying, setup="momentum_call",
               quality_score=None, sector="", dte=None, iv=None, otm_pct=None,
-              mom_6m=None, mom_3m=None, entry_premium=None, qty=1, cost=None):
-    """Record a new broker option position with full attribution."""
+              mom_6m=None, mom_3m=None, entry_premium=None, qty=1, cost=None,
+              rv_at_entry=None, rng_pos=None, in_uptrend=None, reach=None,
+              gate_passed=None, gate_score=None):
+    """Record a new broker option position with full attribution.
+
+    The winner-gate features (rv_at_entry, rng_pos, in_uptrend, reach,
+    gate_passed, gate_score) are recorded on EVERY entry — even when the gate is
+    not enforcing — so the meta-model accumulates labelled training data and we
+    can measure, in shadow, how the gate WOULD have performed."""
     _ensure(conn)
+
+    def _i(b):
+        return None if b is None else (1 if b else 0)
+
     try:
         conn.execute(
             "INSERT INTO broker_trade_journal "
             "(contract_symbol, underlying, sector, setup, quality_score, "
             " quality_band, dte_at_entry, iv_at_entry, otm_pct, mom_6m, mom_3m, "
-            " entry_premium, qty, cost, opened_at, status) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'OPEN') "
+            " entry_premium, qty, cost, opened_at, status, "
+            " rv_at_entry, rng_pos, in_uptrend, reach, gate_passed, gate_score) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'OPEN', ?,?,?,?,?,?) "
             "ON CONFLICT (contract_symbol) DO NOTHING",
             (contract_symbol, str(underlying or "").upper(), sector or "",
              setup, quality_score, _band(quality_score),
@@ -83,7 +126,13 @@ def log_entry(conn, *, contract_symbol, underlying, setup="momentum_call",
              float(mom_3m) if mom_3m is not None else None,
              float(entry_premium) if entry_premium is not None else None,
              int(qty), float(cost) if cost is not None else None,
-             datetime.now(timezone.utc).isoformat())
+             datetime.now(timezone.utc).isoformat(),
+             float(rv_at_entry) if rv_at_entry is not None else None,
+             float(rng_pos) if rng_pos is not None else None,
+             _i(in_uptrend),
+             float(reach) if reach is not None else None,
+             _i(gate_passed),
+             float(gate_score) if gate_score is not None else None)
         )
     except Exception as e:
         print(f"  [journal] log_entry failed: {e}")

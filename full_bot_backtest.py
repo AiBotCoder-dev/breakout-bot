@@ -148,12 +148,16 @@ def _load(t, years=5):
     return df.dropna()
 
 
-def _scan_stock(df, entry_iv_premium=ENTRY_IV_PREMIUM, structure="naked"):
+def _scan_stock(df, entry_iv_premium=ENTRY_IV_PREMIUM, structure="naked",
+                with_features=False):
     """Walk one name's history; return its non-overlapping call signals.
 
-    Each signal tuple: (date, setup, spot, dir_ret%, opt_net%, opt_gross%).
+    Each signal tuple: (date, setup, spot, dir_ret%, opt_net%, opt_gross%[, feats]).
     `entry_iv_premium` scales realized vol into the assumed entry IV — the single
     biggest unknown in the whole backtest, which is why it's a parameter you can sweep.
+    When `with_features=True` a 7th element is appended: the winner-gate feature dict
+    at the signal bar (used by gate() to validate the meta-label filter). Existing
+    callers index s[0..5] and are unaffected by the extra element.
     """
     C = df["Close"].values
     s50 = df["sma50"].values; s200 = df["sma200"].values
@@ -181,8 +185,22 @@ def _scan_stock(df, entry_iv_premium=ENTRY_IV_PREMIUM, structure="naked"):
                 opt_net, opt_gross = _price_spread(S0, S1, iv0, iv1)
             else:
                 opt_net, opt_gross = _price_naked(S0, S1, iv0, iv1)
-            sigs.append((idx[i].date(), setup, round(S0, 2),
-                         round(dir_ret, 1), round(opt_net, 0), round(opt_gross, 0)))
+            rec = [idx[i].date(), setup, round(S0, 2),
+                   round(dir_ret, 1), round(opt_net, 0), round(opt_gross, 0)]
+            if with_features:
+                # mirror _price_naked: a 3%-OTM call, ~21 DTE at entry
+                lo20 = float(np.min(C[max(0, i-19):i+1]))
+                hi20 = float(np.max(C[max(0, i-19):i+1]))
+                rng_pos = (C[i]-lo20)/(hi20-lo20) if hi20 > lo20 else 0.5
+                rec.append({
+                    "in_uptrend": bool(C[i] > s50[i] > s200[i]),
+                    "mom_6m": float(mom6[i]),
+                    "rng_pos": float(rng_pos),
+                    "rv": float(rv[i]),
+                    "otm_pct": 0.03,
+                    "dte": 21,
+                })
+            sigs.append(tuple(rec))
             i += HOLD               # non-overlapping
         else:
             i += 1
@@ -344,6 +362,63 @@ def compare(entry_iv_premium=ENTRY_IV_PREMIUM):
     print("  capped - acceptable for a steadier curve on a small account.")
 
 
+def gate(entry_iv_premium=ENTRY_IV_PREMIUM):
+    """Validate the WINNER GATE (winner_gate.evaluate) the same disciplined way
+    `compare` validated the spread: run the SAME signals, split them into what the
+    gate would TAKE vs SKIP, and show win rate / mean / median for each set. To be
+    worth enforcing, the gate must lift win rate and median on the TAKEN set while
+    the SKIPPED set is meaningfully worse (i.e. it really is removing losers).
+    """
+    from winner_gate import evaluate as _wge, REACH_MAX, CHASE_MAX, MOM_MIN
+    print("WINNER-GATE VALIDATION - does the meta-label filter separate winners from losers?")
+    print(f"(naked near-money call, NET of friction + IV crush, entry IV = realized x "
+          f"{entry_iv_premium:.2f})")
+    print(f"(thresholds: reach<={REACH_MAX}, range<={CHASE_MAX:.0%}, mom_6m>={MOM_MIN:.0%}, "
+          f"uptrend required)\n")
+    dfs = _load_all()
+    all_net, taken, skipped, reason_ct = [], [], [], {}
+    for t in STOCKS:
+        if t not in dfs:
+            continue
+        for s in _scan_stock(dfs[t], entry_iv_premium, "naked", with_features=True):
+            net = s[4]; feats = s[6]
+            all_net.append(net)
+            r = _wge(feats)
+            if r["passed"]:
+                taken.append(net)
+            else:
+                skipped.append(net)
+                for rs in r["reasons"]:
+                    k = rs.split("(")[0].strip()
+                    reason_ct[k] = reason_ct.get(k, 0) + 1
+    A = np.array(all_net); TK = np.array(taken); SK = np.array(skipped)
+
+    def line(label, x):
+        if not len(x):
+            print(f"  {label:<26} n=0"); return
+        print(f"  {label:<26} n={len(x):>5}  win {100*(x>0).mean():>5.1f}%  "
+              f"mean {x.mean():>+5.0f}%  median {np.median(x):>+5.0f}%")
+
+    print(f"  {'set':<26} {'n':>6}  win-rate / mean / median")
+    print("  " + "-" * 70)
+    line("ALL signals (no gate)", A)
+    line("GATE TAKES (passed)", TK)
+    line("GATE SKIPS (rejected)", SK)
+    if len(TK) and len(A):
+        print()
+        print(f"  >>> WIN-RATE: gated {100*(TK>0).mean():.1f}%  vs  ungated "
+              f"{100*(A>0).mean():.1f}%   ({100*(TK>0).mean()-100*(A>0).mean():+.1f} pts) <<<")
+        print(f"  >>> MEDIAN  : gated {np.median(TK):+.0f}%  vs  ungated "
+              f"{np.median(A):+.0f}%   ({np.median(TK)-np.median(A):+.0f} pts) <<<")
+        print(f"  >>> KEPT {len(TK)}/{len(A)} signals ({100*len(TK)/len(A):.0f}%); the "
+              f"removed {len(SK)} averaged {SK.mean():+.0f}% (the losers it filters out) <<<")
+        print("\n  why signals were skipped:")
+        for k, v in sorted(reason_ct.items(), key=lambda x: -x[1]):
+            print(f"    {k:<42} {v}")
+    print("\n  Verdict rule: enforce the gate if it lifts NET win rate AND median on the")
+    print("  taken set, and the skipped set is clearly worse. Otherwise keep shadow-only.")
+
+
 if __name__ == "__main__":
     import sys
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -351,5 +426,7 @@ if __name__ == "__main__":
         sweep()
     elif arg == "compare":
         compare()
+    elif arg == "gate":
+        gate()
     else:
         run()

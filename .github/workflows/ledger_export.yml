@@ -1,0 +1,48 @@
+name: Daily Ledger Export
+
+# Pulls the authoritative trade ledger from Alpaca (+ journal source attribution)
+# and commits data/ledger_*.{csv,json} so the full history is always in the repo —
+# no log scraping, no keys to re-share. Runs once after the close, plus on demand.
+
+on:
+  schedule:
+    - cron: '30 21 * * 1-5'        # 21:30 UTC ≈ after the US close, Mon-Fri
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    name: Export ledger
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Export ledger
+        env:
+          ALPACA_PAPER_KEY:    ${{ secrets.ALPACA_PAPER_KEY }}
+          ALPACA_PAPER_SECRET: ${{ secrets.ALPACA_PAPER_SECRET }}
+          ALPACA_API_KEY:      ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET:   ${{ secrets.ALPACA_API_SECRET }}
+          DATABASE_URL:        ${{ secrets.DATABASE_URL }}
+        run: python export_ledger.py
+
+      - name: Commit ledger
+        run: |
+          git config user.name "ledger-bot"
+          git config user.email "ledger@users.noreply.github.com"
+          git add data/ledger_trades.csv data/ledger_open.csv data/ledger_summary.json
+          git diff --staged --quiet || git commit -m "chore: daily ledger export [skip ci]"
+          git push

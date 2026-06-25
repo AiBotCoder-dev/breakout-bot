@@ -97,4 +97,8 @@ jobs:
           # entries (not in uptrend / weak momentum / chasing highs / unreachable
           # strike). Validate with `python full_bot_backtest.py gate` before enabling.
           WINNER_GATE:             ${{ secrets.WINNER_GATE || 'off' }}
+          # Source blocklist: comma-list of signal sources to skip entirely. The
+          # journal showed PEAD (0/8) and bottom-fisher (0/3) are pure losers, so
+          # the recommended live value is 'pead,bottom_fisher'. Empty = trade all.
+          BLOCK_SIGNAL_SOURCES:    ${{ secrets.BLOCK_SIGNAL_SOURCES || '' }}
         run: python monitor.py

@@ -2674,6 +2674,21 @@ def main():
                             if opened >= 5:
                                 break
                             _srcs = s.get("sources", [])
+                            # SOURCE BLOCKLIST — cut chronically-losing signal sources.
+                            # The journal proved PEAD calls (0/8, -$307) and bottom-
+                            # fisher (0/3) are pure drag; they're counter-trend/event
+                            # sources that contradict the momentum edge. BLOCK_SIGNAL_
+                            # SOURCES is a comma-list (e.g. "pead,bottom_fisher"); a
+                            # setup is skipped ONLY when ALL its sources are blocked, so
+                            # a momentum+X combo still trades on the momentum edge.
+                            # Empty (default) = no change.
+                            _blocked = {x.strip().lower() for x in os.environ.get(
+                                "BLOCK_SIGNAL_SOURCES", "").split(",") if x.strip()}
+                            if _srcs and _blocked and all(
+                                    str(x).lower() in _blocked for x in _srcs):
+                                print(f"    ⊘ {s.get('ticker','?'):6s} — sources "
+                                      f"{_srcs} all blocked, skip")
+                                continue
                             _is_primary = ("momentum" in _srcs)
                             _tag = ("fullscan_" + (_srcs[0] if _srcs else "scan")
                                     + "_" + s.get("option_type", "call"))

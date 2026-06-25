@@ -2395,8 +2395,11 @@ def main():
                     _is_spread = False
                     _short_sym = ""
                     res = {"ok": False}
+                    # DIP-BUY always takes the naked ITM call (never a spread), so the
+                    # OPTION_STRUCTURE=spread momentum fix and DIPBUY can run together.
                     if (os.environ.get("OPTION_STRUCTURE", "naked").strip().lower()
-                            == "spread" and _otype == "call"):
+                            == "spread" and _otype == "call"
+                            and not setup_tag.startswith("dipbuy")):
                         try:
                             from momentum_options import SPREAD_SHORT_OTM as _SSO
                             _under = contract["strike"] / (1 + (s.get("otm_pct") or 0.0))

@@ -627,6 +627,29 @@ class AlpacaPaperBroker:
             except Exception:
                 _long_pair, _short_set = {}, set()
 
+        # ── DIP-BUY AWARENESS — mean-reversion ITM calls use TARGET/STOP/TIME exits
+        # (not the trailing logic). dipbuy_positions (written by monitor.py when
+        # DIPBUY=on) maps contract -> opened_at. Empty (default) = no-op.
+        _dipbuy = {}
+        if conn is not None:
+            try:
+                conn.execute("CREATE TABLE IF NOT EXISTS dipbuy_positions "
+                             "(contract_symbol TEXT PRIMARY KEY, opened_at TEXT)")
+                for r in conn.execute("SELECT contract_symbol, opened_at "
+                                      "FROM dipbuy_positions").fetchall():
+                    try:
+                        _cs, _oa = r["contract_symbol"], r["opened_at"]
+                    except Exception:
+                        _cs, _oa = r[0], r[1]
+                    if _cs:
+                        _dipbuy[_cs] = _oa
+            except Exception:
+                _dipbuy = {}
+        import os as _os
+        _DB_TGT = float(_os.environ.get("DIPBUY_TARGET_PCT", "20"))
+        _DB_STOP = float(_os.environ.get("DIPBUY_STOP_PCT", "-45"))
+        _DB_MAXHOLD = int(_os.environ.get("DIPBUY_MAXHOLD_DAYS", "10"))
+
         positions = self.get_option_positions()
         _by_sym = {p["symbol"]: p for p in positions}
 
@@ -710,7 +733,25 @@ class AlpacaPaperBroker:
             _eff_hard = grace_hard_stop if _in_grace else _hard
 
             reason = None
-            if dte is not None and dte <= _dte_floor:
+            if sym in _dipbuy:
+                # DIP-BUY: take the bounce. +target / -stop / time cap. This REPLACES
+                # the trailing logic for these positions (the target exit is what
+                # realises the backtested 63% win rate).
+                _db_age = 10**9
+                try:
+                    _dba = _dt.fromisoformat(str(_dipbuy[sym]).replace("Z", "+00:00"))
+                    if _dba.tzinfo is None:
+                        _dba = _dba.replace(tzinfo=_tz.utc)
+                    _db_age = (_now_utc - _dba).total_seconds() / 86400.0
+                except Exception:
+                    pass
+                if pct >= _DB_TGT:
+                    reason = "DIPBUY_TARGET"
+                elif pct <= _DB_STOP:
+                    reason = "DIPBUY_STOP"
+                elif _db_age >= _DB_MAXHOLD or (dte is not None and dte <= _dte_floor):
+                    reason = "DIPBUY_TIME"
+            elif dte is not None and dte <= _dte_floor:
                 reason = "TIME_STOP"
             elif not activated:
                 if pct <= _eff_hard:
@@ -725,6 +766,12 @@ class AlpacaPaperBroker:
                 res = self.close_option(sym)
                 if res.get("ok"):
                     _peak_clear(sym)
+                    if sym in _dipbuy and conn is not None:
+                        try:
+                            conn.execute("DELETE FROM dipbuy_positions "
+                                         "WHERE contract_symbol=?", (sym,))
+                        except Exception:
+                            pass
                     if _spread_short is not None:
                         # close the short hedge in the same cycle and clear the
                         # pairing so the spread leaves the book as one unit.

@@ -101,4 +101,9 @@ jobs:
           # journal showed PEAD (0/8) and bottom-fisher (0/3) are pure losers, so
           # the recommended live value is 'pead,bottom_fisher'. Empty = trade all.
           BLOCK_SIGNAL_SOURCES:    ${{ secrets.BLOCK_SIGNAL_SOURCES || '' }}
+          # DIP-BUY strategy (backtested 63.6% win): 'on' adds mean-reversion ITM
+          # calls on oversold dips in uptrends (RSI(2)<10), with target/stop/time
+          # exits. Default 'off'. Run with OPTION_STRUCTURE=naked (DIPBUY wants the
+          # ITM call, not a spread). See GO_LIVE.md / mean_reversion_strategy.py.
+          DIPBUY:                  ${{ secrets.DIPBUY || 'off' }}
         run: python monitor.py

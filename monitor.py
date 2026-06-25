@@ -2078,7 +2078,9 @@ def main():
                         except Exception:
                             pass
                         emoji = {"TRAILING_STOP": "🎯", "STOP_LOSS": "🛑",
-                                 "TIME_STOP": "⏱"}.get(_x["reason"], "📕")
+                                 "TIME_STOP": "⏱", "DIPBUY_TARGET": "✅",
+                                 "DIPBUY_STOP": "🛑", "DIPBUY_TIME": "⏱"
+                                 }.get(_x["reason"], "📕")
                         _peak = _x.get("peak_pct")
                         _peaktxt = f" (peak +{_peak:.0f}%)" if _peak is not None else ""
                         print(f"    {emoji} EXIT {_x['symbol']} {_x['reason']} "
@@ -2491,6 +2493,20 @@ def main():
                              gate_passed=_wg_passed, gate_score=_wg_score)
                     except Exception as _je:
                         print(f"    (journal log_entry skipped: {_je})")
+                    # DIP-BUY: register this position so the exit manager uses the
+                    # TARGET/STOP/TIME rules (not the trailing logic) on it.
+                    if setup_tag.startswith("dipbuy"):
+                        try:
+                            conn.execute(
+                                "CREATE TABLE IF NOT EXISTS dipbuy_positions "
+                                "(contract_symbol TEXT PRIMARY KEY, opened_at TEXT)")
+                            conn.execute(
+                                "INSERT OR REPLACE INTO dipbuy_positions "
+                                "(contract_symbol, opened_at) VALUES (?,?)",
+                                (contract["symbol"],
+                                 datetime.now(timezone.utc).isoformat()))
+                        except Exception:
+                            pass
                     _src = ", ".join(s.get("sources", []) or [])
                     _why = f" · why: {_src}" if _src else ""
                     _dir_emoji = "📉" if _otype == "put" else "📈"
@@ -2728,6 +2744,30 @@ def main():
                                 _need -= 1
                     else:
                         print(f"  📊 Data floor met: {_done}/{_min_day} trades today.")
+
+                # ── DIP-BUY strategy (opt-in via DIPBUY=on) ───────────────────
+                # Mean-reversion ITM calls on oversold dips in uptrends (RSI(2)<10,
+                # price>sma50>sma200). Backtested 63.6% win rate; uses TARGET/STOP/
+                # TIME exits in broker.manage_option_exits. Runs alongside the
+                # scanner. Default off = no change. See mean_reversion_strategy.py.
+                if (os.environ.get("DIPBUY", "off").strip().lower()
+                        in ("on", "1", "true")
+                        and not _macro_block and not _claude_pause
+                        and not _entry_block_open and not _halt_entries):
+                    try:
+                        from dipbuy import find_dipbuy_setups, RSI2_MAX as _dbrsi
+                        _dmax = int(os.environ.get("DIPBUY_MAX_PER_CYCLE", "2") or 2)
+                        _dips = find_dipbuy_setups(_ob, max_results=_dmax)
+                        if _dips:
+                            print(f"  🩸 DIP-BUY: {len(_dips)} oversold-uptrend "
+                                  f"setup(s) (RSI2<{_dbrsi:.0f})")
+                        for _d in _dips:
+                            if opened >= 5:
+                                break
+                            if _attempt_entry(_d, "dipbuy_call"):
+                                opened += 1
+                    except Exception as _dbe:
+                        print(f"  WARN dipbuy failed: {_dbe}")
 
                 print(f"  Momentum options (Alpaca paper): opened {opened} this cycle")
 

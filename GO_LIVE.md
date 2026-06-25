@@ -49,6 +49,26 @@ bottom-fisher/explore removes the worst drag. Re-check the ledger after ~2 weeks
 20+ new trades, then run `python train_meta_model.py` (with `DATABASE_URL`) to see
 if any feature now separates winners well enough to enforce the winner gate.
 
+## Paper-validating the DIP-BUY strategy (the 63.6%-win-rate model)
+`DIPBUY` adds mean-reversion ITM calls on oversold dips in uptrends (RSI(2)<10),
+with +20% target / −45% stop / ~7-day exits — backtested 63.6% win, validated by
+year. To paper-validate it live (recommended before any real capital):
+
+| Secret | Value | Note |
+|---|---|---|
+| `DIPBUY` | `on` | turns the strategy on (paper) |
+| `OPTION_STRUCTURE` | `naked` | DIPBUY wants the ITM call, **not** a spread — keep naked while validating DIPBUY |
+| `ACCOUNT_EQUITY_OVERRIDE` | `5000` | **important** — deep-ITM calls cost ~$1.5k–7k each; the default $1k sizing skips them all. Raise to ~$5k so they actually fill. |
+
+Optional tuning secrets (defaults shown): `DIPBUY_RSI2_MAX=10`, `DIPBUY_ITM_DEPTH=0.07`,
+`DIPBUY_DTE=12`, `DIPBUY_TARGET_PCT=20`, `DIPBUY_STOP_PCT=-45`, `DIPBUY_MAXHOLD_DAYS=10`,
+`DIPBUY_MAX_PER_CYCLE=2`.
+
+**Watch:** logs print `🩸 DIP-BUY: N oversold-uptrend setup(s)`; exits show
+`DIPBUY_TARGET / DIPBUY_STOP / DIPBUY_TIME`. After ~100 trades (~6–9 months), compare
+the live win rate to the 63% backtest via `data/ledger_summary.json` (`setup` =
+`dipbuy_call`). **Rollback:** delete the `DIPBUY` secret.
+
 ## Not yet wired (future code change, optional)
 - Tighten the live momentum bar back to the validated `mom_6m ≥ 0.10` (the scan
   currently uses 0.05). Needs a small code change if you want it; flag it and it's

@@ -83,6 +83,31 @@ gh issue list -R AiBotCoder-dev/breakout-bot     # verify
 
 ## Log (newest first)
 
+### 2026-06-25 — [A / desktop] — CONNECTED Alpaca+journal directly; source-level attribution + go-live sheet (commit `1578586`)
+Got read access to the Alpaca paper account + the Postgres journal, so we finally
+have GROUND TRUTH (no more log scraping):
+- **Lifetime: 67 round-trips, 9% win rate, −$3,047 realized** (expectancy −$45/trade).
+- **Churn was the historical #1 loss: TXN $340C round-tripped ×26 = −$1,784** (the
+  6/12 loop). The rebuy-cooldown has since fixed it (this week = 8 distinct contracts).
+- **Journal source attribution (the unlock):** PEAD calls **0/8 −$307**, bottom-fisher
+  **0/3**, data-floor explore **17% −$230**, core momentum **29% −$134**. The loss is
+  concentrated in the non-momentum sources. Quality score does NOT separate winners
+  (high-quality half did worse). Only winners came from TRAILING_STOP runners (AMD
+  +$235, INTC +$106) — the exit manager is the one profitable component.
+
+**Shipped (data-driven, all OFF by default):**
+- `BLOCK_SIGNAL_SOURCES` env (monitor.py) — skips a setup only when ALL its sources
+  are blocked; recommended live value `pead,bottom_fisher`.
+- `export_ledger.py` + `ledger_export.yml` — daily authoritative ledger from Alpaca
+  fills + journal, committed to `data/ledger_*.{csv,json}`. **No more log scraping.**
+- `GO_LIVE.md` — exact secrets to deploy the validated fixes.
+
+**Go-live (B, please weigh in / set the secrets when ready):** `BLOCK_SIGNAL_SOURCES=
+pead,bottom_fisher`, `MIN_TRADES_PER_DAY=0`, `OPTION_STRUCTURE=spread`. Targets the
+exact −$3,047 cause: cut the dead sources + the explore churn, and spread-cap the
+momentum survivors. Exit manager untouched. Meta-model needs ~40 closed trades to fit
+(at 24); re-run `train_meta_model.py` in ~2 weeks.
+
 ### 2026-06-20 — [A / desktop] — BUILT issue #6 (meta-labeling) — and the rule-gate FAILED validation (commit `0a4b42a`)
 Built the full "separate winners from losers" stack, all additive / OFF by default:
 - **`winner_gate.py`** (NEW): pre-trade separators (strike reachability, don't-chase,

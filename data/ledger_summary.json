@@ -1,7 +1,7 @@
 {
-  "generated_utc": "2026-07-07T22:37:07.675042+00:00",
-  "equity": 97186.77,
-  "cash": 97051.77,
+  "generated_utc": "2026-07-08T22:32:23.401699+00:00",
+  "equity": 97219.68,
+  "cash": 96861.68,
   "closed_round_trips": 82,
   "wins": 11,
   "losses": 71,
@@ -10,8 +10,8 @@
   "avg_win": 83.42,
   "avg_loss": -52.62,
   "expectancy_per_trade": -34.37,
-  "open_positions": 2,
-  "unrealized_pnl": 13.0,
+  "open_positions": 3,
+  "unrealized_pnl": 46.0,
   "by_source": {
     "fullscan_pead_call": {
       "n": 13,

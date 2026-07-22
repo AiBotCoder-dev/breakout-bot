@@ -29,6 +29,7 @@ ALERTING
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone, date, timedelta
 
 
@@ -142,13 +143,19 @@ class OptionsScanner:
         except Exception as e:
             print(f"  [opt-scan] momentum source failed: {e}")
 
-        # 2. PEAD candidates — CALLS
-        try:
-            from earnings_engine import PEADScanner
-            for r in PEADScanner(self.conn).get_latest()[:PER_SOURCE_LIMIT["pead"]]:
-                add(r["ticker"], "pead", "call", price=r.get("entry_now"))
-        except Exception as e:
-            print(f"  [opt-scan] pead source failed: {e}")
+        # 2. PEAD candidates — CALLS — DISABLED by default (2026-07-22 review):
+        #    live record 1/21 win (5%), -$811 — the worst setup in the book.
+        #    Buying calls right after earnings walks into IV crush. Re-enable
+        #    with PEAD_CALLS=on ONLY after it proves a forward edge.
+        if os.environ.get("PEAD_CALLS", "off").strip().lower() == "on":
+            try:
+                from earnings_engine import PEADScanner
+                for r in PEADScanner(self.conn).get_latest()[:PER_SOURCE_LIMIT["pead"]]:
+                    add(r["ticker"], "pead", "call", price=r.get("entry_now"))
+            except Exception as e:
+                print(f"  [opt-scan] pead source failed: {e}")
+        else:
+            print("  [opt-scan] pead calls disabled (live 1/21, -$811 — IV crush)")
 
         # 3. Whale-watch picks — CALLS
         try:

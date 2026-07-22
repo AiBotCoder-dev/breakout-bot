@@ -2677,9 +2677,12 @@ def main():
                     try:
                         from options_scanner import OptionsScanner
                         _fms = OptionsScanner(conn)
+                        # Quality gate raised 55 -> 60 (2026-07-22 review):
+                        # C-grade closed at 9% win / -47% avg. A/B only.
+                        _min_q = int(os.environ.get("MIN_QUALITY_GATE", "60") or 60)
                         _rep = _fms.scan_and_alert(
                             telegram_sender=send_telegram,
-                            min_quality=55, alert_threshold=70,
+                            min_quality=_min_q, alert_threshold=70,
                             fast=True, max_results=12)
                         _fs = _rep["results"]
                         print(f"  🌐 Full market scan: {len(_fs)} setup(s) "

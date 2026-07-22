@@ -59,12 +59,11 @@ jobs:
           # Trade the account as if it had this much equity (e.g. 1000) regardless
           # of the real paper balance. 0/unset = use the real balance.
           ACCOUNT_EQUITY_OVERRIDE: ${{ secrets.ACCOUNT_EQUITY_OVERRIDE }}
-          # Data-collection floor: guarantee at least this many option trades per
-          # day so we gather a profitability sample fast. Top-up trades that fall
-          # below the normal quality gate are tagged 'momentum_call_explore' in
-          # the journal and kept OUT of the real-strategy win-rate stats.
-          # Set to 0 to disable (pure discipline). Tune via repo secret if desired.
-          MIN_TRADES_PER_DAY:    ${{ secrets.MIN_TRADES_PER_DAY || '3' }}
+          # Data-collection floor: OFF as of the 2026-07-22 six-week review.
+          # It forced 3 low-quality (>=35) trades/day: live record 33% win,
+          # -$358, and 48 of 53 open positions were explore junk. Its job
+          # (gather a sample fast) is done — now it was just a money leak.
+          MIN_TRADES_PER_DAY:    ${{ secrets.MIN_TRADES_PER_DAY || '0' }}
           EXPLORE_QUALITY_FLOOR: ${{ secrets.EXPLORE_QUALITY_FLOOR || '35' }}
           # Macro event gate: hard = block all entries when CPI/FOMC imminent
           # (real-money setting), soft = half-size through events (paper
@@ -106,4 +105,9 @@ jobs:
           # exits. Default 'off'. Run with OPTION_STRUCTURE=naked (DIPBUY wants the
           # ITM call, not a spread). See GO_LIVE.md / mean_reversion_strategy.py.
           DIPBUY:                  ${{ secrets.DIPBUY || 'off' }}
+          # 2026-07-22 six-week review changes: A/B-quality only (C-grade closed
+          # 9% win / -47% avg), and PEAD calls hard-off at the scanner level
+          # (1/21 win, -$811 — IV crush) until forward-proven.
+          MIN_QUALITY_GATE:        ${{ secrets.MIN_QUALITY_GATE || '60' }}
+          PEAD_CALLS:              ${{ secrets.PEAD_CALLS || 'off' }}
         run: python monitor.py

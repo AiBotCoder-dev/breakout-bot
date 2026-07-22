@@ -655,18 +655,41 @@ CREATE INDEX IF NOT EXISTS idx_callouts_user   ON paper_options_callouts(usernam
             return []
 
     def get_recent_winners(self, hours: int = 48, limit: int = 20) -> list:
-        """Best-performing open callouts in last N hours."""
+        """Best-performing open callouts in last N hours.
+
+        HONESTY FILTERS (2026-07-22): the old version surfaced penny-option
+        artifacts — entries snapshotted at ~$0.01 on stale/thin quotes marked
+        up to '+17,622%' — while the CLOSED StockTwits record was 0/10, -82%.
+        Now: require a real entry premium (>= $0.10), discard implausible marks
+        (> +500% unrealized = almost certainly a bad quote, not a win), and let
+        the caller label these as UNREALIZED open marks, not wins."""
         cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
         try:
             rows = self.conn.execute(
                 "SELECT * FROM paper_options_callouts "
                 "WHERE detected_at >= ? AND status='OPEN' AND pnl_pct > 10 "
+                "AND pnl_pct <= 500 AND entry_premium >= 0.10 "
                 "ORDER BY pnl_pct DESC LIMIT ?",
                 (cutoff, int(limit))
             ).fetchall()
             return [dict(r) for r in rows or []]
         except Exception:
             return []
+
+    def source_record(self, source: str) -> dict:
+        """Honest closed record for a source — shown in every hot-callout alert
+        so an open mark can never masquerade as a track record."""
+        try:
+            r = self.conn.execute(
+                "SELECT COUNT(*) n, SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) w "
+                "FROM paper_options_callouts WHERE source=? AND status<>'OPEN'",
+                (source,)).fetchone()
+            g = (lambda k, i: r.get(k) if hasattr(r, "get") else r[i])
+            n = int(g("n", 0) or 0); w = int(g("w", 1) or 0)
+            return {"closed": n, "wins": w,
+                    "win_rate": round(100 * w / n, 0) if n else None}
+        except Exception:
+            return {"closed": 0, "wins": 0, "win_rate": None}
 
     def get_leaderboard(self, min_callouts: int = 3) -> list:
         """Rank callers by win rate + average return on CLOSED callouts."""

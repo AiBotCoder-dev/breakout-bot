@@ -2897,16 +2897,27 @@ def main():
               f"no-premium {_ing.get('skipped_no_premium',0)})")
         print(f"  Track  : {_trk.get('updated',0)} updated, "
               f"{_trk.get('expired',0)} closed/expired")
-        # Surface any standout winners to Telegram (open callouts up big)
+        # Surface standout OPEN callout marks — with the honesty stamp. The old
+        # alert pumped penny-quote artifacts ('+17,622%') as wins while the
+        # closed StockTwits record was 0/10 avg -82%. Every alert now carries
+        # UNREALIZED labeling + the source's real closed record.
         try:
             for w in (_oct.get_recent_winners(hours=24, limit=2) or []):
+                _src = w.get("source", "")
+                _rec = _oct.source_record(_src)
+                _rec_txt = (f"{_rec['wins']}/{_rec['closed']} closed callouts green "
+                            f"({_rec['win_rate']:.0f}%)" if _rec.get("win_rate") is not None
+                            else "no closed record yet")
                 send_telegram(
-                    f"📢 <b>Hot Options Callout</b>\n"
+                    f"📢 <b>Hot Options Callout</b> (open mark — UNREALIZED)\n"
                     f"<b>${w.get('ticker','')}</b> "
                     f"{str(w.get('option_type','')).upper()} "
                     f"{('$'+str(w.get('strike'))) if w.get('strike') else 'ATM'}\n"
-                    f"P&L: {w.get('pnl_pct',0):+.0f}% since called\n"
-                    f"By @{w.get('username','?')} on {w.get('source','')}"
+                    f"Marked {w.get('pnl_pct',0):+.0f}% since called "
+                    f"(thin-quote marks can overstate)\n"
+                    f"By @{w.get('username','?')} on {_src}\n"
+                    f"⚖️ <i>{_src} honest record: {_rec_txt} — research only, "
+                    f"NOT actionable until it clears the 55%/20-closed gate.</i>"
                 )
         except Exception:
             pass

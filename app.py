@@ -1999,6 +1999,57 @@ with tab_today:
     except Exception as _cpue:
         st.caption(f"(Claude PM panel unavailable: {_cpue})")
 
+    # ── 🧪 LEVERAGED SHADOW — leveraged-shares expression of the edge ──────────
+    st.markdown("### 🧪 Leveraged Shadow — Directional Edge as Trend-Filtered 3x Shares")
+    st.caption(
+        "Read-only PAPER book (never touches the real account). Reviewer-driven "
+        "tests concluded our edge is a weak-but-real directional tilt, and the "
+        "survival-optimal way to express it is **trend-filtered leveraged shares** "
+        "(0% catastrophic tail) rather than naked calls (41% of trades < −70%). "
+        "This runs that idea live: weekly rotation into the strongest 3x sector "
+        "ETFs above their 50 & 200 SMA (cash otherwise), $10k virtual book, marked "
+        "daily from free data. It settles the reviewer's Q2 — *is the leveraged "
+        "expression worth trading vs just holding the index?* — with real forward "
+        "data, risking nothing."
+    )
+    try:
+        import leveraged_shadow as _lev
+        _lr = _lev.report(conn)
+        _c1, _c2, _c3, _c4 = st.columns(4)
+        _c1.metric("Shadow equity", f"${_lr.get('equity', 0):,.0f}",
+                   f"{_lr.get('return_pct', 0):+.1f}%")
+        _spy = _lr.get("spy_pct"); _qqq = _lr.get("qqq_pct")
+        _c2.metric("vs SPY (same window)",
+                   f"{_spy:+.1f}%" if _spy is not None else "—")
+        _c3.metric("vs QQQ (same window)",
+                   f"{_qqq:+.1f}%" if _qqq is not None else "—")
+        _c4.metric("Max drawdown", f"{_lr.get('max_dd_pct', 0):+.1f}%")
+        _hold = ", ".join(_lr.get("holdings", ["CASH"]))
+        st.caption(f"**Now holding:** {_hold}  ·  cash ${_lr.get('cash', 0):,.0f}  ·  "
+                   f"last rebalance {_lr.get('last_rebalance') or '—'}  ·  "
+                   f"{_lr.get('n_days', 0)} day(s) tracked")
+        try:
+            _rows = conn.execute(
+                "SELECT ts, ticker, action, price, reason FROM lev_shadow_trades "
+                "ORDER BY ts DESC LIMIT 12").fetchall()
+            if _rows:
+                import pandas as _pdl
+                st.dataframe(_pdl.DataFrame([
+                    {"When": (dict(r) if hasattr(r, "keys") else {}).get("ts", "")[:16].replace("T", " "),
+                     "Ticker": (dict(r) if hasattr(r, "keys") else {}).get("ticker"),
+                     "Action": (dict(r) if hasattr(r, "keys") else {}).get("action"),
+                     "Price": (dict(r) if hasattr(r, "keys") else {}).get("price"),
+                     "Reason": (dict(r) if hasattr(r, "keys") else {}).get("reason")}
+                    for r in _rows]), use_container_width=True, hide_index=True)
+        except Exception:
+            pass
+        if _lr.get("n_days", 0) < 20:
+            st.info(f"Only {_lr.get('n_days', 0)} day(s) tracked — needs ~4–8 weeks "
+                    "for a trustworthy read vs the benchmarks. Let it accumulate.",
+                    icon="⏳")
+    except Exception as _lee:
+        st.caption(f"(leveraged shadow unavailable: {_lee})")
+
     # ── TRADE JOURNAL — attribution analytics (drives optimization) ───────────
     # ── 👻 GHOST EXITS — shadow exit-policy A/B test (reviewer idea #3) ─────────
     st.markdown("### 👻 Ghost Exits — Which Exit Policy Would Win?")

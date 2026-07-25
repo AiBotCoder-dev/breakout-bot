@@ -2111,6 +2111,21 @@ def main():
                 except Exception as _xe:
                     print(f"  WARN exit manager failed: {_xe}")
 
+                # LEVERAGED SHADOW — read-only paper book of the trend-filtered
+                # 3x-sector rotation (the survival-optimal expression of our
+                # directional edge). Self-gates to run once per UTC day; NEVER
+                # touches the broker, so it can't disturb the live options run.
+                try:
+                    import leveraged_shadow as _lev
+                    _ls = _lev.step(conn, notify=send_telegram)
+                    if _ls:
+                        print(f"  🧪 leveraged shadow: ${_ls['equity']:,.0f} "
+                              f"({_ls['return_pct']:+.1f}%) holding "
+                              f"{','.join(_ls['holdings']) or 'CASH'}"
+                              f"{' [rebalanced]' if _ls.get('rebalanced') else ''}")
+                except Exception as _lse:
+                    print(f"  (leveraged shadow skipped: {_lse})")
+
                 acct = _ob.get_account()
                 real_equity = acct.get("equity", 0)
                 # Size to the OVERRIDE if set (e.g. trade $100k paper as $1k)

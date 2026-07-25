@@ -160,3 +160,93 @@ def report(conn) -> dict:
     except Exception:
         pass
     return out
+
+
+# ── PRE-REGISTERED ADOPTION RULE (reviewer-locked, no cherry-picking) ─────────
+# Settled with the second-opinion reviewer: when >=MIN_RESOLVED ghosts have
+# resolved, score each policy and adopt the highest scorer that passes ALL hard
+# constraints. If none passes, DON'T adopt — surface that and keep the control.
+MIN_RESOLVED = 80          # ~40 per policy: the floor for a directional read
+
+# Hard disqualifiers — a policy failing ANY of these is rejected outright.
+DQ_MEAN_LT       = 0.0     # mean return < 0            -> REJECT
+DQ_WORST_LT      = -70.0   # worst single trade < -70%  -> REJECT
+DQ_TAIL50_GT     = 20.0    # >20% of trades < -50%      -> REJECT  (the ruin guard)
+
+# Composite score weights (reviewer's, tail-weighted after the 41%-catastrophe data)
+W_SORTINO, W_MEDIAN, W_WIN, W_RUIN, W_TAIL = 0.30, 0.25, 0.15, 0.20, 0.10
+
+
+def _pol_stats(vals):
+    import statistics as st
+    a = sorted(float(v) for v in vals)
+    n = len(a)
+    if n == 0:
+        return None
+    mean = sum(a) / n
+    dn = [v for v in a if v < 0]
+    dd = (sum(v * v for v in dn) / len(dn)) ** 0.5 if dn else 1e-9
+    sortino = mean / dd if dd > 0 else 0.0
+    worst = a[0]
+    tail50 = 100.0 * sum(1 for v in a if v < -50) / n
+    win = 100.0 * sum(1 for v in a if v > 0) / n
+    return {"n": n, "mean": mean, "median": st.median(a), "sortino": sortino,
+            "worst": worst, "tail50": tail50, "win": win}
+
+
+def decision(conn) -> dict:
+    """Apply the pre-registered rule. Returns {ready, resolved, winner, table,
+    note} — read-only; it recommends, it does not change the live policy."""
+    _ensure(conn)
+    policies = {"A_no_stop_time": "a_pnl", "B_wide_80_stop": "b_pnl",
+                "C_trail_after_30": "c_pnl"}
+    stats = {}; total_resolved = 0
+    for name, col in policies.items():
+        try:
+            rows = conn.execute(
+                f"SELECT {col} v FROM ghost_exits WHERE {col} IS NOT NULL").fetchall()
+            vals = [float(x.get("v") if hasattr(x, "get") else x[0]) for x in rows]
+        except Exception:
+            vals = []
+        s = _pol_stats(vals)
+        if s:
+            stats[name] = s
+            total_resolved += s["n"]
+
+    # normalise components to [0,1] across the candidate policies, then weight.
+    def _norm(key, invert=False):
+        xs = [s[key] for s in stats.values()]
+        lo, hi = (min(xs), max(xs)) if xs else (0, 1)
+        span = (hi - lo) or 1.0
+        return {n: ((hi - s[key]) if invert else (s[key] - lo)) / span
+                for n, s in stats.items()}
+
+    n_sort = _norm("sortino"); n_med = _norm("median"); n_win = _norm("win")
+    n_ruin = _norm("worst"); n_tail = _norm("tail50", invert=True)  # lower tail = better
+
+    table = []
+    for name, s in stats.items():
+        passes = (s["mean"] >= DQ_MEAN_LT and s["worst"] >= DQ_WORST_LT
+                  and s["tail50"] <= DQ_TAIL50_GT)
+        score = (W_SORTINO * n_sort[name] + W_MEDIAN * n_med[name]
+                 + W_WIN * n_win[name] + W_RUIN * n_ruin[name] + W_TAIL * n_tail[name])
+        table.append({"policy": name, **{k: round(s[k], 1) for k in
+                      ("n", "mean", "median", "sortino", "worst", "tail50", "win")},
+                      "score": round(score, 3), "passes": passes})
+    table.sort(key=lambda r: (r["passes"], r["score"]), reverse=True)
+
+    ready = total_resolved >= MIN_RESOLVED
+    winner = None; note = ""
+    eligible = [r for r in table if r["passes"]]
+    if not ready:
+        note = (f"{total_resolved}/{MIN_RESOLVED} resolved ghosts — "
+                "accumulating; rule not yet armed.")
+    elif not eligible:
+        note = ("Armed, but NO policy passes all hard constraints — keep the live "
+                "-50% control and pause loosening. (This is the rule working.)")
+    else:
+        winner = eligible[0]["policy"]
+        note = (f"Adopt {winner} (score {eligible[0]['score']}, passes all "
+                "constraints). Highest scorer among the eligible.")
+    return {"ready": ready, "resolved": total_resolved, "min_resolved": MIN_RESOLVED,
+            "winner": winner, "table": table, "note": note}

@@ -2000,6 +2000,32 @@ with tab_today:
         st.caption(f"(Claude PM panel unavailable: {_cpue})")
 
     # ── TRADE JOURNAL — attribution analytics (drives optimization) ───────────
+    # ── 👻 GHOST EXITS — shadow exit-policy A/B test (reviewer idea #3) ─────────
+    st.markdown("### 👻 Ghost Exits — Which Exit Policy Would Win?")
+    st.caption(
+        "Read-only shadow test: on EVERY real trade, we also track what 3 "
+        "alternative exit policies would have yielded on the identical entry — "
+        "so the '-50% stop cuts winners' question gets settled with live causal "
+        "data (full distribution), not one-sided regret. Populates as new trades "
+        "close. **A** = no stop, exit at DTE≤2. **B** = wide -80% stop + trail. "
+        "**C** = no stop, trail after +30%. **Control** = the live -50% policy."
+    )
+    try:
+        import ghost_exits as _ge
+        _gr = _ge.report(conn)
+        import pandas as _pdg
+        _order = ["REAL_-50_control", "A_no_stop_time", "B_wide_80_stop", "C_trail_after_30"]
+        _rowsg = [{"Policy": k.replace("_", " "), "n": _gr[k]["n"],
+                   "Win %": _gr[k]["win"], "Mean %": _gr[k]["mean"],
+                   "Median %": _gr[k]["median"]} for k in _order if k in _gr]
+        st.dataframe(_pdg.DataFrame(_rowsg), use_container_width=True, hide_index=True)
+        _nA = _gr.get("A_no_stop_time", {}).get("n", 0)
+        if _nA < 15:
+            st.info(f"Only {_nA} ghost exits resolved so far — need ~30-50 for a "
+                    "trustworthy read. Let it accumulate.", icon="⏳")
+    except Exception as _gee:
+        st.caption(f"(ghost report unavailable: {_gee})")
+
     st.markdown("### 📓 Trade Journal — Setup Attribution (not $ truth)")
     st.caption("⚠️ Win-rate and grade breakdowns here are reliable, but the DOLLAR "
                "figures use estimated entry prices and collapse repeated round-trips "

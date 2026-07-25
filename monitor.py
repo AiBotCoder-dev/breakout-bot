@@ -2100,6 +2100,14 @@ def main():
                             f"(${_x['pnl']:+.0f}){_pktxt}")
                     if _exits:
                         print(f"  Exit manager closed {len(_exits)} option position(s).")
+                    # GHOST EXITS — advance the shadow exit policies each cycle
+                    try:
+                        import ghost_exits as _ghost
+                        _gn = _ghost.update(conn, _ob)
+                        if _gn:
+                            print(f"  👻 ghost exits: {_gn} shadow position(s) evaluated")
+                    except Exception as _ge:
+                        print(f"  (ghost exits skipped: {_ge})")
                 except Exception as _xe:
                     print(f"  WARN exit manager failed: {_xe}")
 
@@ -2463,6 +2471,14 @@ def main():
                             "VALUES (?,1) ON CONFLICT (snapshot_date) DO UPDATE "
                             "SET n = broker_daily_entries.n + 1",
                             (datetime.now().strftime("%Y-%m-%d"),))
+                    except Exception:
+                        pass
+                    # GHOST EXITS — shadow alternative exit policies on this entry
+                    # (read-only; changes nothing about the live trade).
+                    try:
+                        import ghost_exits as _ghost
+                        _ghost.record(conn, contract["symbol"], s["ticker"], prem,
+                                      dte=s.get("dte"))
                     except Exception:
                         pass
                     _is_ex = setup_tag.endswith("explore")

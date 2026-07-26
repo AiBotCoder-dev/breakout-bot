@@ -10,12 +10,21 @@ survival-optimal way to express a directional bet is NOT naked calls (a
 tail-driven lottery, 41% of trades < -70%) but TREND-FILTERED LEVERAGED SHARES
 (0% catastrophic tail, positive Sortino).
 
-The backtest of that idea:
-  trend-filtered top-2 3x-sector rotation, 8y ->  +2513%  Sortino 0.95  maxDD -47%
-  SPY buy&hold                                     +181%   Sortino 0.79  maxDD -34%
-  QQQ buy&hold                                     +289%   Sortino 0.86  maxDD -35%
+WEALTHSIMPLE-REALISTIC (the user copies signals into Wealthsimple with real $):
+  Vehicles must be Wealthsimple-tradeable AND priced with real fees. Wealthsimple
+  charges 1.5% currency-conversion EACH way on US securities (basic plan), which
+  destroys a weekly-rotation strategy (US 3x rotation Sortino 1.12 -> 0.53 with FX).
+  So we use CAD-listed 2x ETFs (TSX, NO FX fee): HQU/HSU/HXU + HEU/HFU/HGU. Canada's
+  leveraged ETFs are all 2x — which is also the leverage-sweep optimum (3x is past
+  the Sortino peak). Real .TO prices already contain the ETF's MER + decay.
+
+The backtest of that idea (wealthsimple_backtest.py, 8y, real fees):
+  CAD 2x rotation (WS, no FX)  ->  +2306%  Sortino 1.17  maxDD -51%
+  HQU buy&hold                     +525%   Sortino 0.73  maxDD -65%
+  QQQ buy&hold                     +289%   Sortino 0.86  maxDD -35%
 (Headline % is survivorship-flattered; the Sortino EDGE over the benchmarks and
-the tamed drawdown vs -82% for 3x buy-hold are the honest signals.)
+the tamed drawdown vs -65% for 2x buy-hold are the honest signals. The -51% DD is
+real — 2x leverage — and is the risk this shadow exists to make visible.)
 
 What this module does
 ---------------------
@@ -45,13 +54,18 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone, date, timedelta
 
-# Same liquid 3x sector/index universe the backtest validated.
-UNIVERSE = ["TQQQ", "SOXL", "SPXL", "FNGU", "TECL", "FAS",
-            "TNA", "LABU", "CURE", "UDOW", "RETL", "DPST"]
+# CAD-listed 2x ETFs — Wealthsimple-tradeable, NO 1.5% FX fee (they trade in CAD
+# on the TSX), and 2x matches the leverage-sweep optimum. yfinance uses .TO.
+#   HQU 2x Nasdaq-100 · HSU 2x S&P500 · HXU 2x TSX60 ·
+#   HEU 2x energy · HFU 2x financials · HGU 2x gold miners
+UNIVERSE = ["HQU.TO", "HSU.TO", "HXU.TO", "HEU.TO", "HFU.TO", "HGU.TO"]
 TOP_K = 2                 # equal-weight the top-2 in an uptrend
-START_EQUITY = 10_000.0   # virtual book size (paper; unrelated to the real account)
+START_EQUITY = 10_000.0   # virtual book size, CAD (paper; unrelated to real account)
 REBAL_DAYS = 7            # weekly rebalance cadence
-COST_BPS = 5.0            # 0.05% per side friction on traded notional (honesty tax)
+# Wealthsimple cost: $0 commission, and CAD-listed => NO FX fee. The only real
+# per-trade cost is the bid/ask spread (~0.08%/side on a leveraged ETF). The ETF's
+# MER + decay are already inside its real .TO price history.
+COST_BPS = 8.0            # bid/ask spread per side (Wealthsimple, CAD-listed)
 MOM_LOOKBACK = 63         # 3-month momentum, matches the backtest
 
 

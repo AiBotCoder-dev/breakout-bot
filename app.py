@@ -2000,17 +2000,18 @@ with tab_today:
         st.caption(f"(Claude PM panel unavailable: {_cpue})")
 
     # ── 🧪 LEVERAGED SHADOW — leveraged-shares expression of the edge ──────────
-    st.markdown("### 🧪 Leveraged Shadow — Directional Edge as Trend-Filtered 3x Shares")
+    st.markdown("### 🧪 Leveraged Shadow — Directional Edge as Wealthsimple 2x ETFs")
     st.caption(
         "Read-only PAPER book (never touches the real account). Reviewer-driven "
         "tests concluded our edge is a weak-but-real directional tilt, and the "
         "survival-optimal way to express it is **trend-filtered leveraged shares** "
-        "(0% catastrophic tail) rather than naked calls (41% of trades < −70%). "
-        "This runs that idea live: weekly rotation into the strongest 3x sector "
-        "ETFs above their 50 & 200 SMA (cash otherwise), $10k virtual book, marked "
-        "daily from free data. It settles the reviewer's Q2 — *is the leveraged "
-        "expression worth trading vs just holding the index?* — with real forward "
-        "data, risking nothing."
+        "rather than naked calls (41% of trades < −70%). Built to be COPYABLE on "
+        "Wealthsimple: **CAD-listed 2x ETFs** (HQU/HSU/HXU/HEU/HFU/HGU — no 1.5% FX "
+        "fee, and 2x is the leverage sweet spot). Weekly rotation into the top-2 "
+        "above their 50 & 200 SMA (cash otherwise), $10k CAD virtual book, marked "
+        "daily and priced with real Wealthsimple fees. Backtest (8y, real fees): "
+        "**+2306% Sortino 1.17** vs HQU buy-hold 0.73 — but a real −51% drawdown "
+        "(2x leverage) this shadow exists to make visible."
     )
     try:
         import leveraged_shadow as _lev

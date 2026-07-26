@@ -123,18 +123,20 @@ def _sector_rot(data, cal):
 
 def _sweep(name, base_dr):
     print(f"\n  {name}  (base Sortino {_sortino(base_dr):+.2f})")
-    print(f"    {'lev':>5}  {'total':>9}  {'CAGR':>7}  {'maxDD':>7}  {'Sortino':>8}")
-    best = (-1e9, None)
+    print(f"    {'lev':>5}  {'total':>9}  {'CAGR':>7}  {'maxDD':>7}  {'Sortino':>8}  {'Calmar':>7}")
+    best_s = (-1e9, None); best_c = (-1e9, None)
     for L in LEVS:
         eq, curve, dr = _lever(base_dr, L)
-        so = _sortino(dr)
-        tag = ""
-        if so > best[0]:
-            best = (so, L)
-        print(f"    {L:5.1f}  {(eq-1)*100:+8.0f}%  {_cagr(eq,len(dr)):+6.1f}%  "
-              f"{_maxdd(curve):6.0f}%  {so:+7.2f}{tag}")
-    print(f"    -> Sortino peaks at {best[1]:.1f}x")
-    return best[1]
+        so = _sortino(dr); cagr = _cagr(eq, len(dr)); mdd = _maxdd(curve)
+        calmar = cagr / abs(mdd) if mdd != 0 else 0.0   # CAGR / |maxDD|
+        if so > best_s[0]:
+            best_s = (so, L)
+        if calmar > best_c[0]:
+            best_c = (calmar, L)
+        print(f"    {L:5.1f}  {(eq-1)*100:+8.0f}%  {cagr:+6.1f}%  "
+              f"{mdd:6.0f}%  {so:+7.2f}  {calmar:6.2f}")
+    print(f"    -> Sortino peaks at {best_s[1]:.1f}x   ·   Calmar peaks at {best_c[1]:.1f}x")
+    return best_s[1], best_c[1]
 
 
 def run():
@@ -152,12 +154,15 @@ def run():
     print("\n" + "=" * 72)
     print(" LEVERAGE SWEEP — trend-filtered strategies, synthetic daily-rebal + drag")
     print("=" * 72)
-    p1 = _sweep("timed_QQQ", _timed_qqq(data["QQQ"], cal))
+    p1s, p1c = _sweep("timed_QQQ", _timed_qqq(data["QQQ"], cal))
     rot = {t: data[t] for t in SECTORS if t in data}
-    p2 = _sweep("sector_rot", _sector_rot(rot, cal))
+    p2s, p2c = _sweep("sector_rot", _sector_rot(rot, cal))
 
     print("\n" + "=" * 72)
-    print(f"  Sortino-optimal leverage:  timed_QQQ {p1:.1f}x   ·   sector_rot {p2:.1f}x")
+    print(f"  Sortino-optimal:  timed_QQQ {p1s:.1f}x   ·   sector_rot {p2s:.1f}x")
+    print(f"  Calmar-optimal :  timed_QQQ {p1c:.1f}x   ·   sector_rot {p2c:.1f}x")
+    print("  (Calmar = CAGR/|maxDD| — the reviewer's survival metric. If it peaks")
+    print("  LOWER than Sortino, drawdown says use even less leverage.)")
     print("  NOTE: synthetic leverage is OPTIMISTIC vs real leveraged ETFs (the")
     print("  real-vs-synth 3x gap in aggregation_test was ~half). Treat the PEAK as")
     print("  an upper bound; the real-vehicle optimum is likely a notch lower.")

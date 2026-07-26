@@ -200,8 +200,9 @@ def step(conn, force=False, notify=None):
         return None                       # already ran today
 
     # Need history for the union of current holdings + universe (rebalance may
-    # rotate into any of them). One pull per day is cheap.
-    tickers = sorted(set(UNIVERSE) | set(st["holdings"].keys()) | {"SPY", "QQQ"})
+    # rotate into any of them) + the broad-gate indices. One pull per day is cheap.
+    tickers = sorted(set(UNIVERSE) | set(st["holdings"].keys())
+                     | {"SPY", "QQQ", "XIU.TO"})
     hist = _history(tickers)
     if not hist:
         return None                       # data outage; try again next cycle
@@ -214,16 +215,27 @@ def step(conn, force=False, notify=None):
             continue
         equity += float(pos.get("shares") or 0) * px
 
-    # 2) rebalance if due (weekly, or if we hold nothing yet)
+    # 2) BROAD-GATE AIRBAG (reviewer-validated). The per-ETF filter misses the
+    # correlation-spike / late-cycle case where "strong" sectors gap down together
+    # (17% of weeks were divergent; 4 of the 5 worst weeks were gate-in-cash). So
+    # require SPY AND XIU both above their 200 SMA to hold ANYTHING. Checked DAILY,
+    # not just on rebalance days, so a mid-week regime break exits immediately.
+    # Scenario C in broad_gate_test.py: maxDD -50% -> -23%, Calmar 1.20 -> 2.05.
+    broad = _broad_long(hist)
     rebalanced = False
-    due = force or st.get("last_rebalance") is None
-    if not due and st.get("last_rebalance"):
-        try:
-            due = (date.today() - date.fromisoformat(st["last_rebalance"])).days >= REBAL_DAYS
-        except Exception:
-            due = True
-    if due:
-        rebalanced = _rebalance(conn, st, hist, equity)
+    if not broad:
+        if st["holdings"]:                # airbag: liquidate to cash right now
+            rebalanced = _liquidate(conn, st, hist, "broad_gate_risk_off")
+    else:
+        # 3) rebalance if due (weekly, or if we hold nothing yet)
+        due = force or st.get("last_rebalance") is None
+        if not due and st.get("last_rebalance"):
+            try:
+                due = (date.today() - date.fromisoformat(st["last_rebalance"])).days >= REBAL_DAYS
+            except Exception:
+                due = True
+        if due:
+            rebalanced = _rebalance(conn, st, hist, equity)
 
     # 3) recompute equity post-rebalance and snapshot the curve
     equity = st["cash"]
@@ -250,15 +262,56 @@ def step(conn, force=False, notify=None):
     holdings_txt = ", ".join(sorted(st["holdings"].keys())) or "CASH"
     ret = (equity / st["start_equity"] - 1) * 100
     summary = {"equity": round(equity, 2), "return_pct": round(ret, 1),
-               "holdings": sorted(st["holdings"].keys()), "rebalanced": rebalanced}
+               "holdings": sorted(st["holdings"].keys()), "rebalanced": rebalanced,
+               "broad_long": broad}
     if rebalanced and notify:
         try:
+            gate = "" if broad else "\n🛡️ Broad gate RISK-OFF — forced to cash."
             notify(f"🧪 <b>Leveraged shadow rebalance</b> (paper, read-only)\n"
                    f"Now holding: {holdings_txt}\n"
-                   f"Shadow equity: ${equity:,.0f} ({ret:+.1f}% since start)")
+                   f"Shadow equity: ${equity:,.0f} ({ret:+.1f}% since start){gate}")
         except Exception:
             pass
     return summary
+
+
+def _broad_long(hist) -> bool:
+    """Broad-index risk gate: LONG only when BOTH SPY and XIU (TSX 60) are above
+    their 200 SMA. Risk-off if EITHER breaks (the conservative airbag). Fails
+    SAFE — if the gate data is missing, return False (go to cash)."""
+    ok = True
+    for idx in ("SPY", "XIU.TO"):
+        df = hist.get(idx)
+        if df is None:
+            return False
+        px = _last(df); s200 = _last(df, "sma200")
+        if px is None or s200 is None:
+            return False
+        ok = ok and (px > s200)
+    return ok
+
+
+def _liquidate(conn, st, hist, reason):
+    """Sell every holding to cash at current marks and log it. Used by the broad-
+    gate airbag. Mutates st. Returns True if anything was sold."""
+    now = datetime.now(timezone.utc).isoformat()
+    sold = False
+    for t in list(st["holdings"].keys()):
+        px = _last(hist[t]) if t in hist else None
+        pos = st["holdings"].pop(t)
+        sh = float(pos.get("shares") or 0)
+        if px is None or sh <= 0:
+            continue
+        st["cash"] += sh * px * (1 - COST_BPS / 10_000)
+        try:
+            conn.execute(
+                "INSERT INTO lev_shadow_trades (ts, ticker, action, shares, "
+                "price, reason) VALUES (?,?,?,?,?,?)",
+                (now, t, "SELL", round(sh, 4), round(float(px), 4), reason))
+        except Exception:
+            pass
+        sold = True
+    return sold
 
 
 def _rebalance(conn, st, hist, equity):

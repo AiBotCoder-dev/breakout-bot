@@ -2008,10 +2008,11 @@ with tab_today:
         "rather than naked calls (41% of trades < −70%). Built to be COPYABLE on "
         "Wealthsimple: **CAD-listed 2x ETFs** (HQU/HSU/HXU/HEU/HFU/HGU — no 1.5% FX "
         "fee, and 2x is the leverage sweet spot). Weekly rotation into the top-2 "
-        "above their 50 & 200 SMA (cash otherwise), $10k CAD virtual book, marked "
-        "daily and priced with real Wealthsimple fees. Backtest (8y, real fees): "
-        "**+2306% Sortino 1.17** vs HQU buy-hold 0.73 — but a real −51% drawdown "
-        "(2x leverage) this shadow exists to make visible."
+        "above their 50 & 200 SMA, plus a **broad-index airbag** (forces full cash "
+        "when SPY or the TSX 60 breaks its 200 SMA — checked daily). $10k CAD "
+        "virtual book, marked daily and priced with real Wealthsimple fees. Adding "
+        "the airbag (backtest 8y) cut max drawdown from −50% to −23% and nearly "
+        "doubled Calmar (1.20→2.05) for ~12 pts of CAGR — the survival trade."
     )
     try:
         import leveraged_shadow as _lev

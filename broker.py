@@ -692,11 +692,7 @@ class AlpacaPaperBroker:
                 pct = p["unrealized_pct"]
                 pnl = p["unrealized_pnl"]
                 cur_prem = p.get("current", 0) or 0
-            # GUARD: if Alpaca reports no/zero price (illiquid contract, thin
-            # quotes, before-open), do NOT make an exit decision — a 0 price would
-            # look like -100% and falsely trigger a stop. Skip until a real quote.
-            if cur_prem <= 0:
-                continue
+
             parsed = self.parse_occ_symbol(sym)
             is_put = bool(parsed and parsed.get("type") == "put")
             dte = None
@@ -710,6 +706,21 @@ class AlpacaPaperBroker:
             _trail = put_trail_frac if is_put else trail_frac
             _hard = put_hard_stop if is_put else hard_stop_pct
             _dte_floor = 2 if is_put else dte_floor
+
+            # A position at/near expiry MUST be force-closed even with NO quote.
+            # Holding an illiquid deep-OTM option to expiry guarantees -100% and
+            # (once it settles off the book) orphans the journal row. The old
+            # `cur_prem<=0 -> continue` skip ran BEFORE the time-stop, so the
+            # time-stop never fired on these — that's why 46 positions expired
+            # worthless instead of time-stopping. Exempt the DTE time-stop.
+            _force_time = (dte is not None and dte <= _dte_floor)
+
+            # GUARD: without a real quote a 0 price looks like -100% and would
+            # falsely trip a price-based stop — so skip the price logic. But NOT
+            # when the time-stop is due: that must still fire (best-effort close;
+            # reconcile_expired is the backstop if it can't fill).
+            if cur_prem <= 0 and not _force_time:
+                continue
 
             # update peak (+ record first_seen on first sighting)
             prev = _peak_read(sym)

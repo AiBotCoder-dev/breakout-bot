@@ -120,6 +120,24 @@ class OvernightEdge:
                 cur = (pos or {}).get("current") or self.broker.get_price(tk) or 0
                 avg = (pos or {}).get("avg_entry") or float(g("entry_price") or 0)
                 qty = (pos or {}).get("qty") or float(g("qty") or 0)
+                # SELF-HEAL: if the share position no longer exists (settled or
+                # closed elsewhere), a close_position call would fail and leave
+                # this row OPEN forever — which BLOCKS every future buy (the buy
+                # branch requires row is None). That's exactly the stall that
+                # froze this module from 2026-06-19. Instead, reconcile the log at
+                # the best price we have and free the module to trade again.
+                if pos is None:
+                    pnl = (cur - avg) * qty if (cur and avg and qty) else 0.0
+                    pnl_pct = (cur / avg - 1) * 100 if (cur and avg) else 0.0
+                    self.conn.execute(
+                        "UPDATE overnight_edge_log SET status='CLOSED', exit_date=?, "
+                        "exit_time=?, exit_price=?, pnl=?, pnl_pct=? WHERE id=?",
+                        (today, now.strftime("%H:%M"), round(float(cur), 4),
+                         round(float(pnl), 2), round(float(pnl_pct), 3),
+                         int(g("id") or 0)))
+                    print(f"  🌙 overnight RECONCILED (position gone) {tk} "
+                          f"est {pnl_pct:+.2f}% — module unblocked")
+                    return {"action": "reconciled_gone", "pnl_pct": pnl_pct}
                 res = self.broker.close_position(tk)
                 if not res.get("ok"):
                     print(f"  🌙 overnight SELL failed: {res.get('error')}")

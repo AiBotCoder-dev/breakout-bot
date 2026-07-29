@@ -2111,6 +2111,20 @@ def main():
                 except Exception as _xe:
                     print(f"  WARN exit manager failed: {_xe}")
 
+                # RECONCILE EXPIRED — the exit manager only sees LIVE broker
+                # positions, so options that expire (and drop from /v2/positions)
+                # were orphaned as OPEN forever, hiding expired-worthless losers
+                # from the stats. Book them at real intrinsic each cycle so the
+                # journal stays honest and the learning data is complete.
+                try:
+                    from trade_journal import reconcile_expired as _recx
+                    _rx = _recx(conn)
+                    if _rx.get("reconciled"):
+                        print(f"  📕 reconciled {_rx['reconciled']} expired "
+                              f"position(s) (${_rx.get('total_pnl',0):+.0f})")
+                except Exception as _rxe:
+                    print(f"  (expiry reconcile skipped: {_rxe})")
+
                 # LEVERAGED SHADOW — read-only paper book of the Wealthsimple-
                 # copyable CAD 2x rotation + broad-index airbag (the survival-
                 # optimal expression of our directional edge). Self-gates to run

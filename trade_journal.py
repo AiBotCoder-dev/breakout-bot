@@ -186,6 +186,118 @@ def log_exit(conn, contract_symbol, exit_reason, pnl_pct, pnl_dollars,
         print(f"  [journal] log_exit failed: {e}")
 
 
+def reconcile_expired(conn, verbose=False) -> dict:
+    """Book any OPEN journal rows whose option has ALREADY EXPIRED.
+
+    The exit manager only acts on LIVE broker positions. When Alpaca settles an
+    expired option it drops from /v2/positions, so the journal row is orphaned as
+    OPEN forever. Those are almost all expired-worthless calls — hidden losers
+    that inflate the recorded win-rate and understate losses (survivorship that
+    flatters the record). This settles each at its real intrinsic value on the
+    expiry date: intrinsic = max(0, S-K) for calls / max(0, K-S) for puts, where
+    S is the underlying close on the expiry date. Most expire OTM -> -100%.
+
+    Only touches rows whose expiry is STRICTLY in the past, so genuinely-open
+    near-term contracts are left alone. Idempotent and cheap once the backlog is
+    cleared (no expired OPENs -> no downloads)."""
+    _ensure(conn)
+    from datetime import date as _date, timedelta as _td
+    try:
+        from broker import AlpacaPaperBroker as _B
+    except Exception:
+        return {"reconciled": 0, "error": "broker import failed"}
+    try:
+        rows = conn.execute(
+            "SELECT contract_symbol, entry_premium, cost, qty, opened_at "
+            "FROM broker_trade_journal WHERE status='OPEN'").fetchall()
+    except Exception:
+        return {"reconciled": 0}
+
+    today = _date.today()
+    exp = []
+    for r in rows:
+        def _g(k, i, _r=r):
+            return _r.get(k) if hasattr(_r, "get") else _r[i]
+        sym = _g("contract_symbol", 0)
+        p = _B.parse_occ_symbol(str(sym or ""))
+        if not p or p["expiry"] >= today:            # future/undated -> leave OPEN
+            continue
+        exp.append({"sym": sym, "under": p["underlying"], "expiry": p["expiry"],
+                    "type": p["type"], "strike": p["strike"],
+                    "entry": float(_g("entry_premium", 1) or 0),
+                    "cost": (float(_g("cost", 2)) if _g("cost", 2) is not None else None),
+                    "qty": int(_g("qty", 3) or 1), "opened": _g("opened_at", 4)})
+    if not exp:
+        return {"reconciled": 0}
+
+    # underlying close on each expiry date (one small download per underlying)
+    import yfinance as yf
+    import pandas as pd
+    lo = min(e["expiry"] for e in exp); hi = max(e["expiry"] for e in exp)
+    px_cache = {}
+    for u in sorted(set(e["under"] for e in exp)):
+        try:
+            raw = yf.download(u, start=lo - _td(days=7), end=hi + _td(days=4),
+                              progress=False, auto_adjust=True)
+            if raw is None or raw.empty:
+                continue
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = raw.columns.get_level_values(0)
+            px_cache[u] = raw["Close"].dropna()
+        except Exception:
+            continue
+
+    def _close_on(u, d):
+        s = px_cache.get(u)
+        if s is None or s.empty:
+            return None
+        try:
+            sub = s[s.index.date <= d]              # last close on/before expiry
+            return float(sub.iloc[-1]) if len(sub) else None
+        except Exception:
+            return None
+
+    from datetime import datetime as _dt
+    n = 0; booked = []
+    for e in exp:
+        S = _close_on(e["under"], e["expiry"])
+        if S is None:
+            if verbose:
+                print(f"    (skip {e['sym']}: no price for {e['under']} @ {e['expiry']})")
+            continue
+        intrinsic = max(0.0, S - e["strike"]) if e["type"] == "call" \
+            else max(0.0, e["strike"] - S)
+        entry = e["entry"]
+        pct = max(-100.0, (intrinsic / entry - 1) * 100) if entry > 0 else -100.0
+        if e["cost"] and e["cost"] > 0:
+            dollars = round(pct / 100.0 * e["cost"], 2)
+        else:
+            dollars = round((intrinsic - entry) * e["qty"] * 100, 2)
+        try:
+            od = _dt.fromisoformat(str(e["opened"]).replace("Z", "+00:00")).date()
+            hold = (e["expiry"] - od).days
+        except Exception:
+            hold = None
+        closed_at = _dt(e["expiry"].year, e["expiry"].month, e["expiry"].day,
+                        20, 0).isoformat()          # ~market close on expiry day
+        try:
+            conn.execute(
+                "UPDATE broker_trade_journal SET status='CLOSED', "
+                "exit_reason='EXPIRED', exit_premium=?, pnl_pct=?, pnl_dollars=?, "
+                "hold_days=?, closed_at=? WHERE contract_symbol=? AND status='OPEN'",
+                (round(intrinsic, 4), round(pct, 1), dollars, hold, closed_at, e["sym"]))
+            n += 1
+            booked.append((e["sym"], round(pct, 1), dollars))
+        except Exception as ex:
+            if verbose:
+                print(f"    (update failed {e['sym']}: {ex})")
+    if verbose and booked:
+        for sym, pct, d in booked:
+            print(f"    EXPIRED {sym}: {pct:+.0f}%  (${d:+.2f})")
+    return {"reconciled": n, "checked": len(exp),
+            "total_pnl": round(sum(b[2] for b in booked), 2)}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ANALYTICS — the breakdowns that drive optimization
 # ══════════════════════════════════════════════════════════════════════════════

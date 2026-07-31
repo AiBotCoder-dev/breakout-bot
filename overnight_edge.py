@@ -140,8 +140,33 @@ class OvernightEdge:
                     return {"action": "reconciled_gone", "pnl_pct": pnl_pct}
                 res = self.broker.close_position(tk)
                 if not res.get("ok"):
-                    print(f"  🌙 overnight SELL failed: {res.get('error')}")
-                    return {"action": "sell_failed", "error": res.get("error")}
+                    # DEADLOCK GUARD: an overnight trade should live ONE night. If
+                    # the close keeps failing on a position older than a day, we
+                    # must NOT keep returning here — that leaves the row OPEN and
+                    # blocks every future buy (the exact stall since 2026-06-19).
+                    # Retry same-day; but once stale, force-resolve the log row so
+                    # the module can trade again (accept a possible minor desync
+                    # over a permanent freeze).
+                    _stale = True
+                    try:
+                        from datetime import date as _d
+                        _ed = _d.fromisoformat(str(g("entry_date") or "")[:10])
+                        _stale = (now.date() - _ed).days >= 2
+                    except Exception:
+                        _stale = True
+                    if not _stale:
+                        print(f"  🌙 overnight SELL failed (will retry): {res.get('error')}")
+                        return {"action": "sell_failed", "error": res.get("error")}
+                    print(f"  🌙 overnight SELL force-resolved (stale, close "
+                          f"failed: {res.get('error')}) — module unblocked")
+                    self.conn.execute(
+                        "UPDATE overnight_edge_log SET status='CLOSED', exit_date=?, "
+                        "exit_time=?, exit_price=?, pnl=?, pnl_pct=? WHERE id=?",
+                        (today, now.strftime("%H:%M"), round(float(cur), 4),
+                         round((cur - avg) * qty if (cur and avg and qty) else 0.0, 2),
+                         round((cur / avg - 1) * 100 if (cur and avg) else 0.0, 3),
+                         int(g("id") or 0)))
+                    return {"action": "sell_force_resolved"}
                 pnl = (cur - avg) * qty if (cur and avg and qty) else 0.0
                 pnl_pct = (cur / avg - 1) * 100 if (cur and avg) else 0.0
                 self.conn.execute(

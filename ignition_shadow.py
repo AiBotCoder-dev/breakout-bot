@@ -4,11 +4,13 @@ ignition_shadow.py — READ-ONLY paper hunter for igniting pumps & crashes.
 Two validated convex sleeves (backtests: ignition_detector.py, convex_put_backtest.py),
 run in PAPER so we watch their LIVE expectancy before risking a cent:
 
-  PUMP  — RVOL > 3 AND today up > 5%  ->  buy a 2% OTM CALL, ~10 DTE, hold to expiry.
-          (volume-backed pumps keep running: +2.7% continuation, +15.8% option EV.)
-  CRASH — close < EMA20 AND 5-day return < -4%  ->  buy a 5% OTM PUT, ~7 DTE, hold
-          to expiry. The EARLY breakdown, NOT the panic day (reacting to the crash
-          day is -EV; catching the slow break is +20% EV).
+  PUMP  — breakout near 20d-highs (px>=98% of 20d-high, price>EMA20>EMA50, 10d>+6%)
+          OR a sharp 5-day thrust >+10%, with RVOL>1.2  ->  buy a 2% OTM CALL, ~10
+          DTE, hold to expiry. Rebuilt to catch GRINDING runs, not just explosive
+          days (5y catch rate 36% vs 9% for the old RVOL+5%-day trigger).
+  CRASH — early breakdown (close<EMA20 AND 5-day return<-4%) OR a sharp -6% down-day
+          ->  buy a 5% OTM PUT, ~7 DTE, hold to expiry (5y catch rate 86%). The
+          EARLY breakdown, not the panic-day reaction (which is -EV).
 
 Both are tail-hunters: ~70-75% of trades expire worthless, a rare few pay big, and
 the whole edge is hold-to-expiry (a -50% stop INVERTS it). So this NEVER uses a
@@ -87,9 +89,12 @@ def _history(tickers, days=160):
                     continue
                 c = df["Close"]
                 df["ema20"] = c.ewm(span=20).mean()
+                df["ema50"] = c.ewm(span=50).mean()
                 df["rv20"] = np.log(c / c.shift()).rolling(20).std() * np.sqrt(252)
                 df["ret1"] = c.pct_change()
                 df["ret5"] = c / c.shift(5) - 1
+                df["ret10"] = c / c.shift(10) - 1
+                df["hi20"] = c.rolling(20).max()
                 if "Volume" in df:
                     df["rvol"] = df["Volume"] / df["Volume"].rolling(20).mean()
                 else:
@@ -131,13 +136,21 @@ def step(conn, force=False, notify=None):
         if px is None:
             continue
         rvol = _f(df, "rvol") or 0.0; ret1 = _f(df, "ret1") or 0.0
-        ema = _f(df, "ema20"); ret5 = _f(df, "ret5") or 0.0
+        ret5 = _f(df, "ret5") or 0.0; ret10 = _f(df, "ret10") or 0.0
+        ema20 = _f(df, "ema20"); ema50 = _f(df, "ema50"); hi20 = _f(df, "hi20")
         rv = _f(df, "rv20") or 0.4
-        # PUMP
-        if rvol > RVOL_MIN and ret1 > PUMP_MOVE and (t, "pump") not in open_keys:
+        # PUMP (rebuilt — catches grinding runs, not just explosive days; 5y catch
+        # 36% vs 9% for the old RVOL+5%-day trigger). Breakout near 20d-highs in an
+        # uptrend with 10d thrust, OR a sharp 5-day thrust; RVOL>1.2 filters drift.
+        pump = (rvol > 1.2 and (
+            (None not in (ema20, ema50, hi20) and px >= 0.98 * hi20 and px > ema20
+             and ema20 > ema50 and ret10 > 0.06) or ret5 > 0.10))
+        # CRASH (rebuilt — 5y catch 86%): early breakdown below EMA20 + weak week,
+        # OR a sharp -6% down-day.
+        crash = ((ema20 is not None and px < ema20 and ret5 < -0.04) or ret1 < -0.06)
+        if pump and (t, "pump") not in open_keys:
             new_signals.append(_open(conn, t, "pump", "call", px, rv))
-        # CRASH (early breakdown, not panic day)
-        elif ema is not None and px < ema and ret5 < CRASH_RET5 and (t, "crash") not in open_keys:
+        elif crash and (t, "crash") not in open_keys:
             new_signals.append(_open(conn, t, "crash", "put", px, rv))
 
     marked = _mark_and_settle(conn, hist)

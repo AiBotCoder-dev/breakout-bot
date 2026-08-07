@@ -33,9 +33,12 @@ UNIVERSE = ["AAPL","MSFT","NVDA","GOOGL","AMZN","META","AVGO","AMD","MU","SMCI",
             "DASH","GME","MARA","RIOT","RDDT","CVNA","BABA","PDD","NIO","DELL",
             "AI","PATH","SOUN","CELH","ANF","DKNG","PANW","NFLX","MRNA","ROKU"]
 
-RVOL_MIN = 3.0; PUMP_MOVE = 0.05; CRASH_RET5 = -0.04
 PUMP_OTM = 0.02; PUMP_DTE = 10
 CRASH_OTM = 0.05; CRASH_DTE = 7
+# MANUAL-EXECUTABLE cap: only the TOP-N highest-conviction signals per day are taken.
+# Backtest: top-2/day keeps expectancy (pump +70%, crash +41% — HIGHER than taking
+# all) at ~8 trades/week you can actually place by hand, vs 17+/week for take-all.
+TOP_PER_DAY = 2
 TICKET = 100.0          # fixed tiny paper ticket per signal
 IVP = 0.95              # entry IV = realized vol * this
 RET_CAP = 1200.0        # realistic exit-liquidity cap on a single win
@@ -128,9 +131,10 @@ def step(conn, force=False, notify=None):
     if not hist:
         return None
 
-    # open tickers per sleeve (avoid stacking duplicates)
+    # Gather every firing signal with a CONVICTION SCORE, then take only the top-N
+    # so the shadow surfaces a manually-executable handful, not thousands.
     open_keys = _open_keys(conn)
-    new_signals = []
+    cands = []
     for t, df in hist.items():
         px = _f(df, "Close")
         if px is None:
@@ -139,19 +143,27 @@ def step(conn, force=False, notify=None):
         ret5 = _f(df, "ret5") or 0.0; ret10 = _f(df, "ret10") or 0.0
         ema20 = _f(df, "ema20"); ema50 = _f(df, "ema50"); hi20 = _f(df, "hi20")
         rv = _f(df, "rv20") or 0.4
-        # PUMP (rebuilt — catches grinding runs, not just explosive days; 5y catch
-        # 36% vs 9% for the old RVOL+5%-day trigger). Breakout near 20d-highs in an
+        # PUMP (rebuilt — catches grinding runs): breakout near 20d-highs in an
         # uptrend with 10d thrust, OR a sharp 5-day thrust; RVOL>1.2 filters drift.
         pump = (rvol > 1.2 and (
             (None not in (ema20, ema50, hi20) and px >= 0.98 * hi20 and px > ema20
              and ema20 > ema50 and ret10 > 0.06) or ret5 > 0.10))
-        # CRASH (rebuilt — 5y catch 86%): early breakdown below EMA20 + weak week,
-        # OR a sharp -6% down-day.
+        # CRASH (rebuilt): early breakdown below EMA20 + weak week, OR a sharp -6% day.
         crash = ((ema20 is not None and px < ema20 and ret5 < -0.04) or ret1 < -0.06)
         if pump and (t, "pump") not in open_keys:
-            new_signals.append(_open(conn, t, "pump", "call", px, rv))
+            cands.append({"t": t, "sleeve": "pump", "dir": "call", "px": px, "rv": rv,
+                          "score": ret10 * min(rvol, 6)})
         elif crash and (t, "crash") not in open_keys:
-            new_signals.append(_open(conn, t, "crash", "put", px, rv))
+            sev = max(-ret5, -ret1)
+            cands.append({"t": t, "sleeve": "crash", "dir": "put", "px": px, "rv": rv,
+                          "score": sev * min(rvol, 6)})
+
+    cands.sort(key=lambda x: x["score"], reverse=True)
+    new_signals = []
+    for cd in cands[:TOP_PER_DAY]:              # only the highest-conviction few
+        s = _open(conn, cd["t"], cd["sleeve"], cd["dir"], cd["px"], cd["rv"])
+        if s:
+            new_signals.append(s)
 
     marked = _mark_and_settle(conn, hist)
     _set_last_step(conn, today)

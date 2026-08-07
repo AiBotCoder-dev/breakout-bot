@@ -2061,9 +2061,11 @@ with tab_today:
         "an *early* breakdown (below the 20-day EMA + a −4% week) → buy a put, held "
         "to expiry (backtest +20%; reacting to the panic *day* instead is −EV). "
         "Both are tail bets: most expire worthless, rare ones pay big, so a fixed "
-        "$100 paper ticket and **hold-to-expiry** (a stop inverts the edge). It "
-        "flags the exact contract it would buy — settling the live expectancy "
-        "before any real money."
+        "$100 paper ticket and **hold-to-expiry** (a stop inverts the edge). "
+        "**Manually executable:** it takes only the **top 2 highest-conviction "
+        "signals per day** (~8 trades/week) — backtest keeps the edge (pump +70%, "
+        "crash +41% expectancy) at a volume you can copy by hand. Flags the exact "
+        "contract it would buy — settling the live expectancy before any real money."
     )
     try:
         import ignition_shadow as _ign

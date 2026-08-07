@@ -8,13 +8,21 @@ name: Position Monitor
 # The monitor.py script uses MarketClock to skip CLOSED/AVOID windows.
 
 on:
-  schedule:
-    # GitHub frequently DROPS high-frequency '*/5' crons on busy public runners.
-    # Explicit minute lists are honored far more reliably than '*/N'.
-    # Fires ~every 10 min across the session (13:00-20:50 UTC, Mon-Fri).
-    - cron: '0,10,20,30,40,50 13-20 * * 1-5'
+  # Single trigger: the external cron-job.org scheduler (workflow_dispatch).
+  # GitHub's own `schedule:` cron was REMOVED 2026-08 — it double-fired alongside
+  # cron-job.org and, with no concurrency guard, the overlapping runs piled up past
+  # GitHub's concurrent-job ceiling, so ~half failed with "not acquired by Runner
+  # of type hosted". One trigger + the concurrency guard below keeps runs orderly.
+  workflow_dispatch:               # fired by cron-job.org (and manual UI runs)
 
-  workflow_dispatch:               # also allow manual trigger from GitHub UI
+# Never let monitor runs pile up: at most ONE run in progress, and at most one
+# queued behind it (GitHub collapses older pending runs in the same group). Use
+# cancel-in-progress:false so a run that may be mid-trade is NEVER killed — the
+# newest trigger simply waits its turn. This is the core fix for the runner-
+# starvation failures.
+concurrency:
+  group: position-monitor
+  cancel-in-progress: false
 
 jobs:
   monitor:

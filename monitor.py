@@ -2141,6 +2141,19 @@ def main():
                 except Exception as _lse:
                     print(f"  (leveraged shadow skipped: {_lse})")
 
+                # IGNITION SHADOW — read-only paper hunter for igniting pumps
+                # (RVOL+breakout -> call) and early-breakdown crashes (-> put),
+                # both held to expiry. Self-gates to once/UTC-day; NEVER touches
+                # the broker. Flags the contract it would buy via Telegram.
+                try:
+                    import ignition_shadow as _ign
+                    _is = _ign.step(conn, notify=send_telegram)
+                    if _is and _is.get("new"):
+                        print(f"  🎯 ignition shadow: {_is['new']} new signal(s) "
+                              f"{_is.get('signals')}, {_is.get('settled',0)} settled")
+                except Exception as _ise:
+                    print(f"  (ignition shadow skipped: {_ise})")
+
                 acct = _ob.get_account()
                 real_equity = acct.get("equity", 0)
                 # Size to the OVERRIDE if set (e.g. trade $100k paper as $1k)

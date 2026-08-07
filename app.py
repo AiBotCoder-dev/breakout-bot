@@ -2052,6 +2052,49 @@ with tab_today:
     except Exception as _lee:
         st.caption(f"(leveraged shadow unavailable: {_lee})")
 
+    # ── 🎯 IGNITION SHADOW — paper hunter for pumps & crashes ─────────────────
+    st.markdown("### 🎯 Ignition Shadow — Catching Pumps & Crashes (Paper)")
+    st.caption(
+        "Read-only PAPER hunter (never touches the real account). Two validated "
+        "convex sleeves: **PUMP** — a volume explosion (RVOL>3) + a >5% up-day → "
+        "buy a call (backtest +15.8% expectancy, momentum continues). **CRASH** — "
+        "an *early* breakdown (below the 20-day EMA + a −4% week) → buy a put, held "
+        "to expiry (backtest +20%; reacting to the panic *day* instead is −EV). "
+        "Both are tail bets: most expire worthless, rare ones pay big, so a fixed "
+        "$100 paper ticket and **hold-to-expiry** (a stop inverts the edge). It "
+        "flags the exact contract it would buy — settling the live expectancy "
+        "before any real money."
+    )
+    try:
+        import ignition_shadow as _ign
+        _ir = _ign.report(conn)
+        _c1, _c2, _c3 = st.columns(3)
+        _p = _ir["sleeves"].get("pump", {}); _cr = _ir["sleeves"].get("crash", {})
+        _c1.metric("🚀 Pump sleeve",
+                   f"{_p.get('expectancy',0):+.0f}% exp",
+                   f"{_p.get('n',0)} closed · {_p.get('win',0):.0f}% win")
+        _c2.metric("💥 Crash sleeve",
+                   f"{_cr.get('expectancy',0):+.0f}% exp",
+                   f"{_cr.get('n',0)} closed · {_cr.get('win',0):.0f}% win")
+        _c3.metric("Paper P&L ($100/bet)", f"${_ir.get('total_pnl',0):+,.0f}",
+                   f"{_ir.get('open',0)} open")
+        _rec = _ir.get("recent", [])
+        if _rec:
+            import pandas as _pdi
+            st.dataframe(_pdi.DataFrame([
+                {"When": (r.get("ts") or "")[:10], "Ticker": r.get("ticker"),
+                 "Sleeve": r.get("sleeve"), "Buys": (r.get("direction") or "").upper(),
+                 "Strike": r.get("strike"), "Status": r.get("status"),
+                 "P&L %": r.get("pnl_pct")} for r in _rec]),
+                use_container_width=True, hide_index=True)
+        _ntot = sum(s.get("n", 0) for s in _ir["sleeves"].values())
+        if _ntot < 20:
+            st.info(f"Only {_ntot} signals resolved so far — tail strategies need many "
+                    "bets (50+) before the expectancy means anything. Accumulating.",
+                    icon="⏳")
+    except Exception as _iee:
+        st.caption(f"(ignition shadow unavailable: {_iee})")
+
     # ── TRADE JOURNAL — attribution analytics (drives optimization) ───────────
     # ── 👻 GHOST EXITS — shadow exit-policy A/B test (reviewer idea #3) ─────────
     st.markdown("### 👻 Ghost Exits — Which Exit Policy Would Win?")

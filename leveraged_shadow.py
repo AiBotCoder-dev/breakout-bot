@@ -1,6 +1,14 @@
 """
 leveraged_shadow.py — READ-ONLY paper shadow of the leveraged-ETF strategy.
 
+PRICING (rebuilt 2026-08): the tradeable products are CAD-listed 2x ETFs, but
+yfinance cannot quote .TO tickers reliably (their feed froze for 3 weeks and the
+book silently marked a dead price). So every CAD ETF is now SYNTHESISED as a 2x
+daily-rebalanced series off a fresh US underlying — see PROXY / _history(). The
+signals still name the CAD ticker you'd buy on Wealthsimple; only the marking
+changed. Two of the six mappings are approximations (HEU/HFU track CANADIAN sector
+indices) and are flagged as such in report().
+
 Why this exists
 ---------------
 Six weeks of live options trading and a stack of reviewer-driven tests
@@ -55,18 +63,45 @@ import json
 from datetime import datetime, timezone, date, timedelta
 
 # CAD-listed 2x ETFs — Wealthsimple-tradeable, NO 1.5% FX fee (they trade in CAD
-# on the TSX), and 2x matches the leverage-sweep optimum. yfinance uses .TO.
+# on the TSX), and 2x matches the leverage-sweep optimum.
 #   HQU 2x Nasdaq-100 · HSU 2x S&P500 · HXU 2x TSX60 ·
 #   HEU 2x energy · HFU 2x financials · HGU 2x gold miners
 UNIVERSE = ["HQU.TO", "HSU.TO", "HXU.TO", "HEU.TO", "HFU.TO", "HGU.TO"]
+
+# ── PRICING VIA US PROXIES (2026-08 rebuild) ────────────────────────────────
+# yfinance CANNOT price .TO tickers reliably — their data froze at 2026-07-17 while
+# US tickers stayed current, so the shadow silently marked a dead feed for 12 days
+# (equity stuck at $9,991.99 to the cent). Fix: never quote .TO directly. Instead
+# rebuild each CAD 2x ETF SYNTHETICALLY from a fresh US underlying:
+#     synthetic[i] = synthetic[i-1] * (1 + LEV*underlying_daily_return - drag)
+# Daily compounding means volatility decay is modelled inherently, and the drag
+# models MER + borrow + tracking error that a pure 2x math series would ignore.
+#
+# MAPPING ACCURACY — be honest about this:
+#   HQU -> QQQ  EXACT   (HQU tracks the Nasdaq-100, CAD-hedged)
+#   HSU -> SPY  EXACT   (HSU tracks the S&P 500, CAD-hedged)
+#   HXU -> EWC  CLOSE   (EWC = MSCI Canada vs HXU's S&P/TSX 60 — highly correlated)
+#   HGU -> GDX  CLOSE   (both global/Canadian-heavy gold miners)
+#   HEU -> XLE  APPROX  (HEU tracks CANADIAN energy — oil sands/pipelines — vs US energy)
+#   HFU -> XLF  APPROX  (HFU tracks CANADIAN banks vs US financials)
+# The two APPROX names are correlated but NOT the same index, so their live signals
+# are indicative rather than exact. Flagged in report() so it's never mistaken for
+# a true quote of the tradeable CAD product.
+PROXY = {"HQU.TO": "QQQ", "HSU.TO": "SPY", "HXU.TO": "EWC",
+         "HEU.TO": "XLE", "HFU.TO": "XLF", "HGU.TO": "GDX"}
+APPROX = {"HEU.TO", "HFU.TO"}      # index mismatch — signals are indicative only
+LEV = 2.0                          # the CAD products are 2x daily
+SYNTH_ANNUAL_DRAG = 0.015          # ~1.15% MER + borrow/tracking (synthetic flatters)
+BROAD_GATE_TICKERS = ("SPY", "EWC")  # US-listed, always fresh (XIU.TO was stale)
+
 TOP_K = 2                 # equal-weight the top-2 in an uptrend
 START_EQUITY = 10_000.0   # virtual book size, CAD (paper; unrelated to real account)
 REBAL_DAYS = 7            # weekly rebalance cadence
 # Wealthsimple cost: $0 commission, and CAD-listed => NO FX fee. The only real
-# per-trade cost is the bid/ask spread (~0.08%/side on a leveraged ETF). The ETF's
-# MER + decay are already inside its real .TO price history.
+# per-trade cost is the bid/ask spread (~0.08%/side on a leveraged ETF).
 COST_BPS = 8.0            # bid/ask spread per side (Wealthsimple, CAD-listed)
 MOM_LOOKBACK = 63         # 3-month momentum, matches the backtest
+SYNTH_BASE = 100.0        # synthetic series is an INDEX LEVEL, not a CAD quote
 
 
 # ── tables ──────────────────────────────────────────────────────────────────
@@ -146,34 +181,63 @@ def _save_state(conn, st):
         pass
 
 
-# ── market data (free yfinance only) ─────────────────────────────────────────
-def _history(tickers, days=420):
-    """Download recent daily closes for a set of tickers. Returns {t: DataFrame}
-    with Close/sma50/sma200/mom columns. Never raises."""
+# ── market data (free yfinance, US tickers only — .TO is unreliable) ─────────
+def _history(cad_tickers, days=520):
+    """Build the price history the shadow trades on.
+
+    Returns {ticker: DataFrame(Close, sma50, sma200, mom)} containing BOTH:
+      * each CAD 2x ETF, SYNTHESISED as a 2x daily-rebalanced series off its fresh
+        US underlying (see PROXY) with an MER/borrow drag, and
+      * the raw US index tickers used for benchmarking and the broad gate.
+    Never raises; a ticker that fails to download is simply absent.
+    """
     out = {}
     try:
         import yfinance as yf
-        import numpy as np  # noqa: F401
         import pandas as pd
+        cad_tickers = list(cad_tickers)
+        proxies = {PROXY[t] for t in cad_tickers if t in PROXY}
+        raws = sorted(proxies | set(BROAD_GATE_TICKERS) | {"SPY", "QQQ"})
         end = datetime.now()
         start = end - timedelta(days=days)
-        raw = yf.download(list(tickers), start=start, end=end, progress=False,
+        raw = yf.download(raws, start=start, end=end, progress=False,
                           auto_adjust=True, group_by="ticker", threads=True)
-        for t in tickers:
+
+        def _grab(sym):
             try:
-                if isinstance(raw.columns, pd.MultiIndex):
-                    df = raw[t].dropna(subset=["Close"]).copy()
-                else:
-                    df = raw.dropna(subset=["Close"]).copy()
-                if df is None or df.empty or len(df) < 210:
-                    continue
-                c = df["Close"]
-                df["sma50"] = c.rolling(50).mean()
-                df["sma200"] = c.rolling(200).mean()
-                df["mom"] = c / c.shift(MOM_LOOKBACK) - 1
-                out[t] = df
+                df = (raw[sym] if isinstance(raw.columns, pd.MultiIndex) else raw)
+                df = df.dropna(subset=["Close"]).copy()
+                return df if len(df) >= 210 else None
             except Exception:
+                return None
+
+        def _decorate(df):
+            c = df["Close"]
+            df["sma50"] = c.rolling(50).mean()
+            df["sma200"] = c.rolling(200).mean()
+            df["mom"] = c / c.shift(MOM_LOOKBACK) - 1
+            return df
+
+        # raw US tickers (benchmarks + broad gate) — used as-is
+        under = {}
+        for sym in raws:
+            d = _grab(sym)
+            if d is not None:
+                under[sym] = d
+                out[sym] = _decorate(d.copy())
+
+        # CAD 2x ETFs — synthesised from their underlying's daily returns
+        daily_drag = SYNTH_ANNUAL_DRAG / 252.0
+        for t in cad_tickers:
+            sym = PROXY.get(t)
+            d = under.get(sym)
+            if d is None:
                 continue
+            r = d["Close"].pct_change().fillna(0.0)
+            lev_r = LEV * r - daily_drag          # 2x daily + cost => decay is inherent
+            synth = (1.0 + lev_r).cumprod() * SYNTH_BASE
+            sdf = pd.DataFrame({"Close": synth}, index=d.index)
+            out[t] = _decorate(sdf)
     except Exception:
         pass
     return out
@@ -199,20 +263,19 @@ def step(conn, force=False, notify=None):
     if not force and st.get("last_step") == today:
         return None                       # already ran today
 
-    # Need history for the union of current holdings + universe (rebalance may
-    # rotate into any of them) + the broad-gate indices. One pull per day is cheap.
-    tickers = sorted(set(UNIVERSE) | set(st["holdings"].keys())
-                     | {"SPY", "QQQ", "XIU.TO"})
+    # Universe + anything still held (a delisted/removed name must still be marked).
+    # _history() resolves each CAD ticker to its fresh US underlying and also
+    # returns the raw index tickers. One pull per day is cheap.
+    tickers = sorted(set(UNIVERSE) | set(st["holdings"].keys()))
     hist = _history(tickers)
     if not hist:
         return None                       # data outage; try again next cycle
 
-    # STALENESS GUARD — yfinance data for CAD .TO tickers can FREEZE (observed
-    # stuck ~3 weeks at 2026-07-17). Marking holdings at stale prices produces a
-    # fake-flat equity that looks like "underperformance" but is a dead feed. If
-    # the freshest price among the CAD names is >4 calendar days old, refuse to
-    # mark/rebalance/snapshot — record the staleness honestly instead of a lie.
-    _cad = [t for t in (set(st["holdings"].keys()) | set(UNIVERSE)) if t.endswith(".TO")]
+    # STALENESS GUARD — kept as a safety net. Prices now come from US underlyings
+    # (always fresh), but if a feed ever freezes again the shadow must refuse to
+    # mark rather than repeat the 2026-07 failure, where .TO data stuck at
+    # 2026-07-17 and the book silently held $9,991.99 to the cent for 12 days.
+    _cad = [t for t in (set(st["holdings"].keys()) | set(UNIVERSE)) if t in hist]
     _fresh = None
     for t in _cad:
         df = hist.get(t)
@@ -298,11 +361,12 @@ def step(conn, force=False, notify=None):
 
 
 def _broad_long(hist) -> bool:
-    """Broad-index risk gate: LONG only when BOTH SPY and XIU (TSX 60) are above
-    their 200 SMA. Risk-off if EITHER breaks (the conservative airbag). Fails
-    SAFE — if the gate data is missing, return False (go to cash)."""
+    """Broad-index risk gate: LONG only when BOTH the US (SPY) and Canada (EWC,
+    standing in for the TSX — XIU.TO's feed is unreliable) are above their 200
+    SMA. Risk-off if EITHER breaks (the conservative airbag). Fails SAFE — if the
+    gate data is missing, return False (go to cash)."""
     ok = True
-    for idx in ("SPY", "XIU.TO"):
+    for idx in BROAD_GATE_TICKERS:
         df = hist.get(idx)
         if df is None:
             return False
@@ -418,7 +482,10 @@ def report(conn) -> dict:
     except Exception:
         curve = []
 
-    out = {"holdings": sorted(st["holdings"].keys()) or ["CASH"],
+    _held = sorted(st["holdings"].keys())
+    out = {"holdings": _held or ["CASH"],
+           "priced_via": {t: PROXY.get(t) for t in _held if t in PROXY},
+           "approx": [t for t in _held if t in APPROX],
            "cash": round(st["cash"], 2),
            "start_equity": st["start_equity"],
            "started_at": st.get("started_at"),

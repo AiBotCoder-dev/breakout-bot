@@ -207,6 +207,28 @@ def step(conn, force=False, notify=None):
     if not hist:
         return None                       # data outage; try again next cycle
 
+    # STALENESS GUARD — yfinance data for CAD .TO tickers can FREEZE (observed
+    # stuck ~3 weeks at 2026-07-17). Marking holdings at stale prices produces a
+    # fake-flat equity that looks like "underperformance" but is a dead feed. If
+    # the freshest price among the CAD names is >4 calendar days old, refuse to
+    # mark/rebalance/snapshot — record the staleness honestly instead of a lie.
+    _cad = [t for t in (set(st["holdings"].keys()) | set(UNIVERSE)) if t.endswith(".TO")]
+    _fresh = None
+    for t in _cad:
+        df = hist.get(t)
+        if df is not None and len(df):
+            try:
+                ld = df.index[-1].date()
+                _fresh = ld if _fresh is None else max(_fresh, ld)
+            except Exception:
+                pass
+    _stale_days = (date.today() - _fresh).days if _fresh else 999
+    if _stale_days > 4:
+        st["last_step"] = today
+        _save_state(conn, st)
+        return {"stale": True, "stale_days": _stale_days,
+                "last_data": str(_fresh), "holdings": sorted(st["holdings"].keys())}
+
     # 1) mark current holdings to market
     equity = st["cash"]
     for t, pos in list(st["holdings"].items()):

@@ -2133,7 +2133,11 @@ def main():
                 try:
                     import leveraged_shadow as _lev
                     _ls = _lev.step(conn, notify=send_telegram)
-                    if _ls:
+                    if _ls and _ls.get("stale"):
+                        print(f"  🧪 leveraged shadow: ⚠️ CAD price data STALE "
+                              f"({_ls['stale_days']}d old, last {_ls['last_data']}) — "
+                              f"not marking (dead yfinance feed for .TO tickers)")
+                    elif _ls:
                         print(f"  🧪 leveraged shadow: ${_ls['equity']:,.0f} "
                               f"({_ls['return_pct']:+.1f}%) holding "
                               f"{','.join(_ls['holdings']) or 'CASH'}"

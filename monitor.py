@@ -2416,14 +2416,17 @@ def main():
                         from winner_gate import (compute_entry_features as _wgcf,
                                                  evaluate as _wgeval)
                         _wg_feats = _wgcf(s["ticker"], otm_pct=s.get("otm_pct"),
-                                          dte=s.get("dte"), iv=s.get("iv"))
+                                          dte=s.get("dte"), iv=s.get("iv"),
+                                          direction=_otype)
                         if _wg_feats:
-                            _wgr = _wgeval(_wg_feats)
+                            _wgr = _wgeval(_wg_feats, _otype)
                             _wg_passed = bool(_wgr["passed"])
                             _wg_score = _wgr["score"]
                             _wg_on = (os.environ.get("WINNER_GATE", "off").strip()
                                       .lower() in ("on", "1", "true", "enforce"))
-                            if _otype == "call" and not _wg_passed:
+                            # DIRECTION-AWARE: gate both calls (momentum) and puts
+                            # (breakdown), not just calls. Still default-OFF (shadow).
+                            if not _wg_passed:
                                 if _wg_on:
                                     print(f"    ⛔ {s['ticker']:6s} — winner gate REJECT "
                                           f"(score {_wg_score:.0f}): "

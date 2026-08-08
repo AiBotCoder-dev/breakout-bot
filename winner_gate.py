@@ -1,47 +1,49 @@
 """
-winner_gate.py — META-LABEL filter that separates likely WINNERS from likely
-losers, sitting IN FRONT of the existing strategy.
+winner_gate.py — DIRECTION-AWARE meta-label filter (separates winners from losers).
 
-It changes NOTHING about how signals are generated. The primary strategy still
-produces the same candidates; the gate only decides which of them to ACT on (and,
-later, which to size up). This is the "meta-labeling" approach (board issue #6).
+It sits in front of the strategy and grades each candidate trade 0..100, and can
+veto the weak ones. It changes NOTHING about how signals are generated.
 
-Four pre-trade separators, drawn from the bot's own win/loss history (the trailing
-winners were real trends that moved; the losers were unreachable strikes that
-theta-died, entries bought at the highs, below-trend signals, and data-floor
-explore tickets):
+WHY THIS WAS REBUILT (2026-08): the original gate scored EVERY trade on bullish-call
+logic — reward uptrend, punish "chasing", require positive momentum. But the audit
+of 131 graded trades showed that logic is INVERTED versus reality:
+    trades the old gate APPROVED -> net -$92   (it picked losers)
+    trades the old gate REJECTED -> net +$746  (it threw away winners)
+It rejected 18 winners worth +$3,928 — including the TSLA put (+$2,915) it scored
+18.4 — because the bot's real edge is CONVEX/PUT bets in DOWNTRENDS, which the
+bullish gate always failed. Calls bled (-$3,278); puts won (+$2,777).
 
-  1. Strike REACHABILITY — the strike's distance OTM must be within ~1 sigma of the
-     expected move over the hold. Kills the theta-death lottery tickets (the SMH
-     TIME_STOP, the +15%-OTM/9-DTE PLTR call).
-  2. Don't CHASE — skip entries at the top of the recent range / the 10-day high.
-     Kills the same-day stop-outs (CSCO/PLTR bought at the open high).
-  3. Full TREND alignment — price>sma50>sma200 AND mom_6m >= MOM_MIN (the VALIDATED
-     bar; the live scan currently uses 0.05, half of it).
-  4. No FREE PASS — data-floor "explore" trades face the same gate (they were
-     disproportionately losers, e.g. the -$97 UNH).
+So the gate is now DIRECTION-AWARE — it grades a CALL on momentum quality and a PUT
+on BREAKDOWN quality, using the features the ignition backtests validated:
 
-PUBLIC API:
-  evaluate(features) -> {passed: bool, score: float 0..100, reasons: [str], reach}
-  compute_entry_features(ticker, otm_pct, dte, iv) -> feature dict (live helper)
-  expected_move / reachability — the strike-reachability math (shared with backtest)
+  CALL (bullish) — reward: real uptrend, strong 6-mo momentum, reachable strike,
+                   a breakout (high in its range is FINE for momentum).
+  PUT  (convex)  — reward: NOT an uptrend, price low in its range / breaking down,
+                   a sharp recent 5-day drop, reachable put strike. This is the
+                   crash/breakdown profile that actually pays.
 
-All thresholds are env-overridable so they can be tuned/swept without code edits.
+Strike REACHABILITY (shared): the strike's distance OTM must be within ~1 sigma of
+the expected move over the hold — kills the theta-death lottery tickets, both ways.
+
+PUBLIC API (back-compatible):
+  evaluate(features, direction="call") -> {passed, score 0..100, reasons, reach}
+  compute_entry_features(ticker, otm_pct, dte, iv, direction) -> feature dict
+All thresholds env-overridable.
 """
 from __future__ import annotations
 import math
 import os
 
-# ── thresholds (env-overridable) ────────────────────────────────────────────
-REACH_MAX = float(os.environ.get("WG_REACH_MAX", "1.0"))    # strike <= ~1 sigma move
-CHASE_MAX = float(os.environ.get("WG_CHASE_MAX", "0.85"))   # position in 20-day range
-MOM_MIN   = float(os.environ.get("WG_MOM_MIN", "0.10"))     # validated momentum bar
-REQUIRE_UPTREND = os.environ.get("WG_REQUIRE_UPTREND", "1").strip().lower() \
-    not in ("0", "false", "no", "off", "")
+REACH_MAX = float(os.environ.get("WG_REACH_MAX", "1.2"))     # strike <= ~1.2 sigma move
+MOM_MIN   = float(os.environ.get("WG_MOM_MIN", "0.10"))      # call momentum bar
+PUT_RNG_MAX = float(os.environ.get("WG_PUT_RNG_MAX", "0.45"))  # put must be low in range
+PASS_SCORE = float(os.environ.get("WG_PASS_SCORE", "50"))    # min score to pass
+
+
+def _clamp(x, lo, hi): return max(lo, min(hi, x))
 
 
 def expected_move(rv, dte) -> float:
-    """1-sigma expected move (as a fraction) over `dte` calendar days at vol `rv`."""
     try:
         return float(rv) * math.sqrt(max(1, int(dte)) / 252.0)
     except Exception:
@@ -49,73 +51,83 @@ def expected_move(rv, dte) -> float:
 
 
 def reachability(otm_pct, rv, dte) -> float:
-    """Strike distance OTM in units of the expected move. <=1.0 means the strike is
-    within ~1 sigma (reachable); large means the option needs a move it rarely makes."""
+    """Strike distance OTM in units of the expected move. <=1 == within ~1 sigma."""
     em = expected_move(rv, dte)
     if em <= 0:
         return 99.0
     try:
-        return float(otm_pct) / em
+        return abs(float(otm_pct)) / em
     except Exception:
         return 99.0
 
 
-def _score(in_uptrend, mom_6m, rng_pos, reach) -> float:
-    """0..100 'winner score' — also usable later for position sizing."""
-    s = 0.0
-    s += 30.0 if in_uptrend else 0.0
+# ── direction-aware scoring ─────────────────────────────────────────────────
+def _score_call(in_uptrend, mom_6m, rng_pos, reach):
+    s = 30.0 if in_uptrend else 0.0
     if mom_6m is not None:
-        s += max(0.0, min(25.0, (float(mom_6m) / 0.40) * 25.0))
-    if rng_pos is not None:
-        s += max(0.0, min(20.0, (1.0 - float(rng_pos)) * 20.0))
+        s += _clamp(float(mom_6m) / 0.40 * 30.0, 0, 30)      # momentum strength
     if reach is not None:
-        s += max(0.0, min(25.0, (1.0 - min(float(reach), 2.0) / 2.0) * 25.0))
+        s += _clamp((1.0 - min(float(reach), 2.0) / 2.0) * 25.0, 0, 25)
+    if rng_pos is not None:
+        s += _clamp(float(rng_pos) * 15.0, 0, 15)            # breakout = high in range OK
     return round(s, 1)
 
 
-def evaluate(features: dict) -> dict:
-    """Apply the four separators. Missing features are skipped (fail-open per check)
-    so a data hiccup never silently blocks everything; the LIVE path additionally
-    fails open if the whole feature dict is empty."""
+def _score_put(in_uptrend, mom_6m, rng_pos, reach, ret5):
+    s = 30.0 if (in_uptrend is False) else 0.0               # downtrend is GOOD for puts
+    if rng_pos is not None:
+        s += _clamp((1.0 - float(rng_pos)) * 35.0, 0, 35)    # low in range = breaking down
+    if reach is not None:
+        s += _clamp((1.0 - min(float(reach), 2.0) / 2.0) * 20.0, 0, 20)
+    if ret5 is not None:                                      # sharp recent drop
+        s += _clamp((-float(ret5)) / 0.10 * 15.0, 0, 15)
+    elif mom_6m is not None and float(mom_6m) < 0:
+        s += _clamp((-float(mom_6m)) / 0.30 * 15.0, 0, 15)
+    return round(s, 1)
+
+
+def evaluate(features: dict, direction: str = "call") -> dict:
+    """Grade a candidate. Direction-aware. Fails OPEN on missing features (never
+    silently blocks). `direction` may also be read from features['direction']."""
     f = features or {}
-    reasons = []
-    passed = True
+    direction = (f.get("direction") or direction or "call").lower()
+    is_put = direction == "put"
 
     in_uptrend = bool(f.get("in_uptrend")) if f.get("in_uptrend") is not None else None
-    mom = f.get("mom_6m")
-    rng = f.get("rng_pos")
-    otm = f.get("otm_pct")
-    rv = f.get("rv")
-    dte = f.get("dte")
-    reach = f.get("reach")
-    if reach is None and otm is not None and rv is not None and dte is not None:
+    mom = f.get("mom_6m"); rng = f.get("rng_pos"); ret5 = f.get("ret5")
+    otm = f.get("otm_pct"); rv = f.get("rv"); dte = f.get("dte"); reach = f.get("reach")
+    if reach is None and None not in (otm, rv, dte):
         reach = reachability(otm, rv, dte)
 
-    # 1 + 3) trend alignment
-    if REQUIRE_UPTREND and in_uptrend is False:
-        passed = False
-        reasons.append("not in uptrend (need price>sma50>sma200)")
-    if mom is not None and float(mom) < MOM_MIN:
-        passed = False
-        reasons.append(f"weak momentum (mom_6m {float(mom):.0%} < {MOM_MIN:.0%})")
-    # 2) don't chase
-    if rng is not None and float(rng) > CHASE_MAX:
-        passed = False
-        reasons.append(f"chasing (range pos {float(rng):.0%} > {CHASE_MAX:.0%})")
-    # 4) strike reachability
+    reasons = []; passed = True
+    if is_put:
+        score = _score_put(in_uptrend, mom, rng, reach, ret5)
+        # a PUT should be a genuine breakdown: not a strong uptrend, low in its range
+        if in_uptrend is True:
+            passed = False; reasons.append("put but still in an uptrend (no breakdown)")
+        if rng is not None and float(rng) > PUT_RNG_MAX:
+            passed = False; reasons.append(f"not breaking down (range {float(rng):.0%} > {PUT_RNG_MAX:.0%})")
+    else:
+        score = _score_call(in_uptrend, mom, rng, reach)
+        if in_uptrend is False:
+            passed = False; reasons.append("call but not in an uptrend")
+        if mom is not None and float(mom) < MOM_MIN:
+            passed = False; reasons.append(f"weak momentum ({float(mom):.0%} < {MOM_MIN:.0%})")
+    # reachability applies both ways
     if reach is not None and float(reach) > REACH_MAX:
-        passed = False
-        reasons.append(f"strike unreachable (reach {float(reach):.2f} > {REACH_MAX:.2f})")
+        passed = False; reasons.append(f"strike unreachable (reach {float(reach):.2f} > {REACH_MAX:.2f})")
+    # a low score is itself a veto (catches weak-but-not-hard-failing setups)
+    if score < PASS_SCORE:
+        passed = False; reasons.append(f"low score ({score:.0f} < {PASS_SCORE:.0f})")
 
-    return {"passed": passed,
-            "score": _score(bool(in_uptrend), mom, rng, reach),
-            "reasons": reasons,
+    return {"passed": passed, "score": score, "reasons": reasons,
             "reach": (round(float(reach), 2) if reach is not None else None)}
 
 
-def compute_entry_features(ticker, otm_pct=None, dte=None, iv=None) -> dict:
-    """LIVE helper: pull the ticker's history and build the gate feature dict.
-    Defensive — returns {} on any failure so the caller can fail open."""
+def compute_entry_features(ticker, otm_pct=None, dte=None, iv=None,
+                           direction="call") -> dict:
+    """LIVE helper — build the gate feature dict (both call & put features).
+    Defensive: returns {} on any failure so the caller fails open."""
     try:
         import numpy as np
         import pandas as pd
@@ -129,18 +141,17 @@ def compute_entry_features(ticker, otm_pct=None, dte=None, iv=None) -> dict:
         S = float(h.iloc[-1])
         rets = np.log(h / h.shift(1)).dropna()
         rv = float(rets.iloc[-21:].std() * math.sqrt(252))
-        hi20 = float(h.iloc[-20:].max())
-        lo20 = float(h.iloc[-20:].min())
+        hi20 = float(h.iloc[-20:].max()); lo20 = float(h.iloc[-20:].min())
         rng = (S - lo20) / (hi20 - lo20) if hi20 > lo20 else 0.5
+        ema20 = float(h.ewm(span=20).mean().iloc[-1])
+        ret5 = float(S / h.iloc[-6] - 1) if len(h) > 6 else 0.0
         feats = {
+            "direction": direction,
             "in_uptrend": bool(sig.get("in_uptrend")),
-            "mom_6m": sig.get("mom_6m"),
-            "mom_3m": sig.get("mom_3m"),
-            "rng_pos": round(rng, 3),
-            "rv": round(rv, 3),
-            "otm_pct": otm_pct,
-            "dte": dte,
-            "iv": iv,
+            "mom_6m": sig.get("mom_6m"), "mom_3m": sig.get("mom_3m"),
+            "rng_pos": round(rng, 3), "rv": round(rv, 3),
+            "ret5": round(ret5, 4), "below_ema20": bool(S < ema20),
+            "otm_pct": otm_pct, "dte": dte, "iv": iv,
         }
         if otm_pct is not None and dte is not None:
             feats["reach"] = round(reachability(otm_pct, rv, dte), 2)
@@ -150,12 +161,9 @@ def compute_entry_features(ticker, otm_pct=None, dte=None, iv=None) -> dict:
 
 
 if __name__ == "__main__":
-    # quick self-test
-    demo = {"in_uptrend": True, "mom_6m": 0.22, "rng_pos": 0.40,
-            "otm_pct": 0.03, "rv": 0.45, "dte": 21}
-    print("demo features:", demo)
-    print("evaluate     :", evaluate(demo))
-    bad = {"in_uptrend": False, "mom_6m": 0.04, "rng_pos": 0.97,
-           "otm_pct": 0.15, "rv": 0.30, "dte": 9}
-    print("bad features :", bad)
-    print("evaluate     :", evaluate(bad))
+    call_good = {"direction": "call", "in_uptrend": True, "mom_6m": 0.22,
+                 "rng_pos": 0.70, "otm_pct": 0.03, "rv": 0.45, "dte": 7}
+    put_good = {"direction": "put", "in_uptrend": False, "rng_pos": 0.08,
+                "ret5": -0.12, "otm_pct": 0.05, "rv": 0.60, "dte": 7}
+    print("good call ->", evaluate(call_good, "call"))
+    print("good put  ->", evaluate(put_good, "put"))

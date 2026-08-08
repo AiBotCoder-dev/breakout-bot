@@ -448,8 +448,12 @@ def _rebalance(conn, st, hist, equity):
         st["last_rebalance"] = date.today().isoformat()
         return True
 
-    # BUY / rebalance into equal weight of the target set
-    per_name = equity / len(target)
+    # BUY / rebalance into equal weight of the target set.
+    # Reserve a cost buffer FIRST: allocating the full equity and then deducting
+    # fees pushed cash negative (a small margin overdraft that compounds a little
+    # at every rebalance). Sizing off investable equity keeps the book fully funded.
+    investable = equity * (1 - 2 * COST_BPS / 10_000)   # covers a full round trip
+    per_name = investable / len(target)
     for t, px in target.items():
         if px <= 0:
             continue

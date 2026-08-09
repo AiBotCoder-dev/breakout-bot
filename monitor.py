@@ -2158,6 +2158,18 @@ def main():
                 except Exception as _ise:
                     print(f"  (ignition shadow skipped: {_ise})")
 
+                # IV CALIBRATION — measure the REAL option surface (ATM IV, IV/RV
+                # ratio, smile slope, real bid/ask) instead of assuming it. Every
+                # backtest so far turned on an unobservable IV; this replaces the
+                # assumption with data. Once/UTC-day, read-only, never trades.
+                try:
+                    import iv_calibration as _ivc
+                    _iv = _ivc.step(conn, _ob)
+                    if _iv and _iv.get("measured"):
+                        print(f"  📐 IV calibration: measured {_iv['measured']} chains")
+                except Exception as _ive:
+                    print(f"  (IV calibration skipped: {_ive})")
+
                 acct = _ob.get_account()
                 real_equity = acct.get("equity", 0)
                 # Size to the OVERRIDE if set (e.g. trade $100k paper as $1k)

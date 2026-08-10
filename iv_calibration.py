@@ -33,6 +33,23 @@ from datetime import datetime, timezone, date, timedelta
 # names we actually trade / study — a spread of mega-cap and high-beta
 UNIVERSE = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "AMD", "TSLA",
             "NFLX", "COIN", "PLTR", "MU", "CRWD", "SHOP", "UBER", "SPY", "QQQ"]
+
+# EARNINGS POOL — the first run (2026-08-10) measured ZERO names with earnings in
+# the option's life (mid-August is post-Q2), so the key question — is the EARNINGS
+# smile steeper than the normal smile? — went unanswered. Each run now also scans
+# this wider pool and measures any name whose earnings fall inside ~10 DTE, so the
+# comparison fills in as earnings roll through.
+EARNINGS_POOL = ["AAPL","MSFT","NVDA","AMZN","META","GOOGL","AMD","TSLA","NFLX",
+                 "COIN","PLTR","MU","CRWD","SHOP","UBER","DELL","SNOW",
+                 "DDOG","NET","ABNB","DASH","RBLX","U","MRVL","ARM","QCOM","INTC",
+                 "SMCI","HOOD","SOFI","AFRM","CVNA","ANF","DKNG","PANW","ZS","OKTA",
+                 "TTD","ROKU","MRNA","LLY","UNH","JPM","V","MA","WMT","COST","HD",
+                 "CAT","BA","XOM","CVX","ORCL","CRM","ADBE","DIS","BABA","PDD"]
+MAX_EARNINGS_ADD = 12        # cap the extra chains pulled per run
+
+# Quotes wider than this are broken/illiquid, not a real market — discard so they
+# can't pollute the spread average (the first run had MU at a 108% "spread").
+MAX_PLAUSIBLE_SPREAD_PCT = 50.0
 DTE_TARGET = 10          # match the backtests
 OTM_PROBE = 0.05         # measure the smile at 5% OTM (what the studies priced)
 R = 0.04
@@ -193,6 +210,11 @@ def measure(broker, ticker):
 
     cs = _slope(otm_c, atm_iv); ps = _slope(otm_p, atm_iv)
     dte_e = _days_to_earnings(ticker)
+    # discard implausible quotes rather than recording a fake-wide spread
+    atm_spr = (atm_c["spread_pct"] + atm_p["spread_pct"]) / 2
+    otm_spr = (otm_c["spread_pct"] + otm_p["spread_pct"]) / 2
+    if atm_spr > MAX_PLAUSIBLE_SPREAD_PCT or otm_spr > MAX_PLAUSIBLE_SPREAD_PCT:
+        return None
     return {
         "d": date.today().isoformat(), "ticker": ticker, "spot": round(spot, 2),
         "expiry": str(rows[0]["expiry"]), "dte": best_dte,
@@ -202,8 +224,8 @@ def measure(broker, ticker):
         "call_slope": round(cs, 3) if cs is not None else None,
         "put_slope": round(ps, 3) if ps is not None else None,
         "smile_slope": round((cs + ps) / 2, 3) if (cs is not None and ps is not None) else None,
-        "atm_spread_pct": round((atm_c["spread_pct"] + atm_p["spread_pct"]) / 2, 1),
-        "otm_spread_pct": round((otm_c["spread_pct"] + otm_p["spread_pct"]) / 2, 1),
+        "atm_spread_pct": round(atm_spr, 1),
+        "otm_spread_pct": round(otm_spr, 1),
         "earnings_in_life": 1 if (dte_e is not None and dte_e <= best_dte) else 0,
         "days_to_earnings": dte_e,
     }
@@ -230,8 +252,26 @@ def step(conn, broker=None, force=False):
     if not broker.available():
         return None
 
+    # Always measure the core universe, PLUS any name in the wider pool whose
+    # earnings land inside ~the option's life — that's the only way the
+    # earnings-vs-normal smile comparison ever fills in.
+    targets = list(UNIVERSE)
+    try:
+        extra = []
+        for t in EARNINGS_POOL:
+            if t in targets or len(extra) >= MAX_EARNINGS_ADD:
+                continue
+            d = _days_to_earnings(t)
+            if d is not None and d <= DTE_TARGET + 4:
+                extra.append(t)
+        targets += extra
+        if extra:
+            print(f"  [iv-cal] +{len(extra)} earnings-window names: {','.join(extra)}")
+    except Exception:
+        pass
+
     n = 0
-    for t in UNIVERSE:
+    for t in targets:
         m = measure(broker, t)
         if not m:
             continue

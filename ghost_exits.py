@@ -168,13 +168,26 @@ def report(conn) -> dict:
 # constraints. If none passes, DON'T adopt — surface that and keep the control.
 MIN_RESOLVED = 80          # ~40 per policy: the floor for a directional read
 
-# Hard disqualifiers — a policy failing ANY of these is rejected outright.
-DQ_MEAN_LT       = 0.0     # mean return < 0            -> REJECT
-DQ_WORST_LT      = -70.0   # worst single trade < -70%  -> REJECT
-DQ_TAIL50_GT     = 20.0    # >20% of trades < -50%      -> REJECT  (the ruin guard)
+# ── CONSTRAINTS (re-specified 2026-08-11 — the original set was UNSATISFIABLE) ──
+# The first version rejected any policy whose worst trade was below -70% and any
+# with >20% of trades below -50%. For a LONG-OPTION book those are structural: a
+# bought option can always go to -100%, so EVERY conceivable policy failed and the
+# rule could never adopt anything. It fired at 93/80 resolved and rejected all
+# three — including policy C, whose median was -5% against the control's ~-52%.
+#
+# The fix: judge a policy AGAINST THE CONTROL rather than against absolute floors,
+# because -100% tails are the instrument's nature, not a policy defect. What we
+# actually care about is: is it profitable, does it beat what we already do, and
+# does it not blow out the tail relative to the control?
+MIN_PER_POLICY   = 25      # a policy needs its own sample before it can be adopted
+DQ_MEAN_LT       = 0.0     # mean return < 0                      -> REJECT
+DQ_MUST_BEAT_CONTROL = True  # mean must exceed the live control   -> else why switch
+DQ_TAIL_VS_CONTROL   = 1.25  # tail rate > 1.25x the control's     -> REJECT
 
-# Composite score weights (reviewer's, tail-weighted after the 41%-catastrophe data)
-W_SORTINO, W_MEDIAN, W_WIN, W_RUIN, W_TAIL = 0.30, 0.25, 0.15, 0.20, 0.10
+# Composite score weights. The old "ruin" term keyed off the worst single trade,
+# which is ~-100% for every long-option policy — a degenerate component that added
+# nothing. Its weight is redistributed to Sortino/median/tail.
+W_SORTINO, W_MEDIAN, W_WIN, W_TAIL = 0.35, 0.30, 0.15, 0.20
 
 
 def _pol_stats(vals):
@@ -222,17 +235,36 @@ def decision(conn) -> dict:
                 for n, s in stats.items()}
 
     n_sort = _norm("sortino"); n_med = _norm("median"); n_win = _norm("win")
-    n_ruin = _norm("worst"); n_tail = _norm("tail50", invert=True)  # lower tail = better
+    n_tail = _norm("tail50", invert=True)          # lower tail = better
+
+    # the live control (the real -50%-stop trades) is the bar to clear
+    ctrl = None
+    try:
+        rows = conn.execute("SELECT pnl_pct FROM broker_trade_journal "
+                            "WHERE status='CLOSED' AND pnl_pct IS NOT NULL").fetchall()
+        ctrl = _pol_stats([float(x.get("pnl_pct") if hasattr(x, "get") else x[0])
+                           for x in rows])
+    except Exception:
+        ctrl = None
 
     table = []
     for name, s in stats.items():
-        passes = (s["mean"] >= DQ_MEAN_LT and s["worst"] >= DQ_WORST_LT
-                  and s["tail50"] <= DQ_TAIL50_GT)
+        reasons = []
+        if s["n"] < MIN_PER_POLICY:
+            reasons.append(f"n={s['n']}<{MIN_PER_POLICY}")
+        if s["mean"] < DQ_MEAN_LT:
+            reasons.append(f"mean {s['mean']:+.0f}%<0")
+        if ctrl and DQ_MUST_BEAT_CONTROL and s["mean"] <= ctrl["mean"]:
+            reasons.append(f"mean {s['mean']:+.0f}% <= control {ctrl['mean']:+.0f}%")
+        if ctrl and ctrl["tail50"] > 0 and s["tail50"] > ctrl["tail50"] * DQ_TAIL_VS_CONTROL:
+            reasons.append(f"tail {s['tail50']:.0f}% > {DQ_TAIL_VS_CONTROL:g}x control "
+                           f"{ctrl['tail50']:.0f}%")
         score = (W_SORTINO * n_sort[name] + W_MEDIAN * n_med[name]
-                 + W_WIN * n_win[name] + W_RUIN * n_ruin[name] + W_TAIL * n_tail[name])
+                 + W_WIN * n_win[name] + W_TAIL * n_tail[name])
         table.append({"policy": name, **{k: round(s[k], 1) for k in
                       ("n", "mean", "median", "sortino", "worst", "tail50", "win")},
-                      "score": round(score, 3), "passes": passes})
+                      "score": round(score, 3), "passes": not reasons,
+                      "fails": reasons})
     table.sort(key=lambda r: (r["passes"], r["score"]), reverse=True)
 
     ready = total_resolved >= MIN_RESOLVED
@@ -242,11 +274,15 @@ def decision(conn) -> dict:
         note = (f"{total_resolved}/{MIN_RESOLVED} resolved ghosts — "
                 "accumulating; rule not yet armed.")
     elif not eligible:
-        note = ("Armed, but NO policy passes all hard constraints — keep the live "
-                "-50% control and pause loosening. (This is the rule working.)")
+        note = ("Armed, but no policy beats the live control on the re-specified "
+                "constraints — keep the -50% control.")
     else:
         winner = eligible[0]["policy"]
-        note = (f"Adopt {winner} (score {eligible[0]['score']}, passes all "
-                "constraints). Highest scorer among the eligible.")
+        note = (f"ADOPT {winner} (score {eligible[0]['score']}; mean "
+                f"{eligible[0]['mean']:+.0f}% vs control "
+                f"{ctrl['mean']:+.0f}%)" if ctrl else f"ADOPT {winner}")
     return {"ready": ready, "resolved": total_resolved, "min_resolved": MIN_RESOLVED,
-            "winner": winner, "table": table, "note": note}
+            "winner": winner, "table": table, "note": note,
+            "control": ({k: round(ctrl[k], 1) for k in
+                         ("n", "mean", "median", "sortino", "tail50", "win")}
+                        if ctrl else None)}

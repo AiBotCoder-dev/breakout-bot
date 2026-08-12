@@ -519,12 +519,12 @@ class AlpacaPaperBroker:
             return None
 
     def manage_option_exits(self, conn=None,
-                            activation_pct: float = 50.0, trail_frac: float = 0.30,
-                            hard_stop_pct: float = -50.0, dte_floor: int = 2,
-                            put_activation: float = 40.0, put_trail_frac: float = 0.25,
-                            put_hard_stop: float = -45.0,
-                            grace_minutes: float = 60.0,
-                            grace_hard_stop: float = -80.0) -> list:
+                            activation_pct: float = None, trail_frac: float = None,
+                            hard_stop_pct: float = None, dte_floor: int = None,
+                            put_activation: float = None, put_trail_frac: float = None,
+                            put_hard_stop: float = None,
+                            grace_minutes: float = None,
+                            grace_hard_stop: float = None) -> list:
         """
         TRAILING-STOP exit manager — lets winners RUN (no take-profit cap) while
         protecting gains. This is the answer to 'don't sell a +300% runner at +70%.'
@@ -551,7 +551,41 @@ class AlpacaPaperBroker:
         Returns a list of {symbol, underlying, reason, pct, pnl, peak_pct}.
         """
         from datetime import date as _date, datetime as _dt, timezone as _tz
+        import os as _os_
         _now_utc = _dt.now(_tz.utc)
+
+        # ── EXIT POLICY (defaults = ghost-validated policy C, adopted 2026-08-11) ──
+        # The live book ran its whole life on a -50% hard stop. The ghost framework
+        # shadow-tested alternatives on the SAME entries; on 29 paired trades policy C
+        # beat it by +45.6 points per trade:
+        #     control (-50% stop)  mean -15.5%  median -50.0%  win 24%  tail<-50% 38%
+        #     C (trail after +30%) mean +30.0%  median  -6.1%  win 45%  tail<-50% 24%
+        # It also matches the independent convex_put_backtest finding that a -50% stop
+        # INVERTS the tail edge. Policy C = NO hard stop; once +30% up, trail 30% off
+        # the peak; otherwise exit at DTE<=2. Every knob is env-overridable so this is
+        # reversible without a code change (set EXIT_HARD_STOP=-50 to restore the old
+        # behaviour).
+        def _envf(name, dflt):
+            try:
+                return float(_os_.environ.get(name, "") or dflt)
+            except Exception:
+                return dflt
+        if activation_pct is None:  activation_pct = _envf("EXIT_ACTIVATION_PCT", 30.0)
+        if trail_frac is None:      trail_frac     = _envf("EXIT_TRAIL_FRAC", 0.30)
+        if hard_stop_pct is None:   hard_stop_pct  = _envf("EXIT_HARD_STOP", -100.0)
+        if put_activation is None:  put_activation = _envf("PUT_ACTIVATION_PCT", 30.0)
+        if put_trail_frac is None:  put_trail_frac = _envf("PUT_TRAIL_FRAC", 0.30)
+        if put_hard_stop is None:   put_hard_stop  = _envf("PUT_HARD_STOP", -100.0)
+        if grace_minutes is None:   grace_minutes  = _envf("EXIT_GRACE_MINUTES", 60.0)
+        # grace must never be TIGHTER than the live stop, or it would re-introduce
+        # the guillotine that policy C exists to remove.
+        if grace_hard_stop is None:
+            grace_hard_stop = min(_envf("EXIT_GRACE_HARD_STOP", -100.0), hard_stop_pct)
+        if dte_floor is None:
+            try:
+                dte_floor = int(_envf("EXIT_DTE_FLOOR", 2))
+            except Exception:
+                dte_floor = 2
         if conn is not None:
             try:
                 conn.execute("CREATE TABLE IF NOT EXISTS broker_option_peaks "

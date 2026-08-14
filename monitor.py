@@ -2170,6 +2170,19 @@ def main():
                 except Exception as _ive:
                     print(f"  (IV calibration skipped: {_ive})")
 
+                # HEALTH MONITOR — assert the invariants that broke silently before
+                # (dead price feed, unbooked expiries, deadlocked overnight module,
+                # halted entries, exit-policy regression). Alerts at most once per
+                # issue per day so it never becomes noise that gets muted.
+                try:
+                    import health_monitor as _hm
+                    _h = _hm.step(conn, notify=send_telegram)
+                    if _h.get("issues"):
+                        print(f"  🩺 health: {_h['issues']} issue(s) "
+                              f"{_h.get('detail')} ({_h.get('new',0)} newly alerted)")
+                except Exception as _hme:
+                    print(f"  (health monitor skipped: {_hme})")
+
                 acct = _ob.get_account()
                 real_equity = acct.get("equity", 0)
                 # Size to the OVERRIDE if set (e.g. trade $100k paper as $1k)
@@ -2357,6 +2370,18 @@ def main():
                     _oc = _otype[0].upper()                  # 'C' or 'P'
                     if s["ticker"] in held_u:
                         return False
+                    # CONCENTRATION CAP — 34% of multi-trade days had EVERY position
+                    # move together (2026-08-07: opened 10, stopped 8, both directions).
+                    # Caps total open, one-sided exposure, per-sector and per-day so the
+                    # book stops being one bet expressed many ways. Fails OPEN.
+                    try:
+                        import concentration as _conc
+                        _ok, _why = _conc.check(conn, _otype, s.get("sector"))
+                        if not _ok:
+                            print(f"    {s['ticker']:6s} — concentration cap: {_why}")
+                            return False
+                    except Exception:
+                        pass
                     # REBUY COOLDOWN — don't re-enter a contract/underlying we exited
                     # within the cooldown window (stops the stop->rebuy->stop churn).
                     # Block ONLY the exact contract we just exited (not the whole

@@ -12,8 +12,13 @@ trade, which keeps using the current exit manager as the control):
 
   A  NO_STOP_TIME   — no stop at all; exit only at DTE<=2 (pure "let the thesis
                       play out; theta is the only enemy")
-  B  WIDE_STOP_80   — hard stop at -80% (vs live -50%), then trail 30% after +50%
+  B  WIDE_STOP_80   — hard stop at -80%, then trail 30% after +50%
   C  TRAIL_AFTER_30 — no hard stop; once up +30% trail 30% below peak; else DTE<=2
+                      ** ADOPTED AS THE LIVE POLICY 2026-08-11 **
+  D  RETIRED_50_STOP — the OLD live rule (-50% hard stop, trail 30% after +50%),
+                      kept running in shadow as the counterfactual. C replaced it on
+                      only n=29 paired trades, so D is the safety net: if it starts
+                      beating C, regression_check() flags it and we revert.
 
 Compare A/B/C against the REAL trade's journal outcome (the -50% control). After
 ~50-100 closed ghosts, `report()` tells us — with live data — whether a wider or
@@ -32,10 +37,17 @@ def _ensure(conn):
                 dte0 INTEGER, peak_prem REAL,
                 a_done INTEGER DEFAULT 0, a_pnl REAL,
                 b_done INTEGER DEFAULT 0, b_pnl REAL,
-                c_done INTEGER DEFAULT 0, c_pnl REAL
+                c_done INTEGER DEFAULT 0, c_pnl REAL,
+                d_done INTEGER DEFAULT 0, d_pnl REAL
             )""")
     except Exception:
         pass
+    # additive migration so existing databases pick up the arm-D columns
+    for col, typ in (("d_done", "INTEGER DEFAULT 0"), ("d_pnl", "REAL")):
+        try:
+            conn.execute(f"ALTER TABLE ghost_exits ADD COLUMN {col} {typ}")
+        except Exception:
+            pass
 
 
 def record(conn, contract_symbol, underlying, entry_premium, dte=None):
@@ -110,12 +122,26 @@ def update(conn, broker):
                 upd["b_done"], upd["b_pnl"] = 1, round((peak*0.70/entry-1)*100, 1)
             elif dte is not None and dte <= 2:
                 upd["b_done"], upd["b_pnl"] = 1, round(pct, 1)
-        # C: no hard stop; trail 30% after +30%
+        # C: no hard stop; trail 30% after +30%   ** NOW THE LIVE POLICY **
         if not d.get("c_done"):
             if peakpct >= 30 and cur <= peak * 0.70:
                 upd["c_done"], upd["c_pnl"] = 1, round((peak*0.70/entry-1)*100, 1)
             elif dte is not None and dte <= 2:
                 upd["c_done"], upd["c_pnl"] = 1, round(pct, 1)
+        # D: the RETIRED -50% policy, kept as a shadow arm. C replaced it live on
+        # 2026-08-11 on n=29 paired trades — a real but small sample. Without D we
+        # would have no way to notice if that adoption was a mistake, so the old
+        # rule keeps running in shadow as the counterfactual. Mirrors the retired
+        # live branch order: once activated (+50%) it trails 30%; before activation
+        # a -50% hard stop applies; otherwise the DTE<=2 time stop.
+        if not d.get("d_done"):
+            _act_d = peakpct >= 50
+            if _act_d and cur <= peak * 0.70:
+                upd["d_done"], upd["d_pnl"] = 1, round((peak*0.70/entry-1)*100, 1)
+            elif (not _act_d) and pct <= -50:
+                upd["d_done"], upd["d_pnl"] = 1, -50.0
+            elif dte is not None and dte <= 2:
+                upd["d_done"], upd["d_pnl"] = 1, round(pct, 1)
 
         sets = ", ".join(f"{k}=?" for k in upd)
         try:
@@ -133,7 +159,8 @@ def report(conn) -> dict:
     import statistics as st
     out = {}
     for pol, col in [("A_no_stop_time", "a_pnl"), ("B_wide_80_stop", "b_pnl"),
-                     ("C_trail_after_30", "c_pnl")]:
+                     ("C_trail_after_30", "c_pnl"),
+                     ("D_retired_50_stop", "d_pnl")]:
         try:
             rows = conn.execute(
                 f"SELECT {col} v FROM ghost_exits WHERE {col} IS NOT NULL").fetchall()
@@ -212,7 +239,7 @@ def decision(conn) -> dict:
     note} — read-only; it recommends, it does not change the live policy."""
     _ensure(conn)
     policies = {"A_no_stop_time": "a_pnl", "B_wide_80_stop": "b_pnl",
-                "C_trail_after_30": "c_pnl"}
+                "C_trail_after_30": "c_pnl", "D_retired_50_stop": "d_pnl"}
     stats = {}; total_resolved = 0
     for name, col in policies.items():
         try:
@@ -285,4 +312,47 @@ def decision(conn) -> dict:
             "winner": winner, "table": table, "note": note,
             "control": ({k: round(ctrl[k], 1) for k in
                          ("n", "mean", "median", "sortino", "tail50", "win")}
-                        if ctrl else None)}
+                        if ctrl else None),
+            "regression": regression_check(conn)}
+
+
+def regression_check(conn) -> dict:
+    """Did adopting C over the retired -50% stop turn out to be a mistake?
+
+    Compares arms C (live) and D (retired) PAIRED on the same contracts, which
+    controls for regime entirely — the only honest way to compare exit rules. This
+    is the safety net for an adoption made on n=29: if D starts consistently beating
+    C here, the switch should be reconsidered."""
+    _ensure(conn)
+    try:
+        rows = conn.execute(
+            "SELECT c_pnl, d_pnl FROM ghost_exits "
+            "WHERE c_pnl IS NOT NULL AND d_pnl IS NOT NULL").fetchall()
+    except Exception:
+        return {"n": 0}
+    pairs = []
+    for r in rows:
+        d = dict(r) if hasattr(r, "keys") else {"c_pnl": r[0], "d_pnl": r[1]}
+        try:
+            pairs.append((float(d["c_pnl"]), float(d["d_pnl"])))
+        except Exception:
+            pass
+    n = len(pairs)
+    if n == 0:
+        return {"n": 0, "verdict": "no paired data yet — arm D starts accumulating "
+                                   "from the next entries."}
+    c_mean = sum(c for c, _ in pairs) / n
+    d_mean = sum(x for _, x in pairs) / n
+    c_wins = sum(1 for c, x in pairs if c > x)
+    diff = c_mean - d_mean
+    if n < 20:
+        verdict = f"n={n} — too few pairs to judge; keep accumulating."
+    elif diff > 0:
+        verdict = (f"C still ahead by {diff:+.1f} pts/trade ({c_wins}/{n} pairs) — "
+                   "adoption holding up.")
+    else:
+        verdict = (f"⚠️ REGRESSION: retired D is beating live C by {-diff:.1f} "
+                   f"pts/trade ({c_wins}/{n} pairs) — reconsider the switch "
+                   "(set EXIT_HARD_STOP=-50 to revert).")
+    return {"n": n, "c_mean": round(c_mean, 1), "d_mean": round(d_mean, 1),
+            "c_better_pairs": c_wins, "diff": round(diff, 1), "verdict": verdict}

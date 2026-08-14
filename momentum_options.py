@@ -57,12 +57,22 @@ MIN_THESIS_PCT          = 8.0      # don't trade options if the expected move is
 # trade (near-money is much less theta/IV-crush/slippage sensitive). The selector
 # scores closest-to-ATM highest, so it leans ATM when affordable, 5% OTM when not.
 OTM_PCT_MIN             = 0.00     # ATM
-OTM_PCT_MAX             = 0.07     # up to 7% OTM — the selector scores closest-to-
-                                   # money highest (and penalizes premium), so it
-                                   # picks ATM when it fits the $ budget and only
-                                   # drifts toward 7% OTM on pricier names. This
-                                   # keeps the win-rate lift while preserving volume
-                                   # (a 0-5% band skipped too many $100+ leaders).
+# TIGHTENED 0.07 -> 0.03 (2026-08-13). The 0-7% band let the selector drift out to a
+# MEDIAN strike of 5.3% OTM, which the live journal shows is its worst bucket, and
+# three independent lines of evidence agree the money is closer to the money:
+#   live journal (n=66)  0.5-3% OTM: 50% win, +18.9% exp
+#                        3-6%  OTM: 17% win, -61.9% exp
+#                        6%+   OTM:  6% win, -70.5% exp        (monotonic)
+#   structure shootout   near-money 46% win / median -10%  vs far-OTM 37% / -83%
+#   IV calibration       REAL spreads 5.1% ATM vs 12.2% OTM — 2.4x the friction to
+#                        sit further out, on an instrument measured at IV/RV ~1.02
+#                        (i.e. fairly priced, so friction is the whole battle)
+# Env-overridable via OTM_PCT_MAX so this is reversible without a code change.
+import os as _os
+try:
+    OTM_PCT_MAX = float(_os.environ.get("OTM_PCT_MAX", "") or 0.03)
+except Exception:
+    OTM_PCT_MAX = 0.03
 LOTTERY_SIZE_PCT        = 0.05     # 5% of options cash per ticket (lottery)
 
 # ── DEBIT-SPREAD structure (opt-in via env OPTION_STRUCTURE=spread) ───────────

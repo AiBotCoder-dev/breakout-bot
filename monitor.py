@@ -2100,6 +2100,36 @@ def main():
                             f"(${_x['pnl']:+.0f}){_pktxt}")
                     if _exits:
                         print(f"  Exit manager closed {len(_exits)} option position(s).")
+                    # DEAD-OPTION GHOSTS — keep watching anything the 3σ dead-exit
+                    # cut, to measure whether it would have come back. The backtest
+                    # says cutting costs ~0.7pp because fat-tailed resurrections are
+                    # the monster wins; this replaces that model estimate with the
+                    # real thing.
+                    try:
+                        import dead_ghost as _dg
+                        for _x in _exits:
+                            if _x.get("reason") != "DEAD_OPTION":
+                                continue
+                            _sym0 = str(_x.get("symbol") or "")
+                            _ep = None
+                            try:
+                                _er = conn.execute(
+                                    "SELECT entry_premium FROM broker_trade_journal "
+                                    "WHERE contract_symbol=?", (_sym0,)).fetchone()
+                                if _er:
+                                    _ep = float((_er.get("entry_premium")
+                                                 if hasattr(_er, "get") else _er[0]) or 0)
+                            except Exception:
+                                _ep = None
+                            _cutprem = (_ep * (1 + float(_x.get("pct", 0)) / 100.0)
+                                        if _ep else None)
+                            _dg.record(conn, _sym0, _x.get("underlying"),
+                                       _cutprem, _ep, cut_pct=_x.get("pct"))
+                        _dn = _dg.update(conn, _ob)
+                        if _dn:
+                            print(f"  ⚰️ dead-ghosts: {_dn} tracked (did any recover?)")
+                    except Exception as _dge:
+                        print(f"  (dead ghosts skipped: {_dge})")
                     # GHOST EXITS — advance the shadow exit policies each cycle
                     try:
                         import ghost_exits as _ghost

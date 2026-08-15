@@ -339,6 +339,24 @@ class AlpacaPaperBroker:
         except Exception:
             return None
 
+    def _realized_vol(self, ticker: str, days: int = 20) -> float | None:
+        """Annualised realized volatility of the underlying — the independent
+        yardstick for the dead-option check (how far can this stock actually
+        travel?). Returns None on any failure so the caller keeps the position."""
+        try:
+            import math as _m
+            import yfinance as _yf
+            h = _yf.Ticker(ticker).history(period="3mo")["Close"].dropna()
+            if len(h) < days + 2:
+                return None
+            r = [_m.log(h.iloc[i] / h.iloc[i - 1]) for i in range(len(h) - days, len(h))]
+            mu = sum(r) / len(r)
+            var = sum((x - mu) ** 2 for x in r) / max(len(r) - 1, 1)
+            v = _m.sqrt(var) * _m.sqrt(252)
+            return v if 0.02 < v < 5.0 else None
+        except Exception:
+            return None
+
     def get_option_quote(self, occ_symbol: str) -> dict | None:
         """
         Live bid/ask for one option contract from Alpaca market data.
@@ -586,6 +604,15 @@ class AlpacaPaperBroker:
                 dte_floor = int(_envf("EXIT_DTE_FLOOR", 2))
             except Exception:
                 dte_floor = 2
+        # DEAD-OPTION EXIT: cut only when the move still needed exceeds this many
+        # expected-moves (sigma). 3.0 = ~99.9% unlikely on a normal distribution, and
+        # deliberately extreme because fat tails mean 3-sigma recoveries DO happen and
+        # are the monster wins. Set DEAD_SIGMA=0 to disable entirely.
+        _DEAD_SIGMA = _envf("DEAD_SIGMA", 3.0)
+        _DEAD_MAX_DTE = int(_envf("DEAD_MAX_DTE", 6))   # only look near expiry
+        _dead_spot_cache = {}      # one spot lookup per underlying per cycle
+        _dead_vol_cache = {}       # one realized-vol lookup per underlying per cycle
+        import math
         if conn is not None:
             try:
                 conn.execute("CREATE TABLE IF NOT EXISTS broker_option_peaks "
@@ -777,8 +804,51 @@ class AlpacaPaperBroker:
             _in_grace = _age_min < grace_minutes
             _eff_hard = grace_hard_stop if _in_grace else _hard
 
+            # ── DEAD-OPTION EXIT (3σ) — free the slot when recovery is hopeless ──
+            # NOT a stop-loss. It cuts on PROBABILITY OF RECOVERY, so it keeps a
+            # position down 70% that still has time and proximity, and cuts one that
+            # has drifted far OTM with days left — the opposite selection to a stop.
+            #   reachability = (move still needed) / (move still possible)
+            # Backtest (12.6k trades): at 3σ it costs 0.7pp of expectancy and frees 6%
+            # of slot-days. It is NOT free because this is a fat-tailed strategy and
+            # 3σ resurrections are the monster wins — so the threshold is deliberately
+            # extreme, and only DOWN positions near expiry are ever considered.
             reason = None
-            if sym in _dipbuy:
+            _dead = False
+            if (_DEAD_SIGMA > 0 and pct < 0 and parsed
+                    and dte is not None and 1 <= dte <= _DEAD_MAX_DTE
+                    and sym not in _dipbuy and sym not in _long_pair):
+                try:
+                    _spot = _dead_spot_cache.get(p.get("underlying", ""))
+                    if _spot is None:
+                        _spot = self.get_price(p.get("underlying", "")) or 0
+                        _dead_spot_cache[p.get("underlying", "")] = _spot
+                    if _spot and _spot > 0:
+                        _K = float(parsed["strike"])
+                        # distance still needed to reach the strike (0 if already ITM)
+                        _need = (max(0.0, (_K - _spot) / _spot) if not is_put
+                                 else max(0.0, (_spot - _K) / _spot))
+                        if _need > 0:
+                            # Use the UNDERLYING's realized vol, NOT the option's own
+                            # implied vol. Backing IV out of the option price is
+                            # circular: a dead contract still bid at a few cents
+                            # implies enormous vol, which would make it look alive and
+                            # defeat the whole check. Realized vol is an independent
+                            # measure of how far the stock can actually travel.
+                            _rv = _dead_vol_cache.get(p.get("underlying", ""))
+                            if _rv is None:
+                                _rv = self._realized_vol(p.get("underlying", ""))
+                                _dead_vol_cache[p.get("underlying", "")] = _rv or 0.0
+                            if _rv and _rv > 0:
+                                _exp_move = _rv * math.sqrt(max(dte, 1) / 252.0)
+                                if _exp_move > 0 and (_need / _exp_move) > _DEAD_SIGMA:
+                                    _dead = True
+                except Exception:
+                    _dead = False
+
+            if _dead:
+                reason = "DEAD_OPTION"
+            elif sym in _dipbuy:
                 # DIP-BUY: take the bounce. +target / -stop / time cap. This REPLACES
                 # the trailing logic for these positions (the target exit is what
                 # realises the backtested 63% win rate).

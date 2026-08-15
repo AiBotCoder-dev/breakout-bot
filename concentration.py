@@ -35,8 +35,16 @@ def _envi(name, dflt):
 
 
 def limits() -> dict:
+    # max_open raised 10 -> 14 (2026-08-14). The original 10 was a guess, not a
+    # measured number, and the throughput arithmetic showed it was the binding
+    # constraint rather than any risk finding: 10 slots / an 8-day average hold
+    # sustains only ~1.25 entries per day against 3-10 signals per day, so real
+    # signals were being turned away. 14 gives ~1.75/day at ZERO expectancy cost.
+    # The CORRELATION risk we actually measured (34% of multi-trade days moving as
+    # one) is handled by max_same_dir and max_sector, which target it directly —
+    # those stay tight. Raising the headcount does not re-create that risk.
     return {
-        "max_open":      _envi("MAX_OPEN_POSITIONS", 10),
+        "max_open":      _envi("MAX_OPEN_POSITIONS", 14),
         "max_same_dir":  _envi("MAX_SAME_DIRECTION", 6),
         "max_sector":    _envi("MAX_PER_SECTOR", 3),
         "max_per_day":   _envi("MAX_OPENS_PER_DAY", 5),

@@ -1,7 +1,7 @@
 {
-  "generated_utc": "2026-08-28T05:32:01.642227+00:00",
-  "equity": 95416.32,
-  "cash": 94905.34,
+  "generated_utc": "2026-08-29T03:14:10.324343+00:00",
+  "equity": 95296.02,
+  "cash": 94750.13,
   "closed_round_trips": 139,
   "wins": 32,
   "losses": 107,
@@ -11,7 +11,7 @@
   "avg_loss": -52.42,
   "expectancy_per_trade": -29.1,
   "open_positions": 8,
-  "unrealized_pnl": -406.0,
+  "unrealized_pnl": -418.0,
   "by_source": {
     "momentum_call_explore": {
       "n": 66,

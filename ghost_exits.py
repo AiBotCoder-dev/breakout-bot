@@ -14,11 +14,20 @@ trade, which keeps using the current exit manager as the control):
                       play out; theta is the only enemy")
   B  WIDE_STOP_80   — hard stop at -80%, then trail 30% after +50%
   C  TRAIL_AFTER_30 — no hard stop; once up +30% trail 30% below peak; else DTE<=2
-                      ** ADOPTED AS THE LIVE POLICY 2026-08-11 **
-  D  RETIRED_50_STOP — the OLD live rule (-50% hard stop, trail 30% after +50%),
-                      kept running in shadow as the counterfactual. C replaced it on
-                      only n=29 paired trades, so D is the safety net: if it starts
-                      beating C, regression_check() flags it and we revert.
+                      Was live 2026-08-11 -> 2026-08-28. NOW A SHADOW ARM.
+  D  RETIRED_50_STOP — -50% hard stop, trail 30% after +50%. ** LIVE AGAIN 2026-08-28 **
+
+THE ADOPTION AND THE REVERSAL — why this framework earned its place:
+C was adopted on 29 paired trades showing +45.6 pts/trade. D was kept running as the
+counterfactual precisely because that sample was thin. At 32 pairs D had OVERTAKEN it:
+    D (-50% stop)  mean +44.0%  median -50.0%  worst  -50%  Sortino +0.88  tail<-50%  0%
+    C (no stop)    mean +28.9%  median  -6.0%  worst -100%  Sortino +0.37  tail<-50% 42%
+    C won only 6/32 paired trades; D ahead by 15.1 pts/trade.
+C has the better MEDIAN (the stop does cut many trades at exactly -50%), but D wins on
+MEAN and Sortino because capping losses at -50% instead of letting them ride to -100%
+saves more than C's extra upside captures. The live paired test also beat the earlier
+Black-Scholes backtest that predicted the opposite — real fills over assumed IV.
+C keeps running as the shadow so this reversal is itself checkable.
 
 Compare A/B/C against the REAL trade's journal outcome (the -50% control). After
 ~50-100 closed ghosts, `report()` tells us — with live data — whether a wider or
@@ -122,18 +131,17 @@ def update(conn, broker):
                 upd["b_done"], upd["b_pnl"] = 1, round((peak*0.70/entry-1)*100, 1)
             elif dte is not None and dte <= 2:
                 upd["b_done"], upd["b_pnl"] = 1, round(pct, 1)
-        # C: no hard stop; trail 30% after +30%   ** NOW THE LIVE POLICY **
+        # C: no hard stop; trail 30% after +30%   (shadow arm since 2026-08-28)
         if not d.get("c_done"):
             if peakpct >= 30 and cur <= peak * 0.70:
                 upd["c_done"], upd["c_pnl"] = 1, round((peak*0.70/entry-1)*100, 1)
             elif dte is not None and dte <= 2:
                 upd["c_done"], upd["c_pnl"] = 1, round(pct, 1)
-        # D: the RETIRED -50% policy, kept as a shadow arm. C replaced it live on
-        # 2026-08-11 on n=29 paired trades — a real but small sample. Without D we
-        # would have no way to notice if that adoption was a mistake, so the old
-        # rule keeps running in shadow as the counterfactual. Mirrors the retired
-        # live branch order: once activated (+50%) it trails 30%; before activation
-        # a -50% hard stop applies; otherwise the DTE<=2 time stop.
+        # D: the -50% stop policy — LIVE AGAIN since 2026-08-28 after it beat C by
+        # 15.1 pts/trade over 32 paired trades. Kept evaluated here so the live
+        # policy and its shadow stay directly comparable. Branch order mirrors the
+        # live manager: once activated (+50%) it trails 30%; before activation a
+        # -50% hard stop applies; otherwise the DTE<=2 time stop.
         if not d.get("d_done"):
             _act_d = peakpct >= 50
             if _act_d and cur <= peak * 0.70:
@@ -345,14 +353,21 @@ def regression_check(conn) -> dict:
     d_mean = sum(x for _, x in pairs) / n
     c_wins = sum(1 for c, x in pairs if c > x)
     diff = c_mean - d_mean
+    # NOTE: on 2026-08-28 the LIVE policy was reverted to D (the -50% stop) after
+    # this test showed D beating C by 15.1 pts/trade over 32 pairs. C now runs as
+    # the shadow, so the wording is deliberately direction-agnostic — it must be
+    # able to flag a mistake in EITHER direction, including this revert itself.
+    import os as _os
+    _live = "D" if float(_os.environ.get("EXIT_HARD_STOP", "") or -50.0) > -99 else "C"
+    _shadow = "C" if _live == "D" else "D"
     if n < 20:
         verdict = f"n={n} — too few pairs to judge; keep accumulating."
-    elif diff > 0:
-        verdict = (f"C still ahead by {diff:+.1f} pts/trade ({c_wins}/{n} pairs) — "
-                   "adoption holding up.")
+    elif (diff > 0) == (_live == "C"):
+        verdict = (f"live {_live} ahead by {abs(diff):.1f} pts/trade "
+                   f"({c_wins}/{n} pairs won by C) — current policy holding up.")
     else:
-        verdict = (f"⚠️ REGRESSION: retired D is beating live C by {-diff:.1f} "
-                   f"pts/trade ({c_wins}/{n} pairs) — reconsider the switch "
-                   "(set EXIT_HARD_STOP=-50 to revert).")
+        verdict = (f"⚠️ REGRESSION: shadow {_shadow} is beating live {_live} by "
+                   f"{abs(diff):.1f} pts/trade ({c_wins}/{n} pairs won by C) — "
+                   f"reconsider. EXIT_HARD_STOP=-50 selects D, -100 selects C.")
     return {"n": n, "c_mean": round(c_mean, 1), "d_mean": round(d_mean, 1),
             "c_better_pairs": c_wins, "diff": round(diff, 1), "verdict": verdict}

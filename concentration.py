@@ -45,7 +45,7 @@ def limits() -> dict:
     # those stay tight. Raising the headcount does not re-create that risk.
     return {
         "max_open":      _envi("MAX_OPEN_POSITIONS", 14),
-        "max_same_dir":  _envi("MAX_SAME_DIRECTION", 6),
+        "max_same_dir":  _envi("MAX_SAME_DIRECTION", 10),
         "max_sector":    _envi("MAX_PER_SECTOR", 3),
         "max_per_day":   _envi("MAX_OPENS_PER_DAY", 5),
     }

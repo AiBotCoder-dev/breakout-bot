@@ -572,7 +572,7 @@ class AlpacaPaperBroker:
         import os as _os_
         _now_utc = _dt.now(_tz.utc)
 
-        # ── EXIT POLICY (defaults = ghost-validated policy C, adopted 2026-08-11) ──
+        # ── EXIT POLICY (REVERTED to the -50% stop 2026-08-28, per arm D) ────────
         # The live book ran its whole life on a -50% hard stop. The ghost framework
         # shadow-tested alternatives on the SAME entries; on 29 paired trades policy C
         # beat it by +45.6 points per trade:
@@ -588,17 +588,17 @@ class AlpacaPaperBroker:
                 return float(_os_.environ.get(name, "") or dflt)
             except Exception:
                 return dflt
-        if activation_pct is None:  activation_pct = _envf("EXIT_ACTIVATION_PCT", 30.0)
+        if activation_pct is None:  activation_pct = _envf("EXIT_ACTIVATION_PCT", 50.0)
         if trail_frac is None:      trail_frac     = _envf("EXIT_TRAIL_FRAC", 0.30)
-        if hard_stop_pct is None:   hard_stop_pct  = _envf("EXIT_HARD_STOP", -100.0)
-        if put_activation is None:  put_activation = _envf("PUT_ACTIVATION_PCT", 30.0)
-        if put_trail_frac is None:  put_trail_frac = _envf("PUT_TRAIL_FRAC", 0.30)
-        if put_hard_stop is None:   put_hard_stop  = _envf("PUT_HARD_STOP", -100.0)
+        if hard_stop_pct is None:   hard_stop_pct  = _envf("EXIT_HARD_STOP", -50.0)
+        if put_activation is None:  put_activation = _envf("PUT_ACTIVATION_PCT", 40.0)
+        if put_trail_frac is None:  put_trail_frac = _envf("PUT_TRAIL_FRAC", 0.25)
+        if put_hard_stop is None:   put_hard_stop  = _envf("PUT_HARD_STOP", -45.0)
         if grace_minutes is None:   grace_minutes  = _envf("EXIT_GRACE_MINUTES", 60.0)
         # grace must never be TIGHTER than the live stop, or it would re-introduce
         # the guillotine that policy C exists to remove.
         if grace_hard_stop is None:
-            grace_hard_stop = min(_envf("EXIT_GRACE_HARD_STOP", -100.0), hard_stop_pct)
+            grace_hard_stop = min(_envf("EXIT_GRACE_HARD_STOP", -80.0), hard_stop_pct)
         if dte_floor is None:
             try:
                 dte_floor = int(_envf("EXIT_DTE_FLOOR", 2))

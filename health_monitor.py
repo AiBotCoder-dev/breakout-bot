@@ -146,11 +146,19 @@ def run_checks(conn) -> list:
         except Exception:
             pass
 
-    # 6) exit-policy regression — retired rule beating the live one
+    # 6) exit-policy regression — the SHADOW arm beating the LIVE one.
+    # Must be direction-aware: `diff` is (C mean - D mean), so diff<0 means D wins.
+    # Before 2026-08-28 C was live and diff<0 was a regression; after the revert D is
+    # live and diff<0 means the live policy is WINNING. Keying off the sign alone
+    # made this fire on good news — a false alarm, and an alerting system that cries
+    # wolf gets muted, which is worse than no alerting at all.
     try:
         import ghost_exits as _ge
+        import os as _os
         reg = _ge.regression_check(conn)
-        if reg.get("n", 0) >= 20 and reg.get("diff", 0) < 0:
+        live_is_d = float(_os.environ.get("EXIT_HARD_STOP", "") or -50.0) > -99
+        shadow_winning = (reg.get("diff", 0) > 0) if live_is_d else (reg.get("diff", 0) < 0)
+        if reg.get("n", 0) >= 20 and shadow_winning:
             issues.append({"issue": "ghost_regression", "detail": reg["verdict"]})
     except Exception:
         pass

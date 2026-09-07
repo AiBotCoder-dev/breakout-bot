@@ -1,7 +1,7 @@
 {
-  "generated_utc": "2026-09-04T23:09:26.616900+00:00",
-  "equity": 94660.89,
-  "cash": 93879.97,
+  "generated_utc": "2026-09-07T23:38:40.454721+00:00",
+  "equity": 94660.75,
+  "cash": 93879.56,
   "closed_round_trips": 139,
   "wins": 32,
   "losses": 107,
@@ -26,10 +26,10 @@
       "pnl": -2684.0
     },
     "fullscan_news_put_put": {
-      "n": 45,
+      "n": 47,
       "wins": 9,
-      "win_rate": 20.0,
-      "pnl": 3230.0
+      "win_rate": 19.0,
+      "pnl": 3166.0
     },
     "fullscan_pead_call": {
       "n": 23,

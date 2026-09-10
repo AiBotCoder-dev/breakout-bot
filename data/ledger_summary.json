@@ -1,7 +1,7 @@
 {
-  "generated_utc": "2026-09-09T23:25:27.091854+00:00",
-  "equity": 94087.97,
-  "cash": 93505.11,
+  "generated_utc": "2026-09-10T23:19:03.010591+00:00",
+  "equity": 94034.29,
+  "cash": 93400.65,
   "closed_round_trips": 139,
   "wins": 32,
   "losses": 107,
@@ -11,13 +11,13 @@
   "avg_loss": -52.42,
   "expectancy_per_trade": -29.1,
   "open_positions": 4,
-  "unrealized_pnl": -102.0,
+  "unrealized_pnl": -68.0,
   "by_source": {
     "fullscan_momentum_call": {
-      "n": 88,
+      "n": 89,
       "wins": 24,
       "win_rate": 27.0,
-      "pnl": -1980.0
+      "pnl": -2066.0
     },
     "momentum_call_explore": {
       "n": 66,

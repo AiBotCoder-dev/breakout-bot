@@ -1,7 +1,7 @@
 {
-  "generated_utc": "2026-10-08T01:09:57.357904+00:00",
-  "equity": 91463.56,
-  "cash": 90874.4,
+  "generated_utc": "2026-10-09T01:19:18.634804+00:00",
+  "equity": 91462.15,
+  "cash": 90820.98,
   "closed_round_trips": 139,
   "wins": 32,
   "losses": 107,
@@ -10,14 +10,14 @@
   "avg_win": 48.9,
   "avg_loss": -52.42,
   "expectancy_per_trade": -29.1,
-  "open_positions": 4,
-  "unrealized_pnl": -32.0,
+  "open_positions": 6,
+  "unrealized_pnl": 10.0,
   "by_source": {
     "fullscan_momentum_call": {
-      "n": 109,
-      "wins": 30,
+      "n": 110,
+      "wins": 31,
       "win_rate": 28.0,
-      "pnl": -2783.0
+      "pnl": -2776.0
     },
     "fullscan_news_put_put": {
       "n": 100,
@@ -32,10 +32,10 @@
       "pnl": -2684.0
     },
     "fullscan_bottom_fisher_call": {
-      "n": 28,
+      "n": 29,
       "wins": 4,
       "win_rate": 14.0,
-      "pnl": -1170.0
+      "pnl": -1215.0
     },
     "fullscan_pead_call": {
       "n": 23,
